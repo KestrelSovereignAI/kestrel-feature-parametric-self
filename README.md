@@ -11,7 +11,7 @@ Slogan: **rent intelligence, own identity.** This is the *parametric*
 counterpart to reflection's *symbolic* self-model (the weights, not a trait
 dict). It is **not** memory — RAG remains the factual layer.
 
-Design: `docs/research/TWO_BRAIN_ARCHITECTURE.md` in `kestrel-sovereign`.
+Design: [`docs/TWO_BRAIN_ARCHITECTURE.md`](docs/TWO_BRAIN_ARCHITECTURE.md).
 Build plan: epic #1.
 
 > **Status: P0 scaffold.** The feature loads and registers; the MLX trainer,

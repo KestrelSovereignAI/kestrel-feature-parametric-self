@@ -5,7 +5,7 @@ P0 scaffold. The feature loads, registers through the
 declares the sleep-cycle hook surface it will use for nightly training. The
 actual MLX LoRA trainer, the reflection-derived corpus, the fidelity gate,
 and the in-loop conditioning/oracle integration land in later phases
-(see epic #1 and ``docs/research/TWO_BRAIN_ARCHITECTURE.md``).
+(see epic #1 and ``docs/TWO_BRAIN_ARCHITECTURE.md``).
 
 Design boundary: this is the *parametric* self (weights). Reflection keeps
 the *symbolic* self-model (a trait dict). This feature depends on reflection

@@ -9,7 +9,7 @@ This is the *parametric* counterpart to reflection's *symbolic* self-model
 (``kestrel_feature_reflection.SelfModelManager``): the weights, not a trait
 dict. It is **not** memory — RAG remains the factual layer.
 
-See ``docs/research/TWO_BRAIN_ARCHITECTURE.md`` in kestrel-sovereign and
+See ``docs/TWO_BRAIN_ARCHITECTURE.md`` and
 epic #1 for the design and phased build.
 
 P0 is a scaffold: the feature loads and registers, the sleep-hook surface is
