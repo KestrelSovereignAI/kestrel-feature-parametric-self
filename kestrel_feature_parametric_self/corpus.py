@@ -133,8 +133,11 @@ def build_corpus(
     examples = insight_examples + fact_examples
     examples = [e for e in examples if e["messages"][1]["content"]]
 
-    # Deterministic split (no RNG — stable across runs).
-    valid = examples[::valid_every] if valid_every > 0 else []
+    # Deterministic split (no RNG — stable across runs). Offset by
+    # ``valid_every - 1`` so index 0 always stays in train: a tiny corpus
+    # (fewer than ``valid_every`` examples) holds out nothing and leaves a
+    # non-empty train.jsonl, which MLX requires.
+    valid = examples[valid_every - 1 :: valid_every] if valid_every > 0 else []
     valid_ids = set(id(e) for e in valid)
     train = [e for e in examples if id(e) not in valid_ids]
 

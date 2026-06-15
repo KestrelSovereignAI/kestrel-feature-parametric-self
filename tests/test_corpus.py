@@ -67,6 +67,30 @@ def test_includes_all_insights_when_not_grounded_only(tmp_path):
     assert stats.from_insights == 3  # anomaly now included
 
 
+def test_tiny_corpus_never_empties_train_split(tmp_path):
+    """A single usable example must stay in train, not get held out for valid."""
+    db = str(tmp_path / "tiny.db")
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT NOT NULL, "
+        "description TEXT, suggested_action TEXT)"
+    )
+    con.execute("CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT, label TEXT, properties TEXT)")
+    con.execute(
+        "INSERT INTO reflection_insights (id, type, title, description, suggested_action) VALUES (?,?,?,?,?)",
+        ("1", "failure", "Only lesson", "Keep it short.", ""),
+    )
+    con.commit()
+    con.close()
+
+    out = tmp_path / "out"
+    stats = build_corpus(db, str(out), grounded_only=True, valid_every=10)
+    assert stats.total == 1
+    assert stats.train == 1  # the one example stays in train
+    assert stats.valid == 0
+    assert (out / "train.jsonl").read_text().strip()  # non-empty
+
+
 def test_writes_valid_chat_jsonl(tmp_path):
     db = _fixture_db(tmp_path)
     out = tmp_path / "out"
