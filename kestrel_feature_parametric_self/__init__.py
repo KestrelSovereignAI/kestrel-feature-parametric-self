@@ -12,12 +12,22 @@ dict. It is **not** memory — RAG remains the factual layer.
 See ``docs/TWO_BRAIN_ARCHITECTURE.md`` and
 epic #1 for the design and phased build.
 
-P0 is a scaffold: the feature loads and registers, the sleep-hook surface is
-stubbed, and the MLX trainer + reflection corpus land in P1/P2.
+P1 adds the text-native training path: ``TextLoRAConfig``, the reflection-derived
+corpus builder, and ``LocalMLXAdapter`` (Apple-Silicon MLX LoRA). Sleep-hook
+wiring + the fidelity gate are P2.
 """
 
+from .corpus import CorpusStats, build_corpus
 from .feature import ParametricSelfFeature
+from .local_mlx_adapter import LocalMLXAdapter, TrainerUnavailableError, build_lora_argv
+from .text_types import TextLoRAConfig
 
 __all__ = [
     "ParametricSelfFeature",
+    "TextLoRAConfig",
+    "build_corpus",
+    "CorpusStats",
+    "LocalMLXAdapter",
+    "TrainerUnavailableError",
+    "build_lora_argv",
 ]

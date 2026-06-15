@@ -12,13 +12,19 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    # P0 scaffold: the Feature base class and ToolResult contract come from
-    # the SDK; the sleep-hook surface comes from core. The reflection
-    # dependency (corpus source) and the Apple-Silicon MLX trainer land in
-    # P1 — see epic #1 — so this scaffold installs and CI-validates on
-    # Linux without pulling a darwin-only wheel.
+    # The Feature base class + ToolResult come from the SDK; the neutral
+    # training lifecycle types (TrainingState/TrainingStatus) and the sleep-hook
+    # surface come from core.
     "kestrel-sovereign>=0.13.1,<1",
     "kestrel-sovereign-sdk>=0.14.1,<1",
+    # The MLX LoRA trainer is Apple-Silicon only and imported lazily, so it is
+    # platform-gated: it installs on arm64 macOS and is simply absent elsewhere
+    # (LocalMLXAdapter.is_available() returns False, no blind fallback). This
+    # keeps Linux installs and CI green without a darwin-only wheel.
+    "mlx-lm>=0.31; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # NB: the corpus builder reads reflection's plaintext output tables directly
+    # (loose coupling, no import), so kestrel-feature-reflection is an *optional*
+    # runtime companion (see component.yaml), not a hard dependency.
 ]
 
 [project.optional-dependencies]
