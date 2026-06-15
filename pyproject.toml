@@ -1,0 +1,43 @@
+[project]
+name = "kestrel-feature-parametric-self"
+version = "0.1.0"
+description = "Owned parametric self for Kestrel Sovereign agents — a per-agent local model nightly-finetuned on the agent's own experience"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.15"
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    # P0 scaffold: the Feature base class and ToolResult contract come from
+    # the SDK; the sleep-hook surface comes from core. The reflection
+    # dependency (corpus source) and the Apple-Silicon MLX trainer land in
+    # P1 — see epic #1 — so this scaffold installs and CI-validates on
+    # Linux without pulling a darwin-only wheel.
+    "kestrel-sovereign>=0.13.1,<1",
+    "kestrel-sovereign-sdk>=0.14.1,<1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+    "pytest-timeout>=2.3.1",
+]
+
+[project.entry-points."kestrel_sovereign.features"]
+ParametricSelfFeature = "kestrel_feature_parametric_self:ParametricSelfFeature"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_feature_parametric_self"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
