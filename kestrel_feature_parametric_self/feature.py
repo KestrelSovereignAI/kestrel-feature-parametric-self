@@ -84,15 +84,27 @@ class ParametricSelfFeature(Feature):
         self,
         consolidation_result: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Sleep-cycle hook: nightly adapter training (stub).
+        """Feature-layer sleep hook: nightly adapter training (stub).
 
-        Fires after memory consolidation, the point at which reflection has
-        produced the night's insights — the corpus this feature trains on. P0
-        is a no-op that records intent; P2 trains a LoRA adapter here and
-        promotes it only if it clears the fidelity gate.
+        Signature mirrors ``ReflectionFeature.on_post_consolidation`` exactly.
+        The sleep cycle does NOT call feature methods directly — it invokes a
+        ``*SleepHook`` wrapper (cf. reflection's ``ReflectionSleepHook``, whose
+        ``on_post_consolidation(self, agent, consolidation_result)`` is the
+        method ``sleep.py`` calls), and the wrapper delegates here with just
+        ``consolidation_result``. So there is no sleep-context argument at this
+        layer; this is the delegate target.
 
-        Returns the legacy sleep-hook result dict shape used by the sleep
-        cycle so this slots in beside reflection's hook without special-casing.
+        P1/P2 add parametric-self's own SleepHook wrapper and resolve how it
+        attaches: ``sleep.py`` currently exposes a single
+        ``agent.reflection_hook`` slot that reflection owns, so a second
+        feature's nightly hook needs either a core change (hook list) or
+        chaining through reflection — tracked in epic #1 (P2).
+
+        Fires after memory consolidation — the point at which reflection has
+        produced the night's insights, the corpus this feature trains on. P0 is
+        a no-op that records intent; P2 trains a LoRA adapter here and promotes
+        it only if it clears the fidelity gate. Returns the legacy sleep-hook
+        result dict shape so it slots in beside reflection's hook.
         """
         logger.debug(
             "parametric-self on_post_consolidation: training deferred to P2 "
