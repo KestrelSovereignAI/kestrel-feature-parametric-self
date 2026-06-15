@@ -10,7 +10,7 @@ owned, nightly-finetuned local model (the "second brain").
 
 ## Design
 
-- `docs/research/TWO_BRAIN_ARCHITECTURE.md` in `kestrel-sovereign` (rationale, phases, risks).
+- [`docs/TWO_BRAIN_ARCHITECTURE.md`](docs/TWO_BRAIN_ARCHITECTURE.md) (rationale, phases, risks).
 - Epic #1 (this repo) tracks the phased build.
 
 ## Conventions
