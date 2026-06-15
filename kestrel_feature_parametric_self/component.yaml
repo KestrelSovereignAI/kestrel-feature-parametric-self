@@ -1,0 +1,50 @@
+# Parametric Self Feature Component Manifest
+# The agent's owned parametric self — nightly-finetuned, in-the-loop.
+
+name: parametric_self
+version: 0.1.0
+description: |
+  Owned parametric self: a per-agent local model (target Gemma 4 31B, 4-bit
+  MLX) nightly-finetuned during the sleep cycle on the agent's own experience,
+  and consulted in the reasoning loop as a disposition prior and on-demand
+  oracle. The parametric counterpart to reflection's symbolic self-model.
+
+# Feature class location
+module: kestrel_feature_parametric_self.feature
+class: ParametricSelfFeature
+
+# Dependencies
+requires:
+  - storage          # For reading the training corpus and adapter pointers
+
+optional:
+  - reflection       # Corpus source (insights + per-turn facts); P1
+  - llm_service      # For serving / oracle consultation; P3
+  - security         # Constitutional gating — sovereign agents only (P2)
+
+# Tools provided
+tools:
+  - name: parametric-self-status
+    description: Report base model, current adapter, and live build phase
+    command: "!parametric-self"
+
+# Integration hooks
+hooks:
+  - event: post_consolidation
+    method: on_post_consolidation
+    description: Nightly LoRA training on the night's consolidated reflections (P2)
+
+# Configuration
+config:
+  # Apple-Silicon only; the trainer no-ops elsewhere.
+  enable_nightly_training: false   # Off until P2 lands the real trainer
+  base_model: "gemma-4-31B-it-mlx-4bit"
+  # In-loop integration is path-first; promotion to always-on prior is gated.
+  in_loop: false
+
+# Tags for discovery
+tags:
+  - cognitive
+  - parametric-self
+  - sovereignty
+  - local-model
