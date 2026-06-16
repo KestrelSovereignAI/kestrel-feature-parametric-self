@@ -48,6 +48,7 @@ class _Job:
     state: TrainingState
     created_at: float
     process: Optional["object"] = None  # subprocess.Popen, set on launch
+    log_path: Optional[str] = None      # captured mlx_lm.lora stdout/stderr
     error: Optional[str] = None
 
 
@@ -118,9 +119,17 @@ class LocalMLXAdapter:
 
         argv = build_lora_argv(config)  # validates config before we spawn
         import subprocess  # lazy: only on the training host
+        from pathlib import Path
+
+        # Capture stdout+stderr to a log under the adapter dir so the fidelity
+        # gate can read the validation loss mlx_lm.lora prints.
+        adapter_dir = Path(config.adapter_path)
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str(adapter_dir / "train.log")
+        log_fh = open(log_path, "w")  # closed in cleanup()/when the proc ends
 
         job_id = str(uuid.uuid4())
-        proc = subprocess.Popen(argv)  # noqa: S603 (argv is built internally)
+        proc = subprocess.Popen(argv, stdout=log_fh, stderr=subprocess.STDOUT)  # noqa: S603
         self._jobs[job_id] = _Job(
             job_id=job_id,
             agent_id=agent_id,
@@ -128,8 +137,20 @@ class LocalMLXAdapter:
             state=TrainingState.TRAINING,
             created_at=time.monotonic(),
             process=proc,
+            log_path=log_path,
         )
         return self._status(job_id)
+
+    def read_training_log(self, job_id: str) -> str:
+        """Return the captured training log for a job ('' if none yet)."""
+        job = self._jobs.get(job_id)
+        if job is None or not job.log_path:
+            return ""
+        try:
+            with open(job.log_path, "r") as fh:
+                return fh.read()
+        except OSError:
+            return ""
 
     async def get_status(self, job_id: str) -> TrainingStatus:
         """Poll a job, reconciling against the subprocess exit code."""

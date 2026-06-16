@@ -1,9 +1,8 @@
-"""P0 scaffold tests for ParametricSelfFeature.
+"""Feature-level tests for ParametricSelfFeature.
 
-Mirrors the kestrel-feature-reflection test style: import the feature, assert
-it registers through the ``kestrel_sovereign.features`` entry point, and drive
-the scaffold surfaces (status tool + sleep hook) to confirm they load and
-return the expected shapes before the real trainer arrives in P1+.
+Import + entry-point registration, the status tool shape, and the default-OFF
+training gate. Avoids asserting platform-specific trainer availability (this
+host may or may not have MLX) — only behavior and types.
 """
 
 from __future__ import annotations
@@ -19,12 +18,10 @@ from kestrel_feature_parametric_self import ParametricSelfFeature
 
 
 def _feature() -> ParametricSelfFeature:
-    """Construct the feature with a mock agent (Feature.__init__ takes agent)."""
     return ParametricSelfFeature(agent=MagicMock())
 
 
 def test_entry_point_registered():
-    """The feature is discoverable through the features entry point group."""
     eps = entry_points(group="kestrel_sovereign.features")
     assert any(ep.name == "ParametricSelfFeature" for ep in eps)
 
@@ -35,21 +32,19 @@ def test_tool_description_is_nonempty():
     assert feature.tool_description.strip()
 
 
-async def test_status_tool_reports_scaffold_phase():
-    """The status tool returns a successful ToolResult describing P0 state."""
+async def test_status_tool_reports_state():
     feature = _feature()
     await feature.initialize()
 
     result = await feature.parametric_self_status()
 
     assert result.status == ToolResultStatus.OK
-    assert result.data["phase"].startswith("P0")
-    assert result.data["trainer_available"] is False
-    assert result.data["in_loop"] is False
+    assert result.data["training_enabled"] is False  # default OFF
+    assert isinstance(result.data["trainer_available"], bool)
+    assert result.data["served_adapter"] is None
 
 
-async def test_post_consolidation_hook_is_a_noop_in_p0():
-    """The sleep hook loads and declines to train until P2."""
+async def test_training_disabled_by_default_is_a_noop():
     feature = _feature()
     await feature.initialize()
 
@@ -57,4 +52,16 @@ async def test_post_consolidation_hook_is_a_noop_in_p0():
 
     assert result["trained"] is False
     assert result["promoted"] is False
-    assert "P2" in result["reason"]
+    assert "disabled" in result["reason"]
+
+
+async def test_set_config_can_enable_training():
+    feature = _feature()
+    await feature.initialize()
+    assert feature._training_enabled is False
+
+    await feature.set_config({"enable_nightly_training": True})
+    assert feature._training_enabled is True
+
+    cfg = await feature.get_config()
+    assert cfg["enable_nightly_training"] is True
