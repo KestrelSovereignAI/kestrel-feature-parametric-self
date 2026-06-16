@@ -162,12 +162,32 @@ class ParametricSelfFeature(Feature):
         }
 
     async def post_all_features_loaded(self, agent) -> None:
-        """Create this feature's sleep-hook wrapper once all features are up.
+        """Register this feature's sleep-hook wrapper on the core sleep_hooks list.
 
-        The wrapper mirrors reflection's ``ReflectionSleepHook``. It is created
-        here but its dispatch into the sleep cycle awaits the P2b core change
-        (a sleep-hook list); we deliberately do NOT clobber ``agent.reflection_hook``.
+        The wrapper mirrors reflection's ``ReflectionSleepHook`` and is appended
+        to ``agent.sleep_hooks`` (kestrel-sovereign #1784), so nightly training
+        fires after consolidation alongside reflection. Requires a core with the
+        sleep-hook list; on an older core ``sleep_hooks`` is initialized here but
+        the cycle won't dispatch it until core is upgraded (lockstep release).
         """
         from .sleep_hook import create_parametric_self_sleep_hook
 
         self._sleep_hook = create_parametric_self_sleep_hook(agent)
+        if self._sleep_hook is not None:
+            if getattr(agent, "sleep_hooks", None) is None:
+                agent.sleep_hooks = []
+            if self._sleep_hook not in agent.sleep_hooks:  # idempotent re-enable
+                agent.sleep_hooks.append(self._sleep_hook)
+
+    async def on_disable(self) -> None:
+        """Unregister the sleep hook so a disabled feature stops running at sleep.
+
+        ``post_all_features_loaded`` appends to ``agent.sleep_hooks`` manually,
+        so teardown must remove it — otherwise a disabled/reloaded feature keeps
+        training during sleep and re-enabling duplicates the hook.
+        """
+        hook = getattr(self, "_sleep_hook", None)
+        hooks = getattr(self.agent, "sleep_hooks", None)
+        if hook is not None and hooks and hook in hooks:
+            hooks.remove(hook)
+        self._sleep_hook = None
