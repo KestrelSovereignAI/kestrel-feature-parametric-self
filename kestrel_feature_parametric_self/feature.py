@@ -17,6 +17,7 @@ but does not live inside it — it is active in the runtime reasoning loop, not
 only during sleep.
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -78,6 +79,57 @@ class ParametricSelfFeature(Feature):
             self._training_enabled = bool(config["enable_nightly_training"])
         if config.get("base_model"):
             self._base_config.base_model = str(config["base_model"])
+        # Persist so the enablement survives restarts (durable per-agent gate).
+        await self._persist_config()
+
+    # ------------------------------------------------------------------
+    # Per-agent config persistence (graph node, mirrors the sovereign base)
+    # ------------------------------------------------------------------
+
+    def _config_node_id(self) -> str:
+        return f"feature_config:{self.name}"
+
+    async def _persist_config(self) -> None:
+        """Save the durable config (the enable flag + base model) to agent storage."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            logger.debug("No storage to persist parametric-self config")
+            return
+        durable = {
+            "enable_nightly_training": self._training_enabled,
+            "base_model": self._base_config.base_model,
+        }
+        try:
+            from kestrel_sovereign.storage.async_graph_store import GraphNode
+            await storage.add_node(GraphNode(
+                node_id=self._config_node_id(),
+                node_type="feature_config",
+                label=f"{self.name} config",
+                properties={"config": durable},
+            ))
+        except Exception as e:  # never let a persistence hiccup break the feature
+            logger.warning("Failed to persist parametric-self config: %s", e)
+
+    async def _restore_persisted_config(self) -> None:
+        """Re-apply a previously persisted config on load (restart-durable enable)."""
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            return
+        try:
+            node = await storage.get_node(self._config_node_id())
+        except Exception as e:
+            logger.warning("Failed to load parametric-self config: %s", e)
+            return
+        if node is None:
+            return
+        cfg = node.properties.get("config")
+        if isinstance(cfg, str):
+            cfg = json.loads(cfg)
+        if not isinstance(cfg, dict):
+            return
+        self._training_enabled = bool(cfg.get("enable_nightly_training", self._training_enabled))
+        if cfg.get("base_model"):
+            self._base_config.base_model = str(cfg["base_model"])
 
     @tool(
         name="parametric-self-status",
@@ -169,8 +221,14 @@ class ParametricSelfFeature(Feature):
         fires after consolidation alongside reflection. Requires a core with the
         sleep-hook list; on an older core ``sleep_hooks`` is initialized here but
         the cycle won't dispatch it until core is upgraded (lockstep release).
+
+        Also restores any persisted per-agent config (a durable
+        ``enable_nightly_training``) now that storage is up, so the enablement
+        survives restarts.
         """
         from .sleep_hook import create_parametric_self_sleep_hook
+
+        await self._restore_persisted_config()
 
         if getattr(agent, "sleep_hooks", None) is None:
             agent.sleep_hooks = []
