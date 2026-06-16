@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-parametric-self"
-version = "0.1.0"
+version = "0.2.0"
 description = "Owned parametric self for Kestrel Sovereign agents — a per-agent local model nightly-finetuned on the agent's own experience"
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,8 +14,10 @@ classifiers = [
 dependencies = [
     # The Feature base class + ToolResult come from the SDK; the neutral
     # training lifecycle types (TrainingState/TrainingStatus) and the sleep-hook
-    # surface come from core.
-    "kestrel-sovereign>=0.13.1,<1",
+    # surface come from core. Floor raised to 0.28.0: this version registers its
+    # sleep hook via the core ``agent.sleep_hooks`` list (kestrel-sovereign
+    # #1784), which first ships in 0.28.0 — a hard contract, not advisory.
+    "kestrel-sovereign>=0.28.0,<1",
     "kestrel-sovereign-sdk>=0.14.1,<1",
     # The MLX LoRA trainer is Apple-Silicon only and imported lazily, so it is
     # platform-gated: it installs on arm64 macOS and is simply absent elsewhere
