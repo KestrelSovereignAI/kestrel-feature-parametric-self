@@ -98,6 +98,28 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
     assert "empty corpus" in result.reason
 
 
+async def test_each_run_stages_in_a_unique_dir(tmp_path):
+    """A later (rejected) run must not overwrite an earlier promoted adapter."""
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    work = str(tmp_path / "work")
+
+    first = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=work,
+        adapter=_FakeAdapter(log="Iter 100: Val loss 1.2"), gate=FidelityGate(max_val_loss=3.0),
+        config=TextLoRAConfig(), poll_interval=0,
+    )
+    second = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=work,
+        adapter=_FakeAdapter(log="Iter 100: Val loss 9.9"), gate=FidelityGate(max_val_loss=3.0),
+        config=TextLoRAConfig(), poll_interval=0,
+    )
+
+    assert first.promoted is True and first.promoted_adapter_path
+    assert second.promoted is False
+    # the served adapter (first) is a distinct dir the second run never wrote to
+    assert second.promoted_adapter_path is None
+
+
 async def test_cycle_reports_training_failure(tmp_path):
     db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
     result = await run_nightly_cycle(

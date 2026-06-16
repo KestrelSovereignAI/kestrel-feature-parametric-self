@@ -13,6 +13,7 @@ promotes it only if it clears the gate (§5.2).
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
@@ -64,7 +65,12 @@ async def run_nightly_cycle(
 
     work = Path(work_dir)
     corpus_dir = str(work / "corpus")
-    adapter_dir = str(work / "candidate")
+    # Each run trains into a UNIQUE staging dir so a rejected candidate can
+    # never overwrite the currently-served adapter — the served adapter is the
+    # promoted staging dir of a *prior* run, which this run never touches.
+    # (Accumulating staging dirs is the adapter-lifecycle concern tracked for
+    # P5 in epic #1.)
+    adapter_dir = str(work / "candidates" / uuid.uuid4().hex[:12])
 
     stats = build_corpus(db_path, corpus_dir)
     if stats.train == 0:
