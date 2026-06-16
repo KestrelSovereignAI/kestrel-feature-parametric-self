@@ -172,12 +172,16 @@ class ParametricSelfFeature(Feature):
         """
         from .sleep_hook import create_parametric_self_sleep_hook
 
+        if getattr(agent, "sleep_hooks", None) is None:
+            agent.sleep_hooks = []
+        # Idempotent re-enable: drop a previously-registered hook before adding
+        # the fresh one (each call builds a new wrapper object).
+        prior = getattr(self, "_sleep_hook", None)
+        if prior is not None and prior in agent.sleep_hooks:
+            agent.sleep_hooks.remove(prior)
         self._sleep_hook = create_parametric_self_sleep_hook(agent)
         if self._sleep_hook is not None:
-            if getattr(agent, "sleep_hooks", None) is None:
-                agent.sleep_hooks = []
-            if self._sleep_hook not in agent.sleep_hooks:  # idempotent re-enable
-                agent.sleep_hooks.append(self._sleep_hook)
+            agent.sleep_hooks.append(self._sleep_hook)
 
     async def on_disable(self) -> None:
         """Unregister the sleep hook so a disabled feature stops running at sleep.
