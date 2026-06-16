@@ -115,21 +115,24 @@ class ParametricSelfFeature(Feature):
         storage = getattr(self.agent, "storage", None)
         if storage is None:
             return
+        # One guard around load + parse + apply: a malformed persisted config
+        # (bad JSON after a manual edit / sync conflict) must be ignored, never
+        # raise — post_all_features_loaded runs in the agent init loop, which
+        # doesn't isolate per-hook exceptions, so a raise here aborts startup.
         try:
             node = await storage.get_node(self._config_node_id())
+            if node is None:
+                return
+            cfg = node.properties.get("config")
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+            if not isinstance(cfg, dict):
+                return
+            self._training_enabled = bool(cfg.get("enable_nightly_training", self._training_enabled))
+            if cfg.get("base_model"):
+                self._base_config.base_model = str(cfg["base_model"])
         except Exception as e:
-            logger.warning("Failed to load parametric-self config: %s", e)
-            return
-        if node is None:
-            return
-        cfg = node.properties.get("config")
-        if isinstance(cfg, str):
-            cfg = json.loads(cfg)
-        if not isinstance(cfg, dict):
-            return
-        self._training_enabled = bool(cfg.get("enable_nightly_training", self._training_enabled))
-        if cfg.get("base_model"):
-            self._base_config.base_model = str(cfg["base_model"])
+            logger.warning("Failed to restore parametric-self config (ignored): %s", e)
 
     @tool(
         name="parametric-self-status",

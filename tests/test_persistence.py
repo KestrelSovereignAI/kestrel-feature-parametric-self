@@ -59,6 +59,23 @@ async def test_no_storage_is_graceful():
     assert f._training_enabled is True                     # in-memory still works
 
 
+async def test_malformed_persisted_config_does_not_raise():
+    """A bad JSON config string must be ignored, never abort startup (codex P2)."""
+    class _BadNode:
+        properties = {"config": "{not valid json"}
+
+    class _BadStorage:
+        async def get_node(self, node_id):
+            return _BadNode()
+
+    agent = _agent(storage=_BadStorage())
+    f = ParametricSelfFeature(agent=agent)
+    await f.initialize()
+
+    await f._restore_persisted_config()  # must not raise
+    assert f._training_enabled is False  # defaults preserved
+
+
 async def test_base_model_override_persists():
     storage = _FakeStorage()
     agent = _agent(storage)
