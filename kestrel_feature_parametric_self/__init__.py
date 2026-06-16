@@ -13,13 +13,20 @@ See ``docs/TWO_BRAIN_ARCHITECTURE.md`` and
 epic #1 for the design and phased build.
 
 P1 adds the text-native training path: ``TextLoRAConfig``, the reflection-derived
-corpus builder, and ``LocalMLXAdapter`` (Apple-Silicon MLX LoRA). Sleep-hook
-wiring + the fidelity gate are P2.
+corpus builder, and ``LocalMLXAdapter`` (Apple-Silicon MLX LoRA).
+
+P2a adds the nightly orchestration behind a default-OFF gate: the ``FidelityGate``
+(held-out val-loss promotion check), ``run_nightly_cycle`` (corpus→train→gate),
+and ``ParametricSelfSleepHook`` (the sleep-cycle wrapper). Core sleep-hook
+dispatch is P2b.
 """
 
 from .corpus import CorpusStats, build_corpus
+from .cycle import CycleResult, run_nightly_cycle
 from .feature import ParametricSelfFeature
+from .fidelity import FidelityGate, GateDecision, parse_final_val_loss
 from .local_mlx_adapter import LocalMLXAdapter, TrainerUnavailableError, build_lora_argv
+from .sleep_hook import ParametricSelfSleepHook, create_parametric_self_sleep_hook
 from .text_types import TextLoRAConfig
 
 __all__ = [
@@ -30,4 +37,11 @@ __all__ = [
     "LocalMLXAdapter",
     "TrainerUnavailableError",
     "build_lora_argv",
+    "FidelityGate",
+    "GateDecision",
+    "parse_final_val_loss",
+    "run_nightly_cycle",
+    "CycleResult",
+    "ParametricSelfSleepHook",
+    "create_parametric_self_sleep_hook",
 ]
