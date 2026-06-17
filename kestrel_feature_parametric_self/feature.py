@@ -159,7 +159,12 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-status",
         description="Report parametric-self state: training enabled, trainer availability, served adapter, fidelity",
         category=ToolCategory.SYSTEM,
-        command_prefix="!parametric-self",
+        # Explicit `status` subcommand: a bare `!parametric-self` prefix is a
+        # prefix of every subcommand (history/adapters/train-now/…), and the
+        # command dispatcher returns the first startswith-match, so the bare
+        # form would swallow them. All six tools share the `!parametric-self <verb>`
+        # namespace with non-overlapping verbs (mirrors `!identity status`).
+        command_prefix="!parametric-self status",
     )
     async def parametric_self_status(self) -> ToolResult:
         """Report current state."""
