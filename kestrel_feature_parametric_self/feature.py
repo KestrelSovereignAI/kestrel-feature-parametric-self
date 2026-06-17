@@ -87,7 +87,7 @@ class ParametricSelfFeature(Feature):
         return f"feature_config:{self.name}"
 
     async def _persist_config(self) -> None:
-        """Save the durable config (the enable flag + base model) to agent storage."""
+        """Save the durable state (enable flag, base model, served adapter) to storage."""
         storage = getattr(self.agent, "storage", None)
         if storage is None:
             logger.debug("No storage to persist parametric-self config")
@@ -95,6 +95,11 @@ class ParametricSelfFeature(Feature):
         durable = {
             "enable_nightly_training": self._training_enabled,
             "base_model": self._base_config.base_model,
+            # Served-adapter state must persist too: the status tool needs the
+            # pointer after restart, and the fidelity gate needs prior_val_loss
+            # as its anti-regression baseline (it's lost across restarts otherwise).
+            "active_adapter_path": self._active_adapter_path,
+            "last_val_loss": self._last_val_loss,
         }
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -128,6 +133,12 @@ class ParametricSelfFeature(Feature):
             self._training_enabled = bool(cfg.get("enable_nightly_training", self._training_enabled))
             if cfg.get("base_model"):
                 self._base_config.base_model = str(cfg["base_model"])
+            # Restore served-adapter state so status + the regression gate
+            # survive a restart.
+            if cfg.get("active_adapter_path") is not None:
+                self._active_adapter_path = str(cfg["active_adapter_path"])
+            if cfg.get("last_val_loss") is not None:
+                self._last_val_loss = float(cfg["last_val_loss"])
         except Exception as e:
             logger.warning("Failed to restore parametric-self config (ignored): %s", e)
 
@@ -204,6 +215,9 @@ class ParametricSelfFeature(Feature):
         if result.promoted and result.promoted_adapter_path:
             self._active_adapter_path = result.promoted_adapter_path
             self._last_val_loss = result.val_loss
+            # Persist the new served adapter + its val loss so the pointer and
+            # the regression baseline survive a restart.
+            await self._persist_config()
 
         logger.info(
             "parametric-self nightly cycle: trained=%s promoted=%s val_loss=%s (%s)",
