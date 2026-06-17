@@ -112,6 +112,17 @@ async def test_mutation_tools_refused_for_governed_agent():
     assert f._training_enabled is False
 
 
+async def test_nightly_training_refused_for_governed_agent():
+    """Even with nightly training enabled (persisted/external), a governed agent
+    must not self-modify via the sleep cycle (Incubator Principle, all paths)."""
+    f = await _feature(_FakeStorage(), is_test_instance=True, storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True  # as if persisted config had enabled it
+    result = await f.on_post_consolidation({"episodes_created": 5})
+    assert result["trained"] is False
+    assert result["promoted"] is False
+    assert "Incubator Principle" in result["reason"]
+
+
 async def test_view_tools_allowed_for_governed_agent():
     f = await _feature(_FakeStorage(), is_test_instance=True)
     assert (await f.parametric_self_history()).status == ToolResultStatus.OK

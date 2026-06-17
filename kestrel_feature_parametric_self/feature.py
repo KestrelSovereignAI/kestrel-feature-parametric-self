@@ -222,24 +222,27 @@ class ParametricSelfFeature(Feature):
     # Incubator-Principle gate for the mutation tools
     # ------------------------------------------------------------------
 
-    def _require_sovereign_class(self) -> Optional[ToolResult]:
-        """Gate self-modification on agent class (the Incubator Principle).
+    def _is_sovereign_class(self) -> bool:
+        """True when this agent may self-modify (the Incubator Principle).
 
-        Managing the parametric self — training it, toggling nightly training,
-        rolling back the served adapter — is the agent modifying its *own*
-        weights. The Incubator Principle reserves self-modification for
-        sovereign-class agents; governed/test instances
-        (``agent.is_test_instance``) must not. Returns a refusal ``ToolResult``
-        for a governed agent, else ``None``.
+        Self-modifying the parametric self — training it, toggling nightly
+        training, rolling back the served adapter — is reserved for
+        sovereign-class agents. Governed/test instances (``agent.is_test_instance``)
+        must not, on ANY path (manual tools or the nightly sleep cycle).
+        """
+        return not getattr(self.agent, "is_test_instance", False)
+
+    def _require_sovereign_class(self) -> Optional[ToolResult]:
+        """Return a refusal ``ToolResult`` for a governed agent, else ``None``.
 
         Note on the *caller* gate: ``CallerContext.is_sovereign`` is threaded
         only to the command handler for a fixed set of core governance commands
         — it is not passed to feature ``@tool`` methods (they dispatch via the
         A2A TaskManager, which carries no caller context). So caller-level
         gating is not available here without a core change; the agent-class gate
-        below is the meaningful self-modification boundary for this feature.
+        is the meaningful self-modification boundary for this feature.
         """
-        if getattr(self.agent, "is_test_instance", False):
+        if not self._is_sovereign_class():
             return ToolResult.failed(
                 "Refused: managing the parametric self is self-modification, which "
                 "the Incubator Principle reserves for sovereign-class agents. This "
@@ -521,7 +524,15 @@ class ParametricSelfFeature(Feature):
         Serialized across triggers: if a cycle is already in flight (nightly or
         manual), this returns a skip rather than racing on the shared corpus dir
         and served-adapter pointer.
+
+        Incubator Principle is enforced HERE, the single chokepoint for both the
+        manual tool and the nightly sleep hook: a governed/test instance never
+        self-modifies, even if ``enable_nightly_training`` was set in persisted
+        or externally-supplied config.
         """
+        if not self._is_sovereign_class():
+            return {"trained": False, "promoted": False,
+                    "reason": "self-modification reserved for sovereign-class agents (Incubator Principle)"}
         if self._cycle_in_flight:
             return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
         self._cycle_in_flight = True
