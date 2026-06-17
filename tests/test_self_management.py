@@ -243,6 +243,26 @@ async def test_on_disable_cancels_in_flight_training_task():
         await task
 
 
+async def test_on_disable_clears_guard_when_cancel_precedes_runner():
+    """If disable cancels the task before _runner starts, the in-flight guard must
+    still be cleared — otherwise a re-enabled instance refuses everything."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    f.agent.sleep_hooks = []
+
+    async def _never_runs(*, trigger):
+        return {}
+
+    f._run_training_cycle_locked = _never_runs
+    result = await f.parametric_self_train_now()
+    assert result.status == ToolResultStatus.OK
+    assert f._cycle_in_flight is True  # reserved synchronously by train_now
+    # Disable BEFORE yielding to the loop, so _runner never starts.
+    await f.on_disable()
+    assert f._cycle_in_flight is False  # guard force-cleared on teardown
+    assert f._training_task is None
+
+
 async def test_rollback_default_to_previous_promoted(tmp_path):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"

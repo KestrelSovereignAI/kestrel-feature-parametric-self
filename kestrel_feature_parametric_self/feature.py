@@ -711,6 +711,10 @@ class ParametricSelfFeature(Feature):
         if task is not None and not task.done():
             task.cancel()
         self._training_task = None
+        # Force-clear the cross-trigger guard: if the cancel landed before
+        # _runner started, its finally never ran and the guard would stay stuck,
+        # permanently refusing later train/rollback on a re-enabled instance.
+        self._cycle_in_flight = False
 
         adapter = getattr(self, "_adapter", None)
         if adapter is not None and hasattr(adapter, "cancel_all"):
