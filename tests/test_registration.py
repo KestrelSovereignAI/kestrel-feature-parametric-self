@@ -74,6 +74,21 @@ def test_command_prefixes_are_single_token_and_non_nesting():
                 assert not b.startswith(a), f"command prefix {a!r} shadows {b!r}"
 
 
+def test_feature_exposes_get_tool_by_name_for_rich_arg_parsing():
+    """The handler must expose _get_tool_by_name so the host uses the tool's
+    prefix-aware, type-coercing parse_command_args (binding positional args)
+    instead of the naive splitter that emits an arg0 our methods reject."""
+    feature = ParametricSelfFeature(agent=MagicMock())
+    tool = feature._get_tool_by_name("parametric-self-set-enabled")
+    assert tool is not None and hasattr(tool, "parse_command_args")
+    # Positional bool binds to the named param and is coerced.
+    assert tool.parse_command_args("!parametric-self-enable false") == {"enabled": False}
+    assert tool.parse_command_args("!parametric-self-enable true") == {"enabled": True}
+    # No-arg command yields no stray positional.
+    status = feature._get_tool_by_name("parametric-self-status")
+    assert status.parse_command_args("!parametric-self-status") == {}
+
+
 def test_each_command_resolves_to_its_own_tool():
     """Every `!parametric-self-<verb>` resolves to the matching tool (not status)."""
     feature = ParametricSelfFeature(agent=MagicMock())

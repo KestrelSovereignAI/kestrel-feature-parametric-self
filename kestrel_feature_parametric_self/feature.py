@@ -110,6 +110,22 @@ class ParametricSelfFeature(Feature):
         # _run_training_cycle (no await between check and set → atomic in asyncio).
         self._cycle_in_flight = False
 
+    def _get_tool_by_name(self, name: str):
+        """Return this feature's tool by skill id (None if absent).
+
+        The A2A command path prefers ``tool.parse_command_args`` when the handler
+        exposes ``_get_tool_by_name`` — that parser is prefix-word-count aware and
+        type-coerces positional args (so ``!parametric-self-enable false`` binds to
+        ``enabled=False``). Without this method the host falls back to a naive
+        positional splitter that emits an ``arg0`` kwarg our methods reject, so
+        every command with an argument would fail. Provide it to opt into the
+        richer parser (mirrors the core Feature base).
+        """
+        for t in self.get_tools():
+            if t.name == name:
+                return t
+        return None
+
     async def get_config(self) -> Dict[str, Any]:
         return {
             "enable_nightly_training": self._training_enabled,
