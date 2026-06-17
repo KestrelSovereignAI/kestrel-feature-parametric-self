@@ -33,9 +33,6 @@ from .text_types import TextLoRAConfig
 
 logger = logging.getLogger(__name__)
 
-# Default cognition DB filename inside an agent's data_dir.
-_DB_FILENAME = "kestrel_prime.db"
-
 
 class ParametricSelfFeature(Feature):
     """The agent's owned parametric self.
@@ -159,15 +156,19 @@ class ParametricSelfFeature(Feature):
         )
 
     def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve (cognition_db_path, work_dir) for this agent, best-effort."""
+        """Resolve (cognition_db_path, work_dir) for this agent.
+
+        The agent exposes its cognition DB as ``storage_path`` (the SQLite file
+        holding reflection_insights + graph_nodes); the data dir is its parent.
+        There is no ``data_dir`` attribute on the agent.
+        """
         if self._db_path and self._work_dir:
             return self._db_path, self._work_dir
-        data_dir = getattr(self.agent, "data_dir", None) or getattr(self.agent, "_data_dir", None)
-        if not data_dir:
+        storage_path = getattr(self.agent, "storage_path", None)
+        if not storage_path:
             return self._db_path, self._work_dir
-        base = Path(data_dir)
-        db = self._db_path or str(base / _DB_FILENAME)
-        work = self._work_dir or str(base / "parametric_self")
+        db = self._db_path or str(storage_path)
+        work = self._work_dir or str(Path(storage_path).parent / "parametric_self")
         return db, work
 
     async def on_post_consolidation(
@@ -185,7 +186,7 @@ class ParametricSelfFeature(Feature):
 
         db_path, work_dir = self._resolve_paths()
         if not db_path or not work_dir:
-            return {"trained": False, "promoted": False, "reason": "could not resolve agent data_dir"}
+            return {"trained": False, "promoted": False, "reason": "could not resolve agent storage_path"}
 
         agent_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "name", "agent")
         config = TextLoRAConfig.from_dict(self._base_config.to_dict())
