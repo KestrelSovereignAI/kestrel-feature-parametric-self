@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-parametric-self"
-version = "0.2.1"
+version = "0.2.2"
 description = "Owned parametric self for Kestrel Sovereign agents — a per-agent local model nightly-finetuned on the agent's own experience"
 readme = "README.md"
 license = "Apache-2.0"

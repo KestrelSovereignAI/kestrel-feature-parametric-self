@@ -55,6 +55,27 @@ async def test_training_disabled_by_default_is_a_noop():
     assert "disabled" in result["reason"]
 
 
+async def test_resolve_paths_uses_storage_path(tmp_path):
+    """The cognition DB + work dir derive from agent.storage_path (not data_dir)."""
+    agent = MagicMock()
+    db = tmp_path / "kestrel_prime.db"
+    agent.storage_path = str(db)
+    feature = ParametricSelfFeature(agent=agent)
+    await feature.initialize()
+
+    db_path, work_dir = feature._resolve_paths()
+    assert db_path == str(db)
+    assert work_dir == str(tmp_path / "parametric_self")
+
+
+async def test_resolve_paths_none_when_no_storage_path():
+    agent = MagicMock()
+    agent.storage_path = None
+    feature = ParametricSelfFeature(agent=agent)
+    await feature.initialize()
+    assert feature._resolve_paths() == (None, None)
+
+
 async def test_set_config_can_enable_training():
     feature = _feature()
     await feature.initialize()
