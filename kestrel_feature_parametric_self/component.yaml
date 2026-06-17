@@ -25,8 +25,24 @@ optional:
 # Tools provided
 tools:
   - name: parametric-self-status
-    description: Report base model, current adapter, and live build phase
-    command: "!parametric-self"
+    description: Report base model, current adapter, training enablement, fidelity
+    command: "!parametric-self-status"
+  - name: parametric-self-history
+    description: Recent training runs (ts, trigger, corpus, val_loss, promoted)
+    command: "!parametric-self-history"
+  - name: parametric-self-adapters
+    description: Candidate adapters on disk with val_loss; marks the served one
+    command: "!parametric-self-adapters"
+  # Management tools — sovereign-class agents only (Incubator Principle).
+  - name: parametric-self-train-now
+    description: Trigger a training run now (detached); returns once started
+    command: "!parametric-self-train"
+  - name: parametric-self-set-enabled
+    description: Enable/disable nightly training for this agent (durable)
+    command: "!parametric-self-enable"
+  - name: parametric-self-rollback
+    description: Roll the served adapter back to a prior candidate
+    command: "!parametric-self-rollback"
 
 # Integration hooks
 hooks:

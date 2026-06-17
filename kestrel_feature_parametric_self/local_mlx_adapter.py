@@ -191,6 +191,22 @@ class LocalMLXAdapter:
         job.state = TrainingState.CANCELLED
         return True
 
+    async def cancel_all(self) -> int:
+        """Terminate every still-running training subprocess.
+
+        Used on feature disable/shutdown: cancelling the asyncio polling task
+        does not stop the spawned ``mlx_lm.lora`` child, which would otherwise
+        keep running GPU-heavy and writing into the adapter dir. Returns the
+        number of live jobs terminated.
+        """
+        cancelled = 0
+        for job in self._jobs.values():
+            if job.process is not None and job.process.poll() is None:
+                job.process.terminate()
+                job.state = TrainingState.CANCELLED
+                cancelled += 1
+        return cancelled
+
     async def cleanup(self, job_id: str) -> None:
         self._jobs.pop(job_id, None)
 
