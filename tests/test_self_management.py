@@ -180,7 +180,7 @@ async def test_train_now_starts_detached_run():
         ran.set()
         return {"trained": True, "promoted": False}
 
-    f._run_training_cycle = _fake_cycle
+    f._run_training_cycle_locked = _fake_cycle
 
     result = await f.parametric_self_train_now()
     assert result.status == ToolResultStatus.OK
@@ -197,7 +197,7 @@ async def test_train_now_starts_detached_run():
         await release.wait()
         return {}
 
-    f._run_training_cycle = _slow_cycle
+    f._run_training_cycle_locked = _slow_cycle
     first = await f.parametric_self_train_now()
     assert first.status == ToolResultStatus.OK
     await asyncio.wait_for(started.wait(), timeout=2)
@@ -221,7 +221,7 @@ async def test_on_disable_cancels_in_flight_training_task():
         await release.wait()  # never released; cancellation must break this
         return {}
 
-    f._run_training_cycle = _slow_cycle
+    f._run_training_cycle_locked = _slow_cycle
     # Track that the MLX subprocess(es) are also terminated on disable.
     cancel_all_called = asyncio.Event()
 

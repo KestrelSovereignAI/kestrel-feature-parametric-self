@@ -350,14 +350,26 @@ class ParametricSelfFeature(Feature):
         if self._cycle_in_flight or (self._training_task is not None and not self._training_task.done()):
             return ToolResult.failed("A parametric-self training run is already in progress.")
 
+        # Reserve the cross-trigger guard HERE, synchronously, before detaching:
+        # otherwise the nightly hook could fire in the same event-loop turn,
+        # acquire the guard first, and the detached manual run would skip as
+        # "already in progress" — contradicting the "started" we report. There is
+        # no await between the busy-check above and this set, so it is atomic.
+        self._cycle_in_flight = True
+
         # Run detached: a full cycle is ~24 min; the tool returns immediately and
-        # the run records itself in history on completion. Errors are logged, not
-        # surfaced to the caller (poll !parametric-self-history for the outcome).
+        # the run records itself in history on completion. The runner calls the
+        # LOCKED body (the guard is already held) and clears it in finally. Errors
+        # are logged, not surfaced (poll !parametric-self-history for the outcome).
         async def _runner() -> None:
             try:
-                await self._run_training_cycle(trigger="manual")
+                await self._run_training_cycle_locked(trigger="manual")
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.warning("parametric-self manual training run failed: %s", exc)
+            finally:
+                self._cycle_in_flight = False
 
         self._training_task = asyncio.create_task(_runner())
         return ToolResult.ok(
