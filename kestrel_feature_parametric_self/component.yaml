@@ -34,10 +34,10 @@ tools:
     description: Candidate adapters on disk with val_loss; marks the served one
     command: "!parametric-self-adapters"
   # Management tools — sovereign-class agents only (Incubator Principle).
-  - name: parametric-self-train
+  - name: parametric-self-train-now
     description: Trigger a training run now (detached); returns once started
     command: "!parametric-self-train"
-  - name: parametric-self-enable
+  - name: parametric-self-set-enabled
     description: Enable/disable nightly training for this agent (durable)
     command: "!parametric-self-enable"
   - name: parametric-self-rollback

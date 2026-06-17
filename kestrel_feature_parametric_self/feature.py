@@ -349,7 +349,7 @@ class ParametricSelfFeature(Feature):
 
         # Run detached: a full cycle is ~24 min; the tool returns immediately and
         # the run records itself in history on completion. Errors are logged, not
-        # surfaced to the caller (poll !parametric-self history for the outcome).
+        # surfaced to the caller (poll !parametric-self-history for the outcome).
         async def _runner() -> None:
             try:
                 await self._run_training_cycle(trigger="manual")
@@ -360,7 +360,7 @@ class ParametricSelfFeature(Feature):
         return ToolResult.ok(
             confirmation=(
                 "Parametric-self training run started in the background. "
-                "Check `!parametric-self history` for the outcome."
+                "Check `!parametric-self-history` for the outcome."
             ),
             data={"started": True},
         )
