@@ -44,15 +44,31 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _strip_key_prefix(value: Any) -> Any:
+    """Tolerate a leaked ``key=value`` token from the command parser.
+
+    Two command parsers are in play depending on host wiring: one splits
+    ``enabled=false`` into ``"false"``, the other (positional) hands the whole
+    token ``"enabled=false"`` to the param. A real value (a bool spelling or a
+    uuid-hex adapter id) never contains ``=``, so taking the substring after the
+    last ``=`` is a safe normalization that makes the tools correct under both.
+    """
+    if isinstance(value, str) and "=" in value:
+        return value.rsplit("=", 1)[1]
+    return value
+
+
 def _as_bool(value: Any) -> bool:
     """Coerce a tool argument to bool.
 
-    The command path delivers args as strings (e.g. ``enable=false``), so a bare
+    The command path delivers args as strings (e.g. ``enabled=false``), so a bare
     ``bool("false")`` would be ``True`` and silently enable training. Treat the
     usual falsey string spellings as False; otherwise fall back to truthiness.
     """
     if isinstance(value, str):
-        return value.strip().lower() not in ("", "false", "0", "no", "off", "none")
+        return _strip_key_prefix(value).strip().lower() not in (
+            "", "false", "0", "no", "off", "none",
+        )
     return bool(value)
 
 
@@ -384,6 +400,7 @@ class ParametricSelfFeature(Feature):
             return ToolResult.failed("Could not resolve the candidates directory for this agent.")
 
         target_path: Optional[str] = None
+        adapter_id = _strip_key_prefix(adapter_id) if adapter_id else adapter_id
         if adapter_id:
             # Only accept a simple child name — reject path separators, '..',
             # and absolute paths so a rollback can never serve a directory

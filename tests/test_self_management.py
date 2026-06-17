@@ -140,6 +140,8 @@ async def test_set_enabled_toggles_and_persists():
 @pytest.mark.parametrize("raw,expected", [
     ("false", False), ("False", False), ("0", False), ("no", False), ("off", False),
     ("true", True), ("1", True), (True, True), (False, False),
+    # Defensive: a leaked `key=value` token from the positional parser.
+    ("enabled=false", False), ("enabled=true", True),
 ])
 async def test_set_enabled_coerces_string_booleans(raw, expected):
     """A command-path string like 'false' must disable, not enable (bool('false') is True)."""
@@ -219,7 +221,8 @@ async def test_rollback_default_to_previous_promoted(tmp_path):
     assert runs[-1]["trigger"] == "rollback"
 
 
-async def test_rollback_explicit_adapter_id(tmp_path):
+@pytest.mark.parametrize("arg", ["pick99", "adapter_id=pick99"])
+async def test_rollback_explicit_adapter_id(tmp_path, arg):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"
     target = cands / "pick99"
@@ -228,7 +231,8 @@ async def test_rollback_explicit_adapter_id(tmp_path):
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     f._active_adapter_path = "/some/other/served"
-    result = await f.parametric_self_rollback(adapter_id="pick99")
+    # Accept both the split form ("pick99") and a leaked key=value token.
+    result = await f.parametric_self_rollback(adapter_id=arg)
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(target)
     assert f._last_val_loss == pytest.approx(2.750)
