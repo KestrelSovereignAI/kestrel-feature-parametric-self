@@ -366,3 +366,132 @@ async def test_nightly_cycle_skips_when_manual_run_in_flight():
     result = await f.on_post_consolidation({"episodes_created": 1})
     assert result["trained"] is False
     assert "in progress" in result["reason"]
+
+
+# ----------------------------------------------------------------------
+# Adoption / recovery path (candidate on disk, no served pointer)
+# ----------------------------------------------------------------------
+
+async def test_adapters_marks_recoverable_when_unserved(tmp_path):
+    """A valid candidate with no served pointer is flagged recoverable."""
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    # No served adapter (the legacy/interrupted-run state).
+    assert f._active_adapter_path is None
+
+    result = await f.parametric_self_adapters()
+    assert result.status == ToolResultStatus.OK
+    by_id = {a["adapter_id"]: a for a in result.data["adapters"]}
+    assert by_id["ded33cd017d9"]["recoverable"] is True
+    assert by_id["ded33cd017d9"]["served"] is False
+    assert result.data["recoverable_adapters"] == ["ded33cd017d9"]
+
+
+async def test_status_exposes_recoverable_candidates(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+
+    result = await f.parametric_self_status()
+    assert result.status == ToolResultStatus.OK
+    assert result.data["served_adapter"] is None
+    assert result.data["recoverable_adapters"] == ["ded33cd017d9"]
+
+
+async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    storage = _FakeStorage()
+    f = await _feature(storage, storage_path=str(tmp_path / "kestrel_prime.db"))
+
+    result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
+    assert result.status == ToolResultStatus.OK
+    assert f._active_adapter_path == str(cands)
+    assert f._last_val_loss == pytest.approx(2.688)
+    assert f._config_node_id() in storage.nodes  # served pointer persisted
+    runs = await f._load_run_history()
+    assert runs[-1]["trigger"] == "adopt"
+    assert runs[-1]["adapter_path"] == str(cands)
+
+
+@pytest.mark.parametrize("arg", ["ded33cd017d9", "adapter_id=ded33cd017d9"])
+async def test_adopt_accepts_leaked_key_value_token(tmp_path, arg):
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Val loss 2.688\n")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_adopt(adapter_id=arg)
+    assert result.status == ToolResultStatus.OK
+    assert f._active_adapter_path == str(cands)
+
+
+async def test_adopt_refuses_adapter_without_val_loss(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "incomplete"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 10: training started...\n")  # no Val loss
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_adopt(adapter_id="incomplete")
+    assert result.status == ToolResultStatus.ERROR
+    assert "no parseable validation loss" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+async def test_adopt_unknown_adapter_id_fails(tmp_path):
+    (tmp_path / "parametric_self" / "candidates").mkdir(parents=True)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_adopt(adapter_id="nope")
+    assert result.status == ToolResultStatus.ERROR
+    assert "No candidate adapter" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+@pytest.mark.parametrize("bad_id", ["../escape", "/etc", "a/b", "..", "."])
+async def test_adopt_rejects_path_traversal(tmp_path, bad_id):
+    cands = tmp_path / "parametric_self" / "candidates"
+    cands.mkdir(parents=True)
+    (tmp_path / "parametric_self" / "escape").mkdir()
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_adopt(adapter_id=bad_id)
+    assert result.status == ToolResultStatus.ERROR
+    assert f._active_adapter_path is None
+
+
+async def test_adopt_refused_for_governed_agent(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Val loss 2.688\n")
+    f = await _feature(
+        _FakeStorage(), is_test_instance=True, storage_path=str(tmp_path / "kestrel_prime.db"),
+    )
+    result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
+    assert result.status == ToolResultStatus.ERROR
+    assert "Incubator Principle" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+async def test_adopt_rejects_candidate_failing_fidelity_gate(tmp_path):
+    """A candidate whose val_loss exceeds the ceiling must not be adopted."""
+    cands = tmp_path / "parametric_self" / "candidates" / "toobad"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Val loss 3.500\n")  # > max_val_loss (3.0)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_adopt(adapter_id="toobad")
+    assert result.status == ToolResultStatus.ERROR
+    assert "fidelity gate" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+async def test_adopt_refused_while_cycle_in_flight(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Val loss 2.688\n")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._cycle_in_flight = True
+    result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
+    assert result.status == ToolResultStatus.ERROR
+    assert "in progress" in (result.error or "")
+    assert f._active_adapter_path is None

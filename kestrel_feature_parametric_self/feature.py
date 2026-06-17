@@ -218,21 +218,33 @@ class ParametricSelfFeature(Feature):
     )
     async def parametric_self_status(self) -> ToolResult:
         """Report current state."""
+        # Surface the recovery state: a completed run can leave a valid candidate
+        # on disk with no served pointer; expose those so the operator knows they
+        # are adoptable via `!parametric-self-adopt` rather than appearing lost.
+        recoverable = (
+            [a["adapter_id"] for a in self._scan_candidates() if a["recoverable"]]
+            if self._active_adapter_path is None
+            else []
+        )
         data = {
             "training_enabled": self._training_enabled,
             "trainer_available": self._adapter.is_available(),
             "base_model": self._base_config.base_model,
             "served_adapter": self._active_adapter_path,
             "served_val_loss": self._last_val_loss,
+            "recoverable_adapters": recoverable,
         }
-        return ToolResult.ok(
-            confirmation=(
-                "Parametric-self "
-                + ("ENABLED" if self._training_enabled else "disabled")
-                + f"; trainer {'available' if data['trainer_available'] else 'unavailable on this host'}."
-            ),
-            data=data,
+        confirmation = (
+            "Parametric-self "
+            + ("ENABLED" if self._training_enabled else "disabled")
+            + f"; trainer {'available' if data['trainer_available'] else 'unavailable on this host'}."
         )
+        if recoverable:
+            confirmation += (
+                f" No adapter served; {len(recoverable)} valid candidate(s) recoverable via "
+                "`!parametric-self-adopt`."
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     # ------------------------------------------------------------------
     # Incubator-Principle gate for the mutation tools
@@ -274,6 +286,37 @@ class ParametricSelfFeature(Feature):
             return None
         return Path(work_dir) / "candidates"
 
+    def _scan_candidates(self) -> List[Dict[str, Any]]:
+        """Scan the candidates dir for staged adapters with parsed val_loss.
+
+        Each entry carries ``served`` (is this the currently-served adapter) and
+        ``recoverable`` (a valid candidate — parseable val_loss — while NO adapter
+        is served yet; the lifecycle state where a completed run left a candidate
+        on disk but no served pointer, adoptable via ``parametric-self-adopt``).
+        """
+        candidates = self._candidates_dir()
+        served = self._active_adapter_path
+        adapters: List[Dict[str, Any]] = []
+        if candidates and candidates.is_dir():
+            for d in sorted(candidates.iterdir()):
+                if not d.is_dir():
+                    continue
+                val_loss = None
+                log = d / "train.log"
+                if log.is_file():
+                    try:
+                        val_loss = parse_final_val_loss(log.read_text())
+                    except Exception:
+                        val_loss = None
+                adapters.append({
+                    "adapter_id": d.name,
+                    "path": str(d),
+                    "val_loss": val_loss,
+                    "served": str(d) == str(served) if served else False,
+                    "recoverable": served is None and val_loss is not None,
+                })
+        return adapters
+
     # ------------------------------------------------------------------
     # View tools (ungated) — introspect the parametric-self lifecycle
     # ------------------------------------------------------------------
@@ -312,38 +355,35 @@ class ParametricSelfFeature(Feature):
     )
     async def parametric_self_adapters(self) -> ToolResult:
         """List staged candidate adapters, their val_loss, and the served one."""
-        candidates = self._candidates_dir()
         served = self._active_adapter_path
-        adapters: List[Dict[str, Any]] = []
-        if candidates and candidates.is_dir():
-            for d in sorted(candidates.iterdir()):
-                if not d.is_dir():
-                    continue
-                val_loss = None
-                log = d / "train.log"
-                if log.is_file():
-                    try:
-                        val_loss = parse_final_val_loss(log.read_text())
-                    except Exception:
-                        val_loss = None
-                adapters.append({
-                    "adapter_id": d.name,
-                    "path": str(d),
-                    "val_loss": val_loss,
-                    "served": str(d) == str(served) if served else False,
-                })
+        adapters = self._scan_candidates()
+        recoverable = [a["adapter_id"] for a in adapters if a["recoverable"]]
         if not adapters:
             return ToolResult.ok(
                 confirmation="No candidate adapters on disk yet.",
-                data={"adapters": [], "served_adapter": served},
+                data={"adapters": [], "served_adapter": served, "recoverable_adapters": []},
             )
         lines = [f"{len(adapters)} candidate adapter(s):"]
         for a in adapters:
-            mark = " (served)" if a["served"] else ""
+            if a["served"]:
+                mark = " (served)"
+            elif a["recoverable"]:
+                mark = " (recoverable — adopt with !parametric-self-adopt)"
+            else:
+                mark = ""
             lines.append(f"  {a['adapter_id']}  val_loss={a['val_loss']}{mark}")
+        if recoverable:
+            lines.append(
+                f"No adapter is served; {len(recoverable)} valid candidate(s) can be "
+                "adopted with `!parametric-self-adopt adapter_id=<id>`."
+            )
         return ToolResult.ok(
             confirmation="\n".join(lines),
-            data={"adapters": adapters, "served_adapter": served},
+            data={
+                "adapters": adapters,
+                "served_adapter": served,
+                "recoverable_adapters": recoverable,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -503,6 +543,96 @@ class ParametricSelfFeature(Feature):
             })
             return ToolResult.ok(
                 confirmation=f"Served adapter rolled back to {Path(target_path).name} (val_loss={val_loss}).",
+                data={"served_adapter": target_path, "served_val_loss": val_loss},
+            )
+        finally:
+            self._cycle_in_flight = False
+
+    @tool(
+        name="parametric-self-adopt",
+        description="Adopt a candidate parametric-self adapter as the served adapter (sovereign-class only); recovers a valid candidate left on disk with no served pointer",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!parametric-self-adopt",
+    )
+    async def parametric_self_adopt(self, adapter_id: str) -> ToolResult:
+        """Adopt a candidate adapter as the served one (explicit first adoption).
+
+        This is the discoverable path for the recovery state where a completed
+        run left a valid candidate on disk but no served-adapter pointer/history
+        (e.g. a legacy/interrupted run). Unlike rollback — which reverts to a
+        *previously promoted* adapter — adopt fronts a candidate for the first
+        time, evaluating the same fidelity gate against the current baseline and
+        recording an ``adopt`` history entry.
+        """
+        gate = self._require_sovereign_class()
+        if gate is not None:
+            return gate
+
+        candidates = self._candidates_dir()
+        if candidates is None:
+            return ToolResult.failed("Could not resolve the candidates directory for this agent.")
+
+        # Share the in-flight guard with training/rollback: adopting mutates the
+        # served-adapter pointer, which a concurrent cycle also writes.
+        if self._cycle_in_flight:
+            return ToolResult.failed(
+                "A parametric-self training run is in progress; cannot adopt until it completes."
+            )
+        self._cycle_in_flight = True
+        try:
+            adapter_id = _strip_key_prefix(adapter_id) if adapter_id else adapter_id
+            if not adapter_id:
+                return ToolResult.failed(
+                    "An adapter_id is required (see `!parametric-self-adapters`)."
+                )
+            # Only accept a simple child name — same traversal protections as
+            # rollback so adoption can never serve a directory outside candidates.
+            if Path(adapter_id).name != adapter_id or adapter_id in (".", ".."):
+                return ToolResult.failed(f"Invalid adapter id '{adapter_id}' (must be a candidate directory name).")
+            target = candidates / adapter_id
+            # Defense in depth: confirm the resolved path stays under candidates.
+            if not target.is_dir() or candidates.resolve() not in target.resolve().parents:
+                return ToolResult.failed(f"No candidate adapter '{adapter_id}' on disk.")
+            target_path = str(target)
+
+            # Require a parseable validation loss: serving an adapter without one
+            # bypasses the fidelity guarantee and leaves the gate with no baseline.
+            val_loss: Optional[float] = None
+            log = target / "train.log"
+            if log.is_file():
+                try:
+                    val_loss = parse_final_val_loss(log.read_text())
+                except Exception:
+                    val_loss = None
+            if val_loss is None:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' has no parseable validation loss "
+                    "(incomplete/failed run); refusing to serve it."
+                )
+
+            # Same fidelity gate as a nightly promotion, against the current
+            # baseline (``prior_val_loss`` is None in the first-adoption case).
+            decision = self._gate.evaluate(val_loss, prior_val_loss=self._last_val_loss)
+            if not decision.promote:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' fails the fidelity gate: {decision.reason}."
+                )
+
+            self._active_adapter_path = target_path
+            self._last_val_loss = val_loss
+            await self._persist_config()
+            await self._append_run_history({
+                "timestamp": _utc_now_iso(),
+                "trigger": "adopt",
+                "trained": False,
+                "promoted": True,
+                "val_loss": val_loss,
+                "reason": f"adopted candidate adapter {adapter_id} as served",
+                "corpus_train": 0,
+                "adapter_path": target_path,
+            })
+            return ToolResult.ok(
+                confirmation=f"Adopted adapter {adapter_id} as served (val_loss={val_loss}).",
                 data={"served_adapter": target_path, "served_val_loss": val_loss},
             )
         finally:
