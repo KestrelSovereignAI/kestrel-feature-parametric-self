@@ -197,6 +197,31 @@ async def test_train_now_starts_detached_run():
     await f._training_task
 
 
+async def test_on_disable_cancels_in_flight_training_task():
+    """A detached manual run must be cancelled on disable, not left to mutate state."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    f.agent.sleep_hooks = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        started.set()
+        await release.wait()  # never released; cancellation must break this
+        return {}
+
+    f._run_training_cycle = _slow_cycle
+    result = await f.parametric_self_train_now()
+    assert result.status == ToolResultStatus.OK
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    task = f._training_task
+    await f.on_disable()
+    assert f._training_task is None
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def test_rollback_default_to_previous_promoted(tmp_path):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"

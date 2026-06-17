@@ -658,7 +658,18 @@ class ParametricSelfFeature(Feature):
         ``post_all_features_loaded`` appends to ``agent.sleep_hooks`` manually,
         so teardown must remove it — otherwise a disabled/reloaded feature keeps
         training during sleep and re-enabling duplicates the hook.
+
+        Also cancels any in-flight detached manual run (``train_now``): that task
+        is not tracked by the framework once the tool returned, so without this a
+        disabled/reloaded feature could still promote an adapter and persist
+        config after teardown. Cancellation unwinds through ``_run_training_cycle``'s
+        ``finally`` (clearing ``_cycle_in_flight``).
         """
+        task = getattr(self, "_training_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._training_task = None
+
         hook = getattr(self, "_sleep_hook", None)
         hooks = getattr(self.agent, "sleep_hooks", None)
         if hook is not None and hooks and hook in hooks:
