@@ -44,6 +44,18 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _as_bool(value: Any) -> bool:
+    """Coerce a tool argument to bool.
+
+    The command path delivers args as strings (e.g. ``enable=false``), so a bare
+    ``bool("false")`` would be ``True`` and silently enable training. Treat the
+    usual falsey string spellings as False; otherwise fall back to truthiness.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off", "none")
+    return bool(value)
+
+
 class ParametricSelfFeature(Feature):
     """The agent's owned parametric self.
 
@@ -164,12 +176,13 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-status",
         description="Report parametric-self state: training enabled, trainer availability, served adapter, fidelity",
         category=ToolCategory.SYSTEM,
-        # Explicit `status` subcommand: a bare `!parametric-self` prefix is a
-        # prefix of every subcommand (history/adapters/train-now/…), and the
-        # command dispatcher returns the first startswith-match, so the bare
-        # form would swallow them. All six tools share the `!parametric-self <verb>`
-        # namespace with non-overlapping verbs (mirrors `!identity status`).
-        command_prefix="!parametric-self status",
+        # Single-token `!parametric-self-<verb>` prefixes (no spaces): the command
+        # dispatcher routes these by exact match on the first token, so no prefix
+        # shadows another and no-arg tools receive no stray positional. A
+        # multi-token prefix would force the buggy first-startswith fallback AND
+        # turn the verb into an `arg0` kwarg the no-arg method rejects. Verbs are
+        # mutually non-nesting so even the startswith fallback stays unambiguous.
+        command_prefix="!parametric-self-status",
     )
     async def parametric_self_status(self) -> ToolResult:
         """Report current state."""
@@ -234,7 +247,7 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-history",
         description="List recent parametric-self training runs (timestamp, trigger, corpus size, val_loss, promoted, reason)",
         category=ToolCategory.SYSTEM,
-        command_prefix="!parametric-self history",
+        command_prefix="!parametric-self-history",
     )
     async def parametric_self_history(self) -> ToolResult:
         """Report the recorded training-run history, most recent first."""
@@ -260,7 +273,7 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-adapters",
         description="List candidate parametric-self adapters on disk with their val_loss, marking which is currently served",
         category=ToolCategory.SYSTEM,
-        command_prefix="!parametric-self adapters",
+        command_prefix="!parametric-self-adapters",
     )
     async def parametric_self_adapters(self) -> ToolResult:
         """List staged candidate adapters, their val_loss, and the served one."""
@@ -306,7 +319,7 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-train-now",
         description="Trigger a parametric-self training run immediately (sovereign-class only); returns once the run has started, not when it finishes",
         category=ToolCategory.SYSTEM,
-        command_prefix="!parametric-self train-now",
+        command_prefix="!parametric-self-train",
     )
     async def parametric_self_train_now(self) -> ToolResult:
         """Kick off a training cycle detached; do not block for the full run."""
@@ -340,14 +353,14 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-set-enabled",
         description="Enable or disable nightly parametric-self training for this agent (sovereign-class only); persists across restarts",
         category=ToolCategory.SYSTEM,
-        command_prefix="!parametric-self set-enabled",
+        command_prefix="!parametric-self-enable",
     )
     async def parametric_self_set_enabled(self, enabled: bool) -> ToolResult:
         """Toggle the agent's own nightly training gate (durable)."""
         gate = self._require_sovereign_class()
         if gate is not None:
             return gate
-        await self.set_config({"enable_nightly_training": bool(enabled)})
+        await self.set_config({"enable_nightly_training": _as_bool(enabled)})
         state = "ENABLED" if self._training_enabled else "disabled"
         return ToolResult.ok(
             confirmation=f"Nightly parametric-self training {state} for this agent.",
@@ -358,7 +371,7 @@ class ParametricSelfFeature(Feature):
         name="parametric-self-rollback",
         description="Roll the served parametric-self adapter back to a prior candidate (sovereign-class only); default = the previously-served promoted adapter",
         category=ToolCategory.SYSTEM,
-        command_prefix="!parametric-self rollback",
+        command_prefix="!parametric-self-rollback",
     )
     async def parametric_self_rollback(self, adapter_id: Optional[str] = None) -> ToolResult:
         """Revert the served adapter to a prior candidate and persist the change."""

@@ -137,6 +137,19 @@ async def test_set_enabled_toggles_and_persists():
     assert f2._training_enabled is True
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ("false", False), ("False", False), ("0", False), ("no", False), ("off", False),
+    ("true", True), ("1", True), (True, True), (False, False),
+])
+async def test_set_enabled_coerces_string_booleans(raw, expected):
+    """A command-path string like 'false' must disable, not enable (bool('false') is True)."""
+    f = await _feature(_FakeStorage())
+    f._training_enabled = not expected  # start from the opposite state
+    result = await f.parametric_self_set_enabled(raw)
+    assert result.status == ToolResultStatus.OK
+    assert f._training_enabled is expected
+
+
 async def test_train_now_unavailable_trainer_fails():
     f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
     f._adapter.is_available = lambda: False
