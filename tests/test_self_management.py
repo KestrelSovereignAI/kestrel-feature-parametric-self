@@ -222,6 +222,15 @@ async def test_on_disable_cancels_in_flight_training_task():
         return {}
 
     f._run_training_cycle = _slow_cycle
+    # Track that the MLX subprocess(es) are also terminated on disable.
+    cancel_all_called = asyncio.Event()
+
+    async def _cancel_all():
+        cancel_all_called.set()
+        return 0
+
+    f._adapter.cancel_all = _cancel_all
+
     result = await f.parametric_self_train_now()
     assert result.status == ToolResultStatus.OK
     await asyncio.wait_for(started.wait(), timeout=2)
@@ -229,6 +238,7 @@ async def test_on_disable_cancels_in_flight_training_task():
     task = f._training_task
     await f.on_disable()
     assert f._training_task is None
+    assert cancel_all_called.is_set()  # subprocess termination requested
     with pytest.raises(asyncio.CancelledError):
         await task
 

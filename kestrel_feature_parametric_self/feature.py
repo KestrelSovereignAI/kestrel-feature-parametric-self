@@ -674,12 +674,22 @@ class ParametricSelfFeature(Feature):
         is not tracked by the framework once the tool returned, so without this a
         disabled/reloaded feature could still promote an adapter and persist
         config after teardown. Cancellation unwinds through ``_run_training_cycle``'s
-        ``finally`` (clearing ``_cycle_in_flight``).
+        ``finally`` (clearing ``_cycle_in_flight``). Cancelling the asyncio task
+        only stops the Python poller, so we also terminate the spawned
+        ``mlx_lm.lora`` subprocess(es) via the adapter — otherwise an orphaned
+        GPU-heavy job keeps running and writing into the adapter dir.
         """
         task = getattr(self, "_training_task", None)
         if task is not None and not task.done():
             task.cancel()
         self._training_task = None
+
+        adapter = getattr(self, "_adapter", None)
+        if adapter is not None and hasattr(adapter, "cancel_all"):
+            try:
+                await adapter.cancel_all()
+            except Exception as e:  # teardown must never raise
+                logger.warning("Failed to cancel parametric-self training subprocess(es): %s", e)
 
         hook = getattr(self, "_sleep_hook", None)
         hooks = getattr(self.agent, "sleep_hooks", None)
