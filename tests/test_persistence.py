@@ -51,6 +51,26 @@ async def test_enable_persists_then_restores_across_restart():
     assert f2._training_enabled is True             # survived the "restart"
 
 
+async def test_served_adapter_and_val_loss_persist_across_restart():
+    """The served-adapter pointer + last val loss survive a restart, so status
+    keeps the pointer and the regression gate keeps its baseline."""
+    storage = _FakeStorage()
+    agent = _agent(storage)
+
+    f1 = ParametricSelfFeature(agent=agent)
+    await f1.initialize()
+    f1._active_adapter_path = "/data/parametric_self/candidates/abc123"
+    f1._last_val_loss = 2.31
+    await f1._persist_config()
+
+    f2 = ParametricSelfFeature(agent=agent)
+    await f2.initialize()
+    assert f2._active_adapter_path is None and f2._last_val_loss is None  # defaults
+    await f2._restore_persisted_config()
+    assert f2._active_adapter_path == "/data/parametric_self/candidates/abc123"
+    assert f2._last_val_loss == 2.31
+
+
 async def test_no_storage_is_graceful():
     agent = _agent(storage=None)
     f = ParametricSelfFeature(agent=agent)

@@ -53,12 +53,19 @@ class _Job:
 
 
 def _mlx_available() -> bool:
-    """True only on Apple Silicon with mlx_lm importable."""
+    """True only on Apple Silicon with a usable MLX runtime.
+
+    Catches more than ImportError on purpose: ``import mlx_lm`` succeeds but
+    pulls in ``mlx.core``, which probes for a Metal device and raises
+    ``RuntimeError: No Metal device available`` on hosts without a GPU (headless
+    CI, sandboxes). Any failure to import/initialise MLX means "trainer
+    unavailable" — it must never crash ``is_available()`` / the status tool.
+    """
     if sys.platform != "darwin" or platform.machine() != "arm64":
         return False
     try:
         import mlx_lm  # noqa: F401  (lazy: never imported at module load)
-    except ImportError:
+    except Exception:
         return False
     return True
 
@@ -126,10 +133,13 @@ class LocalMLXAdapter:
         adapter_dir = Path(config.adapter_path)
         adapter_dir.mkdir(parents=True, exist_ok=True)
         log_path = str(adapter_dir / "train.log")
-        log_fh = open(log_path, "w")  # closed in cleanup()/when the proc ends
 
         job_id = str(uuid.uuid4())
-        proc = subprocess.Popen(argv, stdout=log_fh, stderr=subprocess.STDOUT)  # noqa: S603
+        # Open the log just for the spawn; close the parent's handle right after
+        # — the child keeps its own inherited fd, so this avoids leaking one fd
+        # per training run. read_training_log() re-opens the path on demand.
+        with open(log_path, "w") as log_fh:
+            proc = subprocess.Popen(argv, stdout=log_fh, stderr=subprocess.STDOUT)  # noqa: S603
         self._jobs[job_id] = _Job(
             job_id=job_id,
             agent_id=agent_id,

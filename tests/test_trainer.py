@@ -60,3 +60,28 @@ async def test_start_training_raises_clearly_when_unavailable():
     cfg = TextLoRAConfig(data_dir="/data", adapter_path="/adapters/a")
     with pytest.raises(TrainerUnavailableError):
         await adapter.start_training("agent-1", cfg)
+
+
+def test_mlx_available_handles_metal_runtime_error(monkeypatch):
+    """import mlx_lm can succeed-then-raise RuntimeError (no Metal device) on a
+    GPU-less host; _mlx_available must return False, never propagate (Emma review)."""
+    import kestrel_feature_parametric_self.local_mlx_adapter as mod
+
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    monkeypatch.setattr(mod.platform, "machine", lambda: "arm64")
+
+    real_import = __import__
+
+    def boom(name, *args, **kwargs):
+        if name == "mlx_lm":
+            raise RuntimeError("No Metal device available")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", boom)
+    assert mod._mlx_available() is False  # must not raise
+
+
+def test_is_available_never_raises(monkeypatch):
+    """is_available() is safe to call from the status tool on any host."""
+    adapter = LocalMLXAdapter()
+    assert isinstance(adapter.is_available(), bool)
