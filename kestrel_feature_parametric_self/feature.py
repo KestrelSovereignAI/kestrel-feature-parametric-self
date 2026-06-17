@@ -399,64 +399,83 @@ class ParametricSelfFeature(Feature):
         if candidates is None:
             return ToolResult.failed("Could not resolve the candidates directory for this agent.")
 
-        target_path: Optional[str] = None
-        adapter_id = _strip_key_prefix(adapter_id) if adapter_id else adapter_id
-        if adapter_id:
-            # Only accept a simple child name — reject path separators, '..',
-            # and absolute paths so a rollback can never serve a directory
-            # outside the candidates tree.
-            if Path(adapter_id).name != adapter_id or adapter_id in (".", ".."):
-                return ToolResult.failed(f"Invalid adapter id '{adapter_id}' (must be a candidate directory name).")
-            target = candidates / adapter_id
-            # Defense in depth: confirm the resolved path stays under candidates.
-            if not target.is_dir() or candidates.resolve() not in target.resolve().parents:
-                return ToolResult.failed(f"No candidate adapter '{adapter_id}' on disk.")
-            target_path = str(target)
-        else:
-            # Default: the most recent promoted adapter in history that is not
-            # the one currently served (i.e. the previously-served adapter).
-            runs = await self._load_run_history()
-            promoted_paths = [r.get("adapter_path") for r in runs if r.get("promoted") and r.get("adapter_path")]
-            prior = [p for p in reversed(promoted_paths) if p != self._active_adapter_path]
-            if not prior:
+        # Serialize against training: a concurrent cycle promoting a candidate
+        # could overwrite this rollback, or evaluate its fidelity gate against a
+        # served-adapter baseline this rollback is changing. Share the in-flight
+        # guard so rollback and training never mutate served state at once.
+        if self._cycle_in_flight:
+            return ToolResult.failed(
+                "A parametric-self training run is in progress; cannot roll back until it completes."
+            )
+        self._cycle_in_flight = True
+        try:
+            target_path: Optional[str] = None
+            adapter_id = _strip_key_prefix(adapter_id) if adapter_id else adapter_id
+            if adapter_id:
+                # Only accept a simple child name — reject path separators, '..',
+                # and absolute paths so a rollback can never serve a directory
+                # outside the candidates tree.
+                if Path(adapter_id).name != adapter_id or adapter_id in (".", ".."):
+                    return ToolResult.failed(f"Invalid adapter id '{adapter_id}' (must be a candidate directory name).")
+                target = candidates / adapter_id
+                # Defense in depth: confirm the resolved path stays under candidates.
+                if not target.is_dir() or candidates.resolve() not in target.resolve().parents:
+                    return ToolResult.failed(f"No candidate adapter '{adapter_id}' on disk.")
+                target_path = str(target)
+            else:
+                # Default: the most recent promoted adapter in history that is not
+                # the one currently served (i.e. the previously-served adapter).
+                runs = await self._load_run_history()
+                promoted_paths = [r.get("adapter_path") for r in runs if r.get("promoted") and r.get("adapter_path")]
+                prior = [p for p in reversed(promoted_paths) if p != self._active_adapter_path]
+                if not prior:
+                    return ToolResult.failed(
+                        "No prior promoted adapter to roll back to. "
+                        "Pass an adapter_id from `!parametric-self-adapters`."
+                    )
+                target_path = prior[0]
+                if not Path(target_path).is_dir():
+                    return ToolResult.failed(
+                        f"Prior adapter '{target_path}' is no longer on disk. "
+                        "Pass an adapter_id from `!parametric-self-adapters`."
+                    )
+
+            # Re-read the target's val_loss so the regression baseline tracks the
+            # adapter we are now serving. Refuse to serve an adapter without a
+            # parseable validation loss: serving it would bypass the fidelity
+            # guarantee and leave the anti-regression gate with no baseline.
+            val_loss: Optional[float] = None
+            log = Path(target_path) / "train.log"
+            if log.is_file():
+                try:
+                    val_loss = parse_final_val_loss(log.read_text())
+                except Exception:
+                    val_loss = None
+            if val_loss is None:
                 return ToolResult.failed(
-                    "No prior promoted adapter to roll back to. "
-                    "Pass an adapter_id from `!parametric-self adapters`."
-                )
-            target_path = prior[0]
-            if not Path(target_path).is_dir():
-                return ToolResult.failed(
-                    f"Prior adapter '{target_path}' is no longer on disk. "
-                    "Pass an adapter_id from `!parametric-self adapters`."
+                    f"Adapter '{Path(target_path).name}' has no parseable validation loss "
+                    "(incomplete/failed run); refusing to serve it."
                 )
 
-        # Re-read the target's val_loss so the regression baseline tracks the
-        # adapter we are now serving.
-        val_loss: Optional[float] = None
-        log = Path(target_path) / "train.log"
-        if log.is_file():
-            try:
-                val_loss = parse_final_val_loss(log.read_text())
-            except Exception:
-                val_loss = None
-
-        self._active_adapter_path = target_path
-        self._last_val_loss = val_loss
-        await self._persist_config()
-        await self._append_run_history({
-            "timestamp": _utc_now_iso(),
-            "trigger": "rollback",
-            "trained": False,
-            "promoted": False,
-            "val_loss": val_loss,
-            "reason": f"rolled back served adapter to {Path(target_path).name}",
-            "corpus_train": 0,
-            "adapter_path": target_path,
-        })
-        return ToolResult.ok(
-            confirmation=f"Served adapter rolled back to {Path(target_path).name} (val_loss={val_loss}).",
-            data={"served_adapter": target_path, "served_val_loss": val_loss},
-        )
+            self._active_adapter_path = target_path
+            self._last_val_loss = val_loss
+            await self._persist_config()
+            await self._append_run_history({
+                "timestamp": _utc_now_iso(),
+                "trigger": "rollback",
+                "trained": False,
+                "promoted": False,
+                "val_loss": val_loss,
+                "reason": f"rolled back served adapter to {Path(target_path).name}",
+                "corpus_train": 0,
+                "adapter_path": target_path,
+            })
+            return ToolResult.ok(
+                confirmation=f"Served adapter rolled back to {Path(target_path).name} (val_loss={val_loss}).",
+                data={"served_adapter": target_path, "served_val_loss": val_loss},
+            )
+        finally:
+            self._cycle_in_flight = False
 
     def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
         """Resolve (cognition_db_path, work_dir) for this agent.

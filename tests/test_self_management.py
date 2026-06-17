@@ -267,6 +267,31 @@ async def test_rollback_rejects_path_traversal(tmp_path, bad_id):
     assert f._active_adapter_path is None  # never repointed
 
 
+async def test_rollback_refused_while_cycle_in_flight(tmp_path):
+    """Rollback must not mutate served state while a training cycle is running."""
+    cands = tmp_path / "parametric_self" / "candidates" / "abc123"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Val loss 2.500\n")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._cycle_in_flight = True
+    result = await f.parametric_self_rollback(adapter_id="abc123")
+    assert result.status == ToolResultStatus.ERROR
+    assert "in progress" in (result.error or "")
+    assert f._active_adapter_path is None  # untouched
+
+
+async def test_rollback_refuses_adapter_without_val_loss(tmp_path):
+    """An incomplete candidate (no parseable val_loss) must not be served."""
+    cands = tmp_path / "parametric_self" / "candidates" / "incomplete"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 10: training started...\n")  # no Val loss line
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_rollback(adapter_id="incomplete")
+    assert result.status == ToolResultStatus.ERROR
+    assert "no parseable validation loss" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
 async def test_nightly_cycle_skips_when_manual_run_in_flight():
     """on_post_consolidation must skip (not race) when a cycle is already running."""
     f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
