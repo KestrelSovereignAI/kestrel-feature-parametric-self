@@ -76,6 +76,11 @@ class ParametricSelfFeature(Feature):
         # In-flight manual training run (train_now). Detached so the tool call
         # returns immediately; guarded so only one cycle runs at a time.
         self._training_task: Optional[asyncio.Task] = None
+        # Cross-trigger serialization: nightly (on_post_consolidation) and manual
+        # (train_now) cycles share the same corpus/work dir and the served-adapter
+        # pointer, so only ONE may run at a time. Set/cleared synchronously inside
+        # _run_training_cycle (no await between check and set → atomic in asyncio).
+        self._cycle_in_flight = False
 
     async def get_config(self) -> Dict[str, Any]:
         return {
@@ -310,7 +315,7 @@ class ParametricSelfFeature(Feature):
             return gate
         if not self._adapter.is_available():
             return ToolResult.failed("Trainer unavailable on this host (MLX/Apple Silicon required).")
-        if self._training_task is not None and not self._training_task.done():
+        if self._cycle_in_flight or (self._training_task is not None and not self._training_task.done()):
             return ToolResult.failed("A parametric-self training run is already in progress.")
 
         # Run detached: a full cycle is ~24 min; the tool returns immediately and
@@ -367,8 +372,14 @@ class ParametricSelfFeature(Feature):
 
         target_path: Optional[str] = None
         if adapter_id:
+            # Only accept a simple child name — reject path separators, '..',
+            # and absolute paths so a rollback can never serve a directory
+            # outside the candidates tree.
+            if Path(adapter_id).name != adapter_id or adapter_id in (".", ".."):
+                return ToolResult.failed(f"Invalid adapter id '{adapter_id}' (must be a candidate directory name).")
             target = candidates / adapter_id
-            if not target.is_dir():
+            # Defense in depth: confirm the resolved path stays under candidates.
+            if not target.is_dir() or candidates.resolve() not in target.resolve().parents:
                 return ToolResult.failed(f"No candidate adapter '{adapter_id}' on disk.")
             target_path = str(target)
         else:
@@ -457,7 +468,21 @@ class ParametricSelfFeature(Feature):
         promotes. Every run (including no-op/failed runs that actually trained)
         appends one entry to the run-history store so the agent can introspect
         its own training lifecycle.
+
+        Serialized across triggers: if a cycle is already in flight (nightly or
+        manual), this returns a skip rather than racing on the shared corpus dir
+        and served-adapter pointer.
         """
+        if self._cycle_in_flight:
+            return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
+        self._cycle_in_flight = True
+        try:
+            return await self._run_training_cycle_locked(trigger=trigger)
+        finally:
+            self._cycle_in_flight = False
+
+    async def _run_training_cycle_locked(self, *, trigger: str) -> Dict[str, Any]:
+        """Body of one cycle; only ever called with the in-flight guard held."""
         db_path, work_dir = self._resolve_paths()
         if not db_path or not work_dir:
             return {"trained": False, "promoted": False, "reason": "could not resolve agent storage_path"}

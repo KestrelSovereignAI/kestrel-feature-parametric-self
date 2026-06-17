@@ -235,3 +235,26 @@ async def test_rollback_no_prior_fails(tmp_path):
     result = await f.parametric_self_rollback()
     assert result.status == ToolResultStatus.ERROR
     assert "No prior promoted adapter" in (result.error or "")
+
+
+@pytest.mark.parametrize("bad_id", ["../escape", "/etc", "a/b", "..", "."])
+async def test_rollback_rejects_path_traversal(tmp_path, bad_id):
+    """adapter_id must be a simple child name — never escape the candidates dir."""
+    cands = tmp_path / "parametric_self" / "candidates"
+    cands.mkdir(parents=True)
+    # Create a sibling dir that a '../' could try to reach.
+    (tmp_path / "parametric_self" / "escape").mkdir()
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    result = await f.parametric_self_rollback(adapter_id=bad_id)
+    assert result.status == ToolResultStatus.ERROR
+    assert f._active_adapter_path is None  # never repointed
+
+
+async def test_nightly_cycle_skips_when_manual_run_in_flight():
+    """on_post_consolidation must skip (not race) when a cycle is already running."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._cycle_in_flight = True  # simulate a manual run holding the guard
+    result = await f.on_post_consolidation({"episodes_created": 1})
+    assert result["trained"] is False
+    assert "in progress" in result["reason"]
