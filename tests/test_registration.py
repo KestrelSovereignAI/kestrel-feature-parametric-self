@@ -96,9 +96,11 @@ def test_each_command_resolves_to_its_own_tool():
         "!parametric-self-status": "parametric-self-status",
         "!parametric-self-history": "parametric-self-history",
         "!parametric-self-adapters": "parametric-self-adapters",
+        "!parametric-self-progress": "parametric-self-progress",
         "!parametric-self-train": "parametric-self-train-now",
         "!parametric-self-enable enabled=false": "parametric-self-set-enabled",
         "!parametric-self-rollback adapter_id=abc": "parametric-self-rollback",
+        "!parametric-self-adopt adapter_id=abc": "parametric-self-adopt",
     }
     for command, expected in cases.items():
         assert feature.get_skill_for_command(command) == expected, command

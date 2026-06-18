@@ -56,6 +56,7 @@ async def run_nightly_cycle(
     gate: FidelityGate,
     config: TextLoRAConfig,
     prior_val_loss: Optional[float] = None,
+    adapter_id: Optional[str] = None,
     poll_interval: float = 2.0,
     max_polls: int = 5400,  # ~3h at 2s; a backstop, not a deadline
 ) -> CycleResult:
@@ -69,8 +70,10 @@ async def run_nightly_cycle(
     # never overwrite the currently-served adapter — the served adapter is the
     # promoted staging dir of a *prior* run, which this run never touches.
     # (Accumulating staging dirs is the adapter-lifecycle concern tracked for
-    # P5 in epic #1.)
-    adapter_dir = str(work / "candidates" / uuid.uuid4().hex[:12])
+    # P5 in epic #1.) The caller may supply the staging-dir name so it can
+    # surface the in-progress run (and its candidate) before the cycle returns;
+    # otherwise a fresh id is minted here.
+    adapter_dir = str(work / "candidates" / (adapter_id or uuid.uuid4().hex[:12]))
 
     stats = build_corpus(db_path, corpus_dir)
     if stats.train == 0:

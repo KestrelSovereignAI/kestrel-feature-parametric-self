@@ -31,8 +31,11 @@ tools:
     description: Recent training runs (ts, trigger, corpus, val_loss, promoted)
     command: "!parametric-self-history"
   - name: parametric-self-adapters
-    description: Candidate adapters on disk with val_loss; marks the served one
+    description: Candidate adapters on disk with val_loss; marks served/in-progress/recoverable state
     command: "!parametric-self-adapters"
+  - name: parametric-self-progress
+    description: Active training run progress, including run_id, adapter_id, iter, and intermediate val_loss
+    command: "!parametric-self-progress"
   # Management tools — sovereign-class agents only (Incubator Principle).
   - name: parametric-self-train-now
     description: Trigger a training run now (detached); returns once started
@@ -43,6 +46,9 @@ tools:
   - name: parametric-self-rollback
     description: Roll the served adapter back to a prior candidate
     command: "!parametric-self-rollback"
+  - name: parametric-self-adopt
+    description: Adopt a valid unserved candidate adapter as served
+    command: "!parametric-self-adopt"
 
 # Integration hooks
 hooks:
