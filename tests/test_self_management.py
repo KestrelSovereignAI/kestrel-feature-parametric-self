@@ -185,6 +185,12 @@ async def test_train_now_starts_detached_run():
     result = await f.parametric_self_train_now()
     assert result.status == ToolResultStatus.OK
     assert result.data["started"] is True
+    assert result.data["active_run"]["state"] == "in_progress"
+    assert result.data["active_run"]["trigger"] == "manual"
+    assert result.data["active_run"] == f._active_run
+    runs = await f._load_run_history()
+    assert runs[-1]["run_id"] == result.data["active_run"]["run_id"]
+    assert runs[-1]["state"] == "in_progress"
     await asyncio.wait_for(ran.wait(), timeout=2)
     await f._training_task  # detached task completed cleanly
 
@@ -257,10 +263,15 @@ async def test_on_disable_clears_guard_when_cancel_precedes_runner():
     result = await f.parametric_self_train_now()
     assert result.status == ToolResultStatus.OK
     assert f._cycle_in_flight is True  # reserved synchronously by train_now
+    assert f._active_run is not None
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "in_progress"
     # Disable BEFORE yielding to the loop, so _runner never starts.
     await f.on_disable()
     assert f._cycle_in_flight is False  # guard force-cleared on teardown
     assert f._training_task is None
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
 
 
 async def test_rollback_default_to_previous_promoted(tmp_path):

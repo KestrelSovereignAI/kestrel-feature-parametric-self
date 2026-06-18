@@ -494,23 +494,37 @@ class ParametricSelfFeature(Feature):
         if self._cycle_in_flight or (self._training_task is not None and not self._training_task.done()):
             return ToolResult.failed("A parametric-self training run is already in progress.")
 
+        db_path, work_dir = self._resolve_paths()
+        if not db_path or not work_dir:
+            return ToolResult.failed("Could not resolve agent storage_path for parametric-self training.")
+
         # Reserve the cross-trigger guard HERE, synchronously, before detaching:
         # otherwise the nightly hook could fire in the same event-loop turn,
         # acquire the guard first, and the detached manual run would skip as
         # "already in progress" — contradicting the "started" we report. There is
         # no await between the busy-check above and this set, so it is atomic.
         self._cycle_in_flight = True
+        active_run = await self._begin_active_run(trigger="manual", work_dir=work_dir)
 
         # Run detached: a full cycle is ~24 min; the tool returns immediately and
-        # the run records itself in history on completion. The runner calls the
-        # LOCKED body (the guard is already held) and clears it in finally. Errors
-        # are logged, not surfaced (poll !parametric-self-history for the outcome).
+        # the run record already exists by the time started=True is returned. The
+        # runner calls the LOCKED body (the guard is already held) and clears it
+        # in finally. Errors are logged, not surfaced (poll history/progress for
+        # the outcome).
         async def _runner() -> None:
             try:
                 await self._run_training_cycle_locked(trigger="manual")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                active = getattr(self, "_active_run", None)
+                if active is not None:
+                    await self._update_run_history(active["run_id"], {
+                        "state": "failed",
+                        "timestamp": _utc_now_iso(),
+                        "reason": f"training error: {exc}",
+                    })
+                    self._active_run = None
                 logger.warning("parametric-self manual training run failed: %s", exc)
             finally:
                 self._cycle_in_flight = False
@@ -523,7 +537,7 @@ class ParametricSelfFeature(Feature):
                 "val_loss is NOT the final result), and `!parametric-self-history` "
                 "for the outcome."
             ),
-            data={"started": True},
+            data={"started": True, "active_run": active_run},
         )
 
     @tool(
@@ -798,37 +812,19 @@ class ParametricSelfFeature(Feature):
         agent_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "name", "agent")
         config = TextLoRAConfig.from_dict(self._base_config.to_dict())
 
-        # Mint the run + candidate ids up front so the in-progress run (and its
-        # candidate dir) are introspectable BEFORE the cycle returns. The history
-        # entry is appended now as ``state=in_progress`` and updated in place on
-        # completion/failure — not appended only after the run finishes — so an
-        # agent can tell a still-active run from a terminal one (issue #17).
-        run_id = uuid.uuid4().hex[:12]
-        adapter_id = uuid.uuid4().hex[:12]
-        adapter_path = str(Path(work_dir) / "candidates" / adapter_id)
-        started_at = _utc_now_iso()
-        self._active_run = {
-            "run_id": run_id,
-            "adapter_id": adapter_id,
-            "trigger": trigger,
-            "started_at": started_at,
-            "state": "in_progress",
-            "adapter_path": adapter_path,
-        }
-        await self._append_run_history({
-            "run_id": run_id,
-            "timestamp": started_at,
-            "started_at": started_at,
-            "trigger": trigger,
-            "state": "in_progress",
-            "trained": False,
-            "promoted": False,
-            "val_loss": None,
-            "reason": "training in progress",
-            "corpus_train": 0,
-            "adapter_id": adapter_id,
-            "adapter_path": adapter_path,
-        })
+        # Manual ``train_now`` creates this record before returning started=True;
+        # nightly/direct cycles create it here. In either path the same durable
+        # record is later updated in place to terminal state.
+        active_run = self._active_run
+        if not (
+            active_run
+            and active_run.get("state") == "in_progress"
+            and active_run.get("trigger") == trigger
+        ):
+            active_run = await self._begin_active_run(trigger=trigger, work_dir=work_dir)
+        run_id = active_run["run_id"]
+        adapter_id = active_run["adapter_id"]
+        adapter_path = active_run["adapter_path"]
 
         try:
             result = await run_nightly_cycle(
@@ -887,6 +883,37 @@ class ParametricSelfFeature(Feature):
         })
         self._active_run = None
         return outcome
+
+    async def _begin_active_run(self, *, trigger: str, work_dir: str) -> Dict[str, Any]:
+        """Create the durable in-progress record for a training run."""
+        run_id = uuid.uuid4().hex[:12]
+        adapter_id = uuid.uuid4().hex[:12]
+        adapter_path = str(Path(work_dir) / "candidates" / adapter_id)
+        started_at = _utc_now_iso()
+        active_run = {
+            "run_id": run_id,
+            "adapter_id": adapter_id,
+            "trigger": trigger,
+            "started_at": started_at,
+            "state": "in_progress",
+            "adapter_path": adapter_path,
+        }
+        self._active_run = dict(active_run)
+        await self._append_run_history({
+            "run_id": run_id,
+            "timestamp": started_at,
+            "started_at": started_at,
+            "trigger": trigger,
+            "state": "in_progress",
+            "trained": False,
+            "promoted": False,
+            "val_loss": None,
+            "reason": "training in progress",
+            "corpus_train": 0,
+            "adapter_id": adapter_id,
+            "adapter_path": adapter_path,
+        })
+        return dict(active_run)
 
     # ------------------------------------------------------------------
     # Run-history store (append-only, capped) — lets the agent introspect
