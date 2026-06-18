@@ -22,6 +22,8 @@ from typing import Optional
 
 # Matches mlx_lm.lora lines like: "Iter 400: Val loss 2.208, Val took 42.083s"
 _VAL_LOSS_RE = re.compile(r"Val loss\s+([0-9]+(?:\.[0-9]+)?)")
+# Matches the iteration counter in either Train- or Val-loss lines: "Iter 400:".
+_ITER_RE = re.compile(r"Iter\s+([0-9]+)")
 
 
 def parse_final_val_loss(log_text: str) -> Optional[float]:
@@ -35,6 +37,20 @@ def parse_final_val_loss(log_text: str) -> Optional[float]:
     if not matches:
         return None
     return float(matches[-1])
+
+
+def parse_latest_iter(log_text: str) -> Optional[int]:
+    """Return the most recent training iteration reported in the log.
+
+    Used only to surface progress for an in-flight run (``last_seen_iter``); a
+    mid-run ``Val loss`` is an intermediate snapshot, never a terminal result,
+    so the iter lets an operator see the run is still advancing rather than
+    mistaking an intermediate loss for the final one.
+    """
+    matches = _ITER_RE.findall(log_text or "")
+    if not matches:
+        return None
+    return int(matches[-1])
 
 
 @dataclass

@@ -20,6 +20,7 @@ only during sleep.
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,7 +30,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from .cycle import run_nightly_cycle
-from .fidelity import FidelityGate, parse_final_val_loss
+from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
 from .local_mlx_adapter import LocalMLXAdapter
 from .text_types import TextLoRAConfig
 
@@ -104,6 +105,12 @@ class ParametricSelfFeature(Feature):
         # In-flight manual training run (train_now). Detached so the tool call
         # returns immediately; guarded so only one cycle runs at a time.
         self._training_task: Optional[asyncio.Task] = None
+        # The currently-running cycle's durable record (run_id, adapter_id,
+        # trigger, started_at, state, adapter_path), or None when idle. Set when
+        # a cycle begins so the introspection tools can distinguish "no run",
+        # "run in progress", and "run completed/failed" instead of treating an
+        # intermediate Val-loss snapshot as terminal (issue #17).
+        self._active_run: Optional[Dict[str, Any]] = None
         # Cross-trigger serialization: nightly (on_post_consolidation) and manual
         # (train_now) cycles share the same corpus/work dir and the served-adapter
         # pointer, so only ONE may run at a time. Set/cleared synchronously inside
@@ -226,6 +233,7 @@ class ParametricSelfFeature(Feature):
             if self._active_adapter_path is None
             else []
         )
+        active_run = self._active_run_progress()
         data = {
             "training_enabled": self._training_enabled,
             "trainer_available": self._adapter.is_available(),
@@ -233,18 +241,54 @@ class ParametricSelfFeature(Feature):
             "served_adapter": self._active_adapter_path,
             "served_val_loss": self._last_val_loss,
             "recoverable_adapters": recoverable,
+            "active_run": active_run,
         }
         confirmation = (
             "Parametric-self "
             + ("ENABLED" if self._training_enabled else "disabled")
             + f"; trainer {'available' if data['trainer_available'] else 'unavailable on this host'}."
         )
+        if active_run:
+            confirmation += (
+                f" A {active_run['trigger']} training run is in progress"
+                f" (run {active_run['run_id']}, iter {active_run.get('last_seen_iter')},"
+                f" latest val_loss {active_run.get('latest_val_loss')})."
+            )
         if recoverable:
             confirmation += (
                 f" No adapter served; {len(recoverable)} valid candidate(s) recoverable via "
                 "`!parametric-self-adopt`."
             )
         return ToolResult.ok(confirmation=confirmation, data=data)
+
+    def _active_run_progress(self) -> Optional[Dict[str, Any]]:
+        """The in-flight run record enriched with live progress, or None if idle.
+
+        Reads the candidate's ``train.log`` to attach ``last_seen_iter`` and
+        ``latest_val_loss`` so an operator monitoring a long detached run sees it
+        advancing (iter 60 -> 230 -> 400) rather than mistaking an intermediate
+        validation-loss snapshot for the final, terminal result (issue #17).
+        """
+        run = self._active_run
+        if not run:
+            return None
+        progress = dict(run)
+        last_seen_iter: Optional[int] = None
+        latest_val_loss: Optional[float] = None
+        adapter_path = run.get("adapter_path")
+        if adapter_path:
+            log = Path(adapter_path) / "train.log"
+            if log.is_file():
+                try:
+                    text = log.read_text()
+                    last_seen_iter = parse_latest_iter(text)
+                    latest_val_loss = parse_final_val_loss(text)
+                except Exception:
+                    last_seen_iter = None
+                    latest_val_loss = None
+        progress["last_seen_iter"] = last_seen_iter
+        progress["latest_val_loss"] = latest_val_loss
+        return progress
 
     # ------------------------------------------------------------------
     # Incubator-Principle gate for the mutation tools
@@ -289,13 +333,18 @@ class ParametricSelfFeature(Feature):
     def _scan_candidates(self) -> List[Dict[str, Any]]:
         """Scan the candidates dir for staged adapters with parsed val_loss.
 
-        Each entry carries ``served`` (is this the currently-served adapter) and
-        ``recoverable`` (a valid candidate — parseable val_loss — while NO adapter
-        is served yet; the lifecycle state where a completed run left a candidate
-        on disk but no served pointer, adoptable via ``parametric-self-adopt``).
+        Each entry carries ``served`` (is this the currently-served adapter),
+        ``in_progress`` (this candidate belongs to the run currently training),
+        and ``recoverable`` (a valid candidate — parseable val_loss — while NO
+        adapter is served yet; the lifecycle state where a *completed* run left a
+        candidate on disk but no served pointer, adoptable via
+        ``parametric-self-adopt``). An in-progress candidate is never recoverable:
+        its parsed ``val_loss`` is an intermediate snapshot, not a terminal
+        result, so it must not be presented as adoptable (issue #17).
         """
         candidates = self._candidates_dir()
         served = self._active_adapter_path
+        active_id = self._active_run.get("adapter_id") if self._active_run else None
         adapters: List[Dict[str, Any]] = []
         if candidates and candidates.is_dir():
             for d in sorted(candidates.iterdir()):
@@ -308,12 +357,14 @@ class ParametricSelfFeature(Feature):
                         val_loss = parse_final_val_loss(log.read_text())
                     except Exception:
                         val_loss = None
+                in_progress = active_id is not None and d.name == active_id
                 adapters.append({
                     "adapter_id": d.name,
                     "path": str(d),
                     "val_loss": val_loss,
                     "served": str(d) == str(served) if served else False,
-                    "recoverable": served is None and val_loss is not None,
+                    "in_progress": in_progress,
+                    "recoverable": served is None and val_loss is not None and not in_progress,
                 })
         return adapters
 
@@ -337,11 +388,16 @@ class ParametricSelfFeature(Feature):
                 data={"runs": []},
             )
         promoted = sum(1 for r in recent if r.get("promoted"))
-        lines = [f"{len(recent)} training run(s) recorded ({promoted} promoted):"]
+        in_progress = sum(1 for r in recent if r.get("state") == "in_progress")
+        header = f"{len(recent)} training run(s) recorded ({promoted} promoted"
+        header += f", {in_progress} in progress):" if in_progress else "):"
+        lines = [header]
         for r in recent[:10]:
+            # Older entries predate the state field; default to a terminal label.
+            state = r.get("state", "completed")
             lines.append(
                 f"  {r.get('timestamp', '?')} [{r.get('trigger', '?')}] "
-                f"trained={r.get('trained')} promoted={r.get('promoted')} "
+                f"state={state} trained={r.get('trained')} promoted={r.get('promoted')} "
                 f"val_loss={r.get('val_loss')} corpus={r.get('corpus_train')} "
                 f"— {r.get('reason', '')}".rstrip()
             )
@@ -367,6 +423,8 @@ class ParametricSelfFeature(Feature):
         for a in adapters:
             if a["served"]:
                 mark = " (served)"
+            elif a.get("in_progress"):
+                mark = " (in progress — training, val_loss is intermediate)"
             elif a["recoverable"]:
                 mark = " (recoverable — adopt with !parametric-self-adopt)"
             else:
@@ -384,6 +442,36 @@ class ParametricSelfFeature(Feature):
                 "served_adapter": served,
                 "recoverable_adapters": recoverable,
             },
+        )
+
+    @tool(
+        name="parametric-self-progress",
+        description="Report the parametric-self training run currently in progress (run_id, trigger, state, last_seen_iter, latest_val_loss), or that none is active",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!parametric-self-progress",
+    )
+    async def parametric_self_progress(self) -> ToolResult:
+        """Report the in-flight run so a detached run is not mistaken for done.
+
+        Distinguishes "no run exists" from "a run is still active": the run
+        history is completion-only for terminal outcomes, so this is the
+        first-class surface for an in-progress run and its live ``train.log``
+        progress (issue #17).
+        """
+        active_run = self._active_run_progress()
+        if not active_run:
+            return ToolResult.ok(
+                confirmation="No parametric-self training run is in progress.",
+                data={"active_run": None},
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"A {active_run['trigger']} training run is in progress "
+                f"(run {active_run['run_id']}, adapter {active_run.get('adapter_id')}, "
+                f"started {active_run.get('started_at')}): iter {active_run.get('last_seen_iter')}, "
+                f"latest val_loss {active_run.get('latest_val_loss')} (intermediate, not final)."
+            ),
+            data={"active_run": active_run},
         )
 
     # ------------------------------------------------------------------
@@ -431,7 +519,9 @@ class ParametricSelfFeature(Feature):
         return ToolResult.ok(
             confirmation=(
                 "Parametric-self training run started in the background. "
-                "Check `!parametric-self-history` for the outcome."
+                "Poll `!parametric-self-progress` while it runs (an intermediate "
+                "val_loss is NOT the final result), and `!parametric-self-history` "
+                "for the outcome."
             ),
             data={"started": True},
         )
@@ -708,15 +798,62 @@ class ParametricSelfFeature(Feature):
         agent_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "name", "agent")
         config = TextLoRAConfig.from_dict(self._base_config.to_dict())
 
-        result = await run_nightly_cycle(
-            agent_id=str(agent_id),
-            db_path=db_path,
-            work_dir=work_dir,
-            adapter=self._adapter,
-            gate=self._gate,
-            config=config,
-            prior_val_loss=self._last_val_loss,
-        )
+        # Mint the run + candidate ids up front so the in-progress run (and its
+        # candidate dir) are introspectable BEFORE the cycle returns. The history
+        # entry is appended now as ``state=in_progress`` and updated in place on
+        # completion/failure — not appended only after the run finishes — so an
+        # agent can tell a still-active run from a terminal one (issue #17).
+        run_id = uuid.uuid4().hex[:12]
+        adapter_id = uuid.uuid4().hex[:12]
+        adapter_path = str(Path(work_dir) / "candidates" / adapter_id)
+        started_at = _utc_now_iso()
+        self._active_run = {
+            "run_id": run_id,
+            "adapter_id": adapter_id,
+            "trigger": trigger,
+            "started_at": started_at,
+            "state": "in_progress",
+            "adapter_path": adapter_path,
+        }
+        await self._append_run_history({
+            "run_id": run_id,
+            "timestamp": started_at,
+            "started_at": started_at,
+            "trigger": trigger,
+            "state": "in_progress",
+            "trained": False,
+            "promoted": False,
+            "val_loss": None,
+            "reason": "training in progress",
+            "corpus_train": 0,
+            "adapter_id": adapter_id,
+            "adapter_path": adapter_path,
+        })
+
+        try:
+            result = await run_nightly_cycle(
+                agent_id=str(agent_id),
+                db_path=db_path,
+                work_dir=work_dir,
+                adapter=self._adapter,
+                gate=self._gate,
+                config=config,
+                prior_val_loss=self._last_val_loss,
+                adapter_id=adapter_id,
+            )
+        except asyncio.CancelledError:
+            # Cancellation (e.g. on_disable) marks the record interrupted; that
+            # durable update is done by on_disable, not here, because awaiting
+            # storage during cancellation re-raises immediately.
+            raise
+        except Exception as exc:
+            await self._update_run_history(run_id, {
+                "state": "failed",
+                "timestamp": _utc_now_iso(),
+                "reason": f"training error: {exc}",
+            })
+            self._active_run = None
+            raise
 
         if result.promoted and result.promoted_adapter_path:
             self._active_adapter_path = result.promoted_adapter_path
@@ -736,16 +873,19 @@ class ParametricSelfFeature(Feature):
             "reason": result.reason,
             "corpus_train": result.corpus_train,
         }
-        await self._append_run_history({
+        await self._update_run_history(run_id, {
+            "state": "completed",
             "timestamp": _utc_now_iso(),
-            "trigger": trigger,
             "trained": result.trained,
             "promoted": result.promoted,
             "val_loss": result.val_loss,
             "reason": result.reason,
             "corpus_train": result.corpus_train,
-            "adapter_path": result.promoted_adapter_path,
+            # Record the served path only on promotion (matches the prior
+            # contract); otherwise keep the candidate path for traceability.
+            "adapter_path": result.promoted_adapter_path or adapter_path,
         })
+        self._active_run = None
         return outcome
 
     # ------------------------------------------------------------------
@@ -775,6 +915,69 @@ class ParametricSelfFeature(Feature):
             ))
         except Exception as e:  # history is best-effort; never break a cycle
             logger.warning("Failed to append parametric-self run history: %s", e)
+
+    async def _update_run_history(self, run_id: str, updates: Dict[str, Any]) -> None:
+        """Merge ``updates`` into the most recent history entry with ``run_id``.
+
+        Lets a run's record transition in place (``in_progress`` -> ``completed``/
+        ``failed``/``interrupted``) instead of appending a second entry, so an
+        in-flight run is one durable record an agent can poll to completion.
+        No-ops if the entry is gone (capped out) — falls back to appending so the
+        outcome is never silently lost.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            return
+        try:
+            from kestrel_sovereign.storage.async_graph_store import GraphNode
+            runs = await self._load_run_history()
+            for entry in reversed(runs):
+                if entry.get("run_id") == run_id:
+                    entry.update(updates)
+                    break
+            else:
+                merged = {"run_id": run_id}
+                merged.update(updates)
+                runs.append(merged)
+                runs = runs[-_RUN_HISTORY_LIMIT:]
+            await storage.add_node(GraphNode(
+                node_id=self._history_node_id(),
+                node_type="parametric_self_runs",
+                label=f"{self.name} training runs",
+                properties={"runs": runs},
+            ))
+        except Exception as e:  # history is best-effort; never break a cycle
+            logger.warning("Failed to update parametric-self run history: %s", e)
+
+    async def _reconcile_stale_runs(self) -> None:
+        """Mark any persisted ``in_progress`` run as interrupted on load.
+
+        A detached run does not survive a restart, so an ``in_progress`` entry
+        found at startup is stale: its task is gone and it will never complete.
+        Flipping it to ``interrupted`` keeps history honest and prevents the
+        progress/status tools from reporting a run that is not actually running.
+        """
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            return
+        try:
+            from kestrel_sovereign.storage.async_graph_store import GraphNode
+            runs = await self._load_run_history()
+            changed = False
+            for entry in runs:
+                if entry.get("state") == "in_progress":
+                    entry["state"] = "interrupted"
+                    entry["reason"] = "run interrupted (process restarted before completion)"
+                    changed = True
+            if changed:
+                await storage.add_node(GraphNode(
+                    node_id=self._history_node_id(),
+                    node_type="parametric_self_runs",
+                    label=f"{self.name} training runs",
+                    properties={"runs": runs},
+                ))
+        except Exception as e:  # reconciliation is best-effort; never break load
+            logger.warning("Failed to reconcile stale parametric-self runs: %s", e)
 
     async def _load_run_history(self) -> List[Dict[str, Any]]:
         """Load the run-history list (most recent last); [] if absent/malformed."""
@@ -809,6 +1012,9 @@ class ParametricSelfFeature(Feature):
         from .sleep_hook import create_parametric_self_sleep_hook
 
         await self._restore_persisted_config()
+        # A detached run can't survive a restart; reconcile any lingering
+        # in_progress record so introspection never reports a dead run as active.
+        await self._reconcile_stale_runs()
 
         if getattr(agent, "sleep_hooks", None) is None:
             agent.sleep_hooks = []
@@ -845,6 +1051,19 @@ class ParametricSelfFeature(Feature):
         # _runner started, its finally never ran and the guard would stay stuck,
         # permanently refusing later train/rollback on a re-enabled instance.
         self._cycle_in_flight = False
+        # Durably mark a cancelled in-flight run interrupted from here (a normal
+        # async context), since the cancelled cycle body cannot await storage.
+        active_run = getattr(self, "_active_run", None)
+        if active_run is not None:
+            try:
+                await self._update_run_history(active_run["run_id"], {
+                    "state": "interrupted",
+                    "timestamp": _utc_now_iso(),
+                    "reason": "run cancelled (feature disabled)",
+                })
+            except Exception as e:  # teardown must never raise
+                logger.warning("Failed to mark parametric-self run interrupted: %s", e)
+            self._active_run = None
 
         adapter = getattr(self, "_adapter", None)
         if adapter is not None and hasattr(adapter, "cancel_all"):

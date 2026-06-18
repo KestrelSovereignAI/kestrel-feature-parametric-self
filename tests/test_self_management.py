@@ -495,3 +495,158 @@ async def test_adopt_refused_while_cycle_in_flight(tmp_path):
     assert result.status == ToolResultStatus.ERROR
     assert "in progress" in (result.error or "")
     assert f._active_adapter_path is None
+
+
+# ----------------------------------------------------------------------
+# In-progress run surface (issue #17)
+# ----------------------------------------------------------------------
+
+async def test_progress_none_when_idle():
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    result = await f.parametric_self_progress()
+    assert result.status == ToolResultStatus.OK
+    assert result.data["active_run"] is None
+    assert "No parametric-self training run" in result.confirmation
+
+
+async def test_progress_reports_active_run_with_live_iter(tmp_path):
+    """An active run surfaces its run_id and the latest log iter, marking the
+    intermediate val_loss as non-terminal (the core of issue #17)."""
+    work = tmp_path / "parametric_self"
+    cands = work / "candidates" / "abc123def456"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text(
+        "Iter 60: Val loss 8.977\nIter 230: Val loss 1.86\nIter 400: Val loss 2.69\n"
+    )
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._active_run = {
+        "run_id": "run0001",
+        "adapter_id": "abc123def456",
+        "trigger": "manual",
+        "started_at": "2026-06-18T01:00:00+00:00",
+        "state": "in_progress",
+        "adapter_path": str(cands),
+    }
+
+    result = await f.parametric_self_progress()
+    assert result.status == ToolResultStatus.OK
+    run = result.data["active_run"]
+    assert run["run_id"] == "run0001"
+    assert run["state"] == "in_progress"
+    assert run["last_seen_iter"] == 400
+    assert run["latest_val_loss"] == pytest.approx(2.69)
+
+
+async def test_status_exposes_active_run(tmp_path):
+    work = tmp_path / "parametric_self"
+    cands = work / "candidates" / "abc123def456"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 400: Val loss 2.69\n")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._active_run = {
+        "run_id": "run0001", "adapter_id": "abc123def456", "trigger": "manual",
+        "started_at": "2026-06-18T01:00:00+00:00", "state": "in_progress",
+        "adapter_path": str(cands),
+    }
+    result = await f.parametric_self_status()
+    assert result.status == ToolResultStatus.OK
+    assert result.data["active_run"]["run_id"] == "run0001"
+    assert "in progress" in result.confirmation
+
+
+async def test_active_candidate_marked_in_progress_not_recoverable(tmp_path):
+    """A candidate of the active run must read in_progress, never recoverable,
+    so an intermediate snapshot isn't presented as adoptable."""
+    work = tmp_path / "parametric_self"
+    cands = work / "candidates" / "abc123def456"
+    cands.mkdir(parents=True)
+    (cands / "train.log").write_text("Iter 230: Val loss 1.86\n")  # intermediate
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    assert f._active_adapter_path is None  # nothing served yet
+    f._active_run = {
+        "run_id": "run0001", "adapter_id": "abc123def456", "trigger": "manual",
+        "started_at": "2026-06-18T01:00:00+00:00", "state": "in_progress",
+        "adapter_path": str(cands),
+    }
+    result = await f.parametric_self_adapters()
+    by_id = {a["adapter_id"]: a for a in result.data["adapters"]}
+    assert by_id["abc123def456"]["in_progress"] is True
+    assert by_id["abc123def456"]["recoverable"] is False
+    assert result.data["recoverable_adapters"] == []
+
+
+async def test_cycle_records_in_progress_then_completed(tmp_path):
+    """The cycle appends an in_progress entry up front and updates it in place
+    on completion — one durable record, not a completion-only append."""
+    db = _db_path_with_corpus(tmp_path)
+    f = await _feature(_FakeStorage(), storage_path=db)
+    f._adapter.is_available = lambda: True
+    seen_states = []
+
+    real_run = f._run_training_cycle_locked
+
+    # Capture history state mid-run by patching run_nightly_cycle via the module.
+    import kestrel_feature_parametric_self.feature as feat_mod
+
+    async def _fake_run_cycle(**kwargs):
+        runs = await f._load_run_history()
+        seen_states.append(runs[-1]["state"])  # in_progress while running
+        from kestrel_feature_parametric_self.cycle import CycleResult
+        return CycleResult(
+            trained=True, promoted=True, reason="ok", val_loss=1.2,
+            promoted_adapter_path=kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"],
+            corpus_train=5,
+        )
+
+    orig = feat_mod.run_nightly_cycle
+    feat_mod.run_nightly_cycle = _fake_run_cycle
+    try:
+        outcome = await real_run(trigger="manual")
+    finally:
+        feat_mod.run_nightly_cycle = orig
+
+    assert outcome["promoted"] is True
+    assert seen_states == ["in_progress"]
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "completed"
+    assert runs[-1]["trained"] is True
+    assert f._active_run is None
+
+
+async def test_cycle_marks_failed_on_exception(tmp_path):
+    db = _db_path_with_corpus(tmp_path)
+    f = await _feature(_FakeStorage(), storage_path=db)
+    import kestrel_feature_parametric_self.feature as feat_mod
+
+    async def _boom(**kwargs):
+        raise RuntimeError("kaboom")
+
+    orig = feat_mod.run_nightly_cycle
+    feat_mod.run_nightly_cycle = _boom
+    try:
+        with pytest.raises(RuntimeError):
+            await f._run_training_cycle_locked(trigger="manual")
+    finally:
+        feat_mod.run_nightly_cycle = orig
+
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "failed"
+    assert "kaboom" in runs[-1]["reason"]
+    assert f._active_run is None
+
+
+async def test_reconcile_marks_stale_in_progress_interrupted():
+    storage = _FakeStorage()
+    f = await _feature(storage)
+    await f._append_run_history({
+        "run_id": "stale1", "trigger": "manual", "state": "in_progress",
+        "trained": False, "promoted": False,
+    })
+    await f._reconcile_stale_runs()
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+
+
+def _db_path_with_corpus(tmp_path) -> str:
+    """Minimal storage_path; run_nightly_cycle is faked so the DB is unused."""
+    return str(tmp_path / "kestrel_prime.db")
