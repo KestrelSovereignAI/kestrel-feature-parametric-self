@@ -74,6 +74,24 @@ Without one, the promotion gate is theater.
 ### 5.3 Arbitration
 When the frontier brain says X and the second brain "believes" Y (stale or overfit), which wins, and is the disagreement surfaced? This needs an explicit doctrine, not an implicit default.
 
+### 5.4 Privacy & forgetting (F377)
+Training turns user-authored content into two artifacts: a **transient corpus**
+(`train.jsonl` / `valid.jsonl`) and **durable adapter weights**. Two consequences:
+
+- **Corpus is transient input, not durable state.** `run_nightly_cycle` builds
+  the corpus fresh each cycle and deletes the JSONL files in a `finally` once the
+  trainer has consumed them — no plaintext user content lingers on disk.
+- **The cycle is gated on the platform privacy decision.** When the agent's
+  privacy mode hides persisted user content (ephemeral / temp storage,
+  `hides_persisted_user_content`), the whole cycle is skipped at the
+  `_run_training_cycle` chokepoint — content that may not be durably retained
+  must not be baked into weights.
+- **Promoted weights may retain deleted facts.** Once a fact is trained into a
+  promoted adapter, deleting the source fact does NOT remove its influence from
+  the weights. Fact-deletion → adapter-invalidation (re-train / roll back the
+  served adapter when source facts are forgotten) is the follow-up lifecycle
+  item tracked in epic #1.
+
 ## 6. Where it lives in the system
 
 - **Training trigger:** a new phase in the sleep cycle, after `_consolidate_memories()` in `kestrel_sovereign/agent/sleep.py`. Consolidation already produces the curated corpus.

@@ -141,3 +141,78 @@ async def test_cycle_reports_training_failure(tmp_path):
     )
     assert result.trained is False
     assert "did not complete" in result.reason
+
+
+class _CorpusSpyAdapter(_FakeAdapter):
+    """Records whether the corpus existed at training time, to prove the files
+    are built + consumed BEFORE the cycle deletes them (F377)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.train_existed_during = None
+
+    async def start_training(self, agent_id, config):
+        from pathlib import Path
+        self.train_existed_during = (Path(config.data_dir) / "train.jsonl").exists()
+        return await super().start_training(agent_id, config)
+
+
+async def test_cycle_deletes_corpus_after_training(tmp_path):
+    from pathlib import Path
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    work = tmp_path / "work"
+    adapter = _CorpusSpyAdapter(log="Iter 100: Val loss 1.2")
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work),
+        adapter=adapter, gate=FidelityGate(max_val_loss=3.0),
+        config=TextLoRAConfig(), poll_interval=0, adapter_id="delrun",
+    )
+    assert result.trained is True
+    # The corpus existed during training (built + consumed)...
+    assert adapter.train_existed_during is True
+    # ...and is deleted afterwards — no durable plaintext user content (F377).
+    corpus = work / "corpus" / "delrun"  # per-run corpus dir
+    assert not (corpus / "train.jsonl").exists()
+    assert not (corpus / "valid.jsonl").exists()
+
+
+async def test_cycle_keeps_corpus_when_training_still_running(tmp_path):
+    """codex P2: if the poll budget is exhausted while training is still
+    non-terminal, the corpus must NOT be deleted — the live subprocess still
+    needs its input files (F377 deletion only after terminal)."""
+    from pathlib import Path
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    work = tmp_path / "work"
+    # Adapter stuck in TRAINING (never terminal); tiny poll budget → times out.
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work),
+        adapter=_FakeAdapter(state=TrainingState.TRAINING), gate=FidelityGate(),
+        config=TextLoRAConfig(), poll_interval=0, max_polls=1, adapter_id="keeprun",
+    )
+    assert result.trained is False
+    corpus = work / "corpus" / "keeprun"  # per-run corpus dir
+    assert (corpus / "train.jsonl").exists()  # preserved for the live trainer
+
+
+
+
+
+async def test_cycle_deletes_corpus_on_cancellation(tmp_path):
+    """codex P2: on cancellation (on_disable tears down the trainer), the
+    transient corpus must be cleaned up, not left as durable plaintext."""
+    import asyncio as _asyncio
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    work = tmp_path / "work"
+
+    class _CancelMidPoll(_FakeAdapter):
+        async def get_status(self, job_id):
+            raise _asyncio.CancelledError()
+
+    with pytest.raises(_asyncio.CancelledError):
+        await run_nightly_cycle(
+            agent_id="emma", db_path=db, work_dir=str(work),
+            adapter=_CancelMidPoll(state=TrainingState.TRAINING), gate=FidelityGate(),
+            config=TextLoRAConfig(), poll_interval=0, max_polls=5, adapter_id="cancelrun",
+        )
+    corpus = work / "corpus" / "cancelrun"
+    assert not (corpus / "train.jsonl").exists()  # cleaned up on shutdown

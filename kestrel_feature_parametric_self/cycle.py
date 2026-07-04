@@ -65,7 +65,6 @@ async def run_nightly_cycle(
         return CycleResult(False, reason="trainer unavailable on this host")
 
     work = Path(work_dir)
-    corpus_dir = str(work / "corpus")
     # Each run trains into a UNIQUE staging dir so a rejected candidate can
     # never overwrite the currently-served adapter — the served adapter is the
     # promoted staging dir of a *prior* run, which this run never touches.
@@ -73,39 +72,84 @@ async def run_nightly_cycle(
     # P5 in epic #1.) The caller may supply the staging-dir name so it can
     # surface the in-progress run (and its candidate) before the cycle returns;
     # otherwise a fresh id is minted here.
-    adapter_dir = str(work / "candidates" / (adapter_id or uuid.uuid4().hex[:12]))
+    run_id = adapter_id or uuid.uuid4().hex[:12]
+    adapter_dir = str(work / "candidates" / run_id)
+    # PER-RUN corpus dir (keyed on the same run id): so a concurrent/later cycle
+    # can never overwrite or delete a still-needed corpus from a prior run that
+    # timed out with its trainer still alive (codex P2).
+    corpus_dir = str(work / "corpus" / run_id)
 
-    stats = build_corpus(db_path, corpus_dir)
-    if stats.train == 0:
+    # Only safe to delete the corpus once no training subprocess is (or may be)
+    # still reading it. True while a started job hasn't reached a terminal state.
+    training_active = False
+    try:
+        stats = build_corpus(db_path, corpus_dir)
+        if stats.train == 0:
+            return CycleResult(
+                False, reason="empty corpus — no grounded reflections to train on",
+                corpus_train=0, corpus_valid=stats.valid,
+            )
+
+        config.data_dir = corpus_dir
+        config.adapter_path = adapter_dir
+
+        status = await adapter.start_training(agent_id, config)
+        training_active = True
+        polls = 0
+        while not status.state.is_terminal() and polls < max_polls:
+            await asyncio.sleep(poll_interval)
+            status = await adapter.get_status(status.job_id)
+            polls += 1
+
+        # Safe to delete only once the job is terminal. If the poll backstop was
+        # exhausted while still non-terminal, the trainer subprocess may still be
+        # reading its input, so KEEP the corpus (codex P2) — we can't reliably
+        # confirm the subprocess exited from here (a cancel() only requests
+        # termination). Cleaning up a runaway job's working files is the
+        # adapter's lifecycle responsibility (epic #1 follow-up).
+        training_active = not status.state.is_terminal()
+
+        if status.state != TrainingState.COMPLETED:
+            return CycleResult(
+                False, reason=f"training did not complete (state={status.state.value}; {status.error or ''})".strip(),
+                corpus_train=stats.train, corpus_valid=stats.valid,
+            )
+
+        val_loss = parse_final_val_loss(adapter.read_training_log(status.job_id))
+        decision = gate.evaluate(val_loss, prior_val_loss)
         return CycleResult(
-            False, reason="empty corpus — no grounded reflections to train on",
-            corpus_train=0, corpus_valid=stats.valid,
+            trained=True,
+            promoted=decision.promote,
+            reason=decision.reason,
+            val_loss=val_loss,
+            promoted_adapter_path=adapter_dir if decision.promote else None,
+            corpus_train=stats.train,
+            corpus_valid=stats.valid,
         )
+    except asyncio.CancelledError:
+        # Cancellation (on_disable / shutdown) tears the trainer subprocess down
+        # via ``cancel_all``, so the corpus is no longer needed — allow the
+        # finally to remove it rather than leaving plaintext behind (codex P2).
+        training_active = False
+        raise
+    finally:
+        # The corpus is transient training INPUT derived from user-authored
+        # reflections/facts — don't leave train.jsonl/valid.jsonl on disk as
+        # durable plaintext once the trainer is done with them (F377). Skip the
+        # delete only when a started job is still running WITHOUT being torn
+        # down (a live poll-timeout job, codex P2), so a running subprocess
+        # never loses its input mid-run.
+        if not training_active:
+            _delete_corpus(corpus_dir)
 
-    config.data_dir = corpus_dir
-    config.adapter_path = adapter_dir
 
-    status = await adapter.start_training(agent_id, config)
-    polls = 0
-    while not status.state.is_terminal() and polls < max_polls:
-        await asyncio.sleep(poll_interval)
-        status = await adapter.get_status(status.job_id)
-        polls += 1
+def _delete_corpus(corpus_dir: str) -> None:
+    """Remove the transient corpus files (best effort; never breaks the cycle)."""
+    corpus = Path(corpus_dir)
+    for name in ("train.jsonl", "valid.jsonl"):
+        try:
+            (corpus / name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
-    if status.state != TrainingState.COMPLETED:
-        return CycleResult(
-            False, reason=f"training did not complete (state={status.state.value}; {status.error or ''})".strip(),
-            corpus_train=stats.train, corpus_valid=stats.valid,
-        )
 
-    val_loss = parse_final_val_loss(adapter.read_training_log(status.job_id))
-    decision = gate.evaluate(val_loss, prior_val_loss)
-    return CycleResult(
-        trained=True,
-        promoted=decision.promote,
-        reason=decision.reason,
-        val_loss=val_loss,
-        promoted_adapter_path=adapter_dir if decision.promote else None,
-        corpus_train=stats.train,
-        corpus_valid=stats.valid,
-    )

@@ -304,6 +304,27 @@ class ParametricSelfFeature(Feature):
         """
         return not getattr(self.agent, "is_test_instance", False)
 
+    def _hides_persisted_user_content(self) -> bool:
+        """True when the agent's privacy mode forbids durably retaining
+        user-authored content (ephemeral / temp-storage), so training must not
+        bake it into adapter weights (F377).
+
+        Best-effort + defensive: resolves the platform's privacy decision via
+        ``kestrel_sovereign.features.storage_access.hides_persisted_user_content``
+        (this feature already depends on kestrel-sovereign), degrading to
+        ``False`` if that helper is unavailable on the host's sovereign build.
+        """
+        try:
+            from kestrel_sovereign.features.storage_access import (
+                hides_persisted_user_content,
+            )
+        except Exception:  # noqa: BLE001 - older host without the helper
+            return False
+        try:
+            return bool(hides_persisted_user_content(self.agent))
+        except Exception:  # noqa: BLE001 - never let a probe break the cycle
+            return False
+
     def _require_sovereign_class(self) -> Optional[ToolResult]:
         """Return a refusal ``ToolResult`` for a governed agent, else ``None``.
 
@@ -489,6 +510,16 @@ class ParametricSelfFeature(Feature):
         gate = self._require_sovereign_class()
         if gate is not None:
             return gate
+        if self._hides_persisted_user_content():
+            # Same privacy refusal as the nightly chokepoint — the manual tool
+            # detaches straight into ``_run_training_cycle_locked``, bypassing
+            # the ``_run_training_cycle`` gate, so it must be checked here too or
+            # ``!parametric-self-train`` would train under an ephemeral/temp
+            # privacy mode (F377).
+            return ToolResult.failed(
+                "Training refused: the agent's privacy mode hides persisted "
+                "user content, which would be baked into adapter weights."
+            )
         if not self._adapter.is_available():
             return ToolResult.failed("Trainer unavailable on this host (MLX/Apple Silicon required).")
         if self._cycle_in_flight or (self._training_task is not None and not self._training_task.done()):
@@ -795,6 +826,13 @@ class ParametricSelfFeature(Feature):
         if not self._is_sovereign_class():
             return {"trained": False, "promoted": False,
                     "reason": "self-modification reserved for sovereign-class agents (Incubator Principle)"}
+        if self._hides_persisted_user_content():
+            # An ephemeral / temp-storage privacy mode means user-authored
+            # content must not be durably retained. Training would bake the
+            # night's reflections/facts into the LoRA weights — which cannot be
+            # selectively forgotten — so skip the whole cycle (F377).
+            return {"trained": False, "promoted": False,
+                    "reason": "training skipped: privacy mode hides persisted user content"}
         if self._cycle_in_flight:
             return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
         self._cycle_in_flight = True
