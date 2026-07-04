@@ -86,3 +86,75 @@ async def test_set_config_can_enable_training():
 
     cfg = await feature.get_config()
     assert cfg["enable_nightly_training"] is True
+
+
+@pytest.mark.asyncio
+async def test_training_skipped_when_privacy_hides_user_content(monkeypatch):
+    """F377: when the privacy mode forbids durably retaining user content, the
+    training cycle must be skipped (not baked into adapter weights)."""
+    agent = MagicMock()
+    agent.is_test_instance = False  # sovereign-class → passes the Incubator gate
+    feature = ParametricSelfFeature(agent=agent)
+    monkeypatch.setattr(feature, "_hides_persisted_user_content", lambda: True)
+
+    ran = []
+
+    async def _locked(*, trigger):
+        ran.append(trigger)
+        return {"trained": True, "promoted": False}
+
+    monkeypatch.setattr(feature, "_run_training_cycle_locked", _locked)
+
+    result = await feature._run_training_cycle(trigger="manual")
+
+    assert result["trained"] is False
+    assert "privacy mode" in result["reason"]
+    assert ran == []  # the cycle body never ran
+
+
+@pytest.mark.asyncio
+async def test_training_proceeds_when_privacy_allows(monkeypatch):
+    agent = MagicMock()
+    agent.is_test_instance = False
+    feature = ParametricSelfFeature(agent=agent)
+    feature._cycle_in_flight = False
+    monkeypatch.setattr(feature, "_hides_persisted_user_content", lambda: False)
+
+    ran = []
+
+    async def _locked(*, trigger):
+        ran.append(trigger)
+        return {"trained": True, "promoted": False}
+
+    monkeypatch.setattr(feature, "_run_training_cycle_locked", _locked)
+
+    result = await feature._run_training_cycle(trigger="manual")
+
+    assert ran == ["manual"]  # the cycle body ran
+    assert result["trained"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_train_now_refused_under_privacy(monkeypatch):
+    """F377 (codex P1): the detached manual `parametric_self_train_now` tool
+    must also refuse when privacy hides persisted user content — it bypasses
+    the nightly `_run_training_cycle` gate."""
+    agent = MagicMock()
+    agent.is_test_instance = False
+    feature = ParametricSelfFeature(agent=agent)
+    feature._cycle_in_flight = False
+    feature._training_task = None
+    monkeypatch.setattr(feature, "_hides_persisted_user_content", lambda: True)
+
+    started = []
+    monkeypatch.setattr(
+        feature, "_begin_active_run",
+        lambda **kw: started.append(kw) or {"run_id": "r", "adapter_id": "a", "adapter_path": "p"},
+    )
+
+    result = await feature.parametric_self_train_now()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "privacy mode" in (result.error or "")
+    assert started == []  # never started / created a run record
+    assert feature._cycle_in_flight is False
