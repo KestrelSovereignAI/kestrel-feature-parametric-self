@@ -61,10 +61,20 @@ async def run_nightly_cycle(
     max_polls: int = 5400,  # ~3h at 2s; a backstop, not a deadline
 ) -> CycleResult:
     """Run one corpus->train->gate cycle. Promotes nothing the gate rejects."""
+    work = Path(work_dir)
+
+    # One-time cleanup of the PRE-0.3.1 shared corpus location (F377/P8): older
+    # code wrote plaintext train.jsonl/valid.jsonl DIRECTLY at ``work/corpus/``
+    # (not a per-run subdir), and a host upgraded from that version still carries
+    # that plaintext user-derived corpus on disk. Do this FIRST — before the
+    # trainer-availability early return — so the lingering plaintext is removed
+    # even on hosts where the trainer is unavailable or broken (where the cycle
+    # never trains). ``_delete_corpus`` only touches ``<dir>/train.jsonl``/
+    # ``valid.jsonl``, never the new per-run ``work/corpus/<run_id>/`` subdirs.
+    _delete_corpus(str(work / "corpus"))
+
     if not adapter.is_available():
         return CycleResult(False, reason="trainer unavailable on this host")
-
-    work = Path(work_dir)
     # Each run trains into a UNIQUE staging dir so a rejected candidate can
     # never overwrite the currently-served adapter — the served adapter is the
     # promoted staging dir of a *prior* run, which this run never touches.

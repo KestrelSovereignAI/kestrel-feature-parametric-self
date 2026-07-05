@@ -98,6 +98,56 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
     assert "empty corpus" in result.reason
 
 
+async def test_cycle_cleans_up_legacy_shared_corpus_plaintext(tmp_path):
+    """#2112/P8: a host upgraded from pre-0.3.1 still has plaintext
+    train.jsonl/valid.jsonl at the OLD shared work/corpus/ location (not a
+    per-run subdir). A cycle must best-effort remove them so no user-derived
+    plaintext lingers (F377) — while leaving per-run subdirs untouched."""
+    from pathlib import Path
+
+    work = tmp_path / "work"
+    legacy = work / "corpus"
+    legacy.mkdir(parents=True)
+    (legacy / "train.jsonl").write_text('{"text": "old plaintext reflection"}\n')
+    (legacy / "valid.jsonl").write_text('{"text": "old plaintext"}\n')
+    # A per-run subdir that must NOT be touched.
+    (legacy / "some-prior-run").mkdir()
+    (legacy / "some-prior-run" / "train.jsonl").write_text("{}\n")
+
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work),
+        adapter=_FakeAdapter(log="Iter 100: Val loss 1.2"), gate=FidelityGate(max_val_loss=3.0),
+        config=TextLoRAConfig(), poll_interval=0,
+    )
+
+    # Legacy flat plaintext gone.
+    assert not (legacy / "train.jsonl").exists()
+    assert not (legacy / "valid.jsonl").exists()
+    # Per-run subdir untouched (only the pre-0.3.1 flat files are cleaned).
+    assert (legacy / "some-prior-run" / "train.jsonl").exists()
+
+
+async def test_legacy_corpus_cleaned_even_when_trainer_unavailable(tmp_path):
+    """The cleanup must run BEFORE the trainer-availability early return — a host
+    without the trainer (common) would otherwise keep the plaintext forever."""
+    work = tmp_path / "work"
+    legacy = work / "corpus"
+    legacy.mkdir(parents=True)
+    (legacy / "train.jsonl").write_text('{"text": "old plaintext"}\n')
+    (legacy / "valid.jsonl").write_text('{"text": "old plaintext"}\n')
+
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work),
+        adapter=_FakeAdapter(available=False), gate=FidelityGate(),
+        config=TextLoRAConfig(), poll_interval=0,
+    )
+    assert result.trained is False and "unavailable" in result.reason
+    assert not (legacy / "train.jsonl").exists()
+    assert not (legacy / "valid.jsonl").exists()
+
+
 async def test_each_run_stages_in_a_unique_dir(tmp_path):
     """A later (rejected) run must not overwrite an earlier promoted adapter."""
     db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
