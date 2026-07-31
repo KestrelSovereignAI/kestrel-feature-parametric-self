@@ -154,6 +154,7 @@ class ParametricSelfFeature(Feature):
         }
 
     async def set_config(self, config: Dict[str, Any]) -> None:
+        prior_policy_digest = getattr(self._governed_corpus_policy, "digest", None)
         if "enable_nightly_training" in config:
             self._training_enabled = bool(config["enable_nightly_training"])
         if config.get("base_model"):
@@ -164,6 +165,18 @@ class ParametricSelfFeature(Feature):
             )
         if "governed_inference_profile" in config:
             self._governed_inference_profile = config["governed_inference_profile"]
+        # A policy change changes the set of facts that were authorized for an
+        # adapter.  Do not leave a previously-trained adapter served until the
+        # next status/train call happens to notice it.
+        if (
+            "governed_corpus_policy" in config
+            and self._active_adapter_path
+            and prior_policy_digest != getattr(self._governed_corpus_policy, "digest", None)
+        ):
+            await self._quarantine_adapter(
+                self._active_adapter_path,
+                "governed corpus policy updated; rebuild required",
+            )
         # Persist so the enablement survives restarts (durable per-agent gate).
         await self._persist_config()
 
@@ -399,11 +412,15 @@ class ParametricSelfFeature(Feature):
             )
         except Exception:  # noqa: BLE001 - older host without the helper
             return False
+        try:
+            return bool(hides_persisted_user_content(self.agent))
+        except Exception:  # noqa: BLE001 - never let a probe break the cycle
+            return False
 
     def _resolved_governed_policy(self):
         for candidate in (
-            self._governed_corpus_policy,
             getattr(self.agent, "parametric_self_governed_corpus_policy", None),
+            self._governed_corpus_policy,
         ):
             if isinstance(getattr(candidate, "digest", None), str):
                 return candidate
@@ -473,6 +490,94 @@ class ParametricSelfFeature(Feature):
                 pairs.add((assertion_id, revision_id))
         return pairs
 
+    @staticmethod
+    def _checkpoint_signature(checkpoint: Any) -> Optional[tuple[int, Optional[str]]]:
+        """Return the public checkpoint identity in the manifest's shape."""
+        generation = getattr(checkpoint, "generation", None)
+        event_id = getattr(checkpoint, "latest_event_id", getattr(checkpoint, "event_id", None))
+        if not isinstance(generation, int) or not isinstance(event_id, (str, type(None))):
+            return None
+        return generation, event_id
+
+    @staticmethod
+    def _manifest_checkpoint_signature(manifest: Dict[str, Any]) -> Optional[tuple[int, Optional[str]]]:
+        checkpoint = manifest.get("semantic_checkpoint")
+        if not isinstance(checkpoint, dict):
+            return None
+        generation, event_id = checkpoint.get("generation"), checkpoint.get("event_id")
+        if not isinstance(generation, int) or not isinstance(event_id, (str, type(None))):
+            return None
+        return generation, event_id
+
+    def _snapshot_pin_problem(
+        self,
+        manifest: Dict[str, Any],
+        snapshot: Any,
+        *,
+        require_exact_snapshot: bool,
+    ) -> Optional[str]:
+        """Validate the complete receipt that authorized this adapter.
+
+        An assertion/revision pair is not enough: the same pair can be exposed
+        under a different policy, ontology/capability pin, or semantic state.
+        The manifest is a receipt for one immutable snapshot.  A live snapshot
+        must match it byte-for-byte at the public-contract level; a restart
+        snapshot may be newer, but must retain the same policy/capability pins.
+        """
+        expected_policy = manifest.get("policy_digest")
+        expected_hash = manifest.get("snapshot_hash")
+        expected_capabilities = manifest.get("capability_versions")
+        expected_checkpoint = self._manifest_checkpoint_signature(manifest)
+        if (
+            not isinstance(expected_policy, str)
+            or not isinstance(expected_hash, str)
+            or not isinstance(expected_capabilities, dict)
+            or not all(isinstance(key, str) and isinstance(value, str)
+                       for key, value in expected_capabilities.items())
+            or expected_checkpoint is None
+        ):
+            return "candidate manifest governed evidence is malformed"
+
+        policy = self._resolved_governed_policy()
+        if getattr(policy, "digest", None) != expected_policy:
+            return "governed corpus policy changed; rebuild required"
+        if getattr(getattr(snapshot, "policy", None), "digest", None) != expected_policy:
+            return "governed corpus policy evidence mismatch; rebuild required"
+        capabilities = getattr(snapshot, "capability_versions", None)
+        if not isinstance(capabilities, dict) or dict(capabilities) != expected_capabilities:
+            return "governed semantic capability pins changed; rebuild required"
+
+        checkpoint = self._checkpoint_signature(getattr(snapshot, "checkpoint", None))
+        snapshot_hash = getattr(snapshot, "snapshot_hash", None)
+        if checkpoint is None or not isinstance(snapshot_hash, str):
+            return "governed corpus snapshot evidence is malformed"
+        if require_exact_snapshot:
+            if checkpoint != expected_checkpoint or snapshot_hash != expected_hash:
+                return "governed corpus snapshot receipt changed; rebuild required"
+        # If a fresh read reports the exact same checkpoint, its receipt hash
+        # must be identical.  A later checkpoint is allowed and its assertion
+        # membership is checked below; it cannot silently change policy/pins.
+        elif checkpoint == expected_checkpoint and snapshot_hash != expected_hash:
+            return "governed corpus snapshot receipt changed; rebuild required"
+        return None
+
+    def _delta_pin_problem(self, manifest: Dict[str, Any], delta: Any) -> Optional[str]:
+        """Check that delta evidence is rooted at the manifest's exact snapshot."""
+        expected_checkpoint = self._manifest_checkpoint_signature(manifest)
+        since_checkpoint = self._checkpoint_signature(getattr(delta, "since_checkpoint", None))
+        checkpoint = self._checkpoint_signature(getattr(delta, "checkpoint", None))
+        observability = getattr(delta, "observability", None)
+        expected_policy = manifest.get("policy_digest")
+        if (
+            expected_checkpoint is None
+            or since_checkpoint != expected_checkpoint
+            or checkpoint is None
+            or not isinstance(getattr(delta, "snapshot_hash", None), str)
+            or getattr(observability, "policy_digest", None) != expected_policy
+        ):
+            return "governed corpus delta evidence mismatch; adapter cannot be verified"
+        return None
+
     async def _verify_adapter_lineage(self, path: str, *, before_promotion: bool = False) -> Optional[str]:
         """Quarantine an adapter when its exact governed inputs no longer hold."""
         manifest, manifest_error = self._manifest_lineage(path)
@@ -485,6 +590,12 @@ class ParametricSelfFeature(Feature):
         policy = self._resolved_governed_policy()
         changes = getattr(storage, "governed_assertion_corpus_changes_since", None)
         if snapshot is not None and callable(changes) and policy is not None:
+            pin_problem = self._snapshot_pin_problem(
+                manifest or {}, snapshot, require_exact_snapshot=True,
+            )
+            if pin_problem:
+                await self._quarantine_adapter(path, pin_problem)
+                return pin_problem
             try:
                 delta = await changes(
                     snapshot, policy=policy,
@@ -494,6 +605,10 @@ class ParametricSelfFeature(Feature):
                 reason = "governed corpus delta unavailable; adapter cannot be verified"
                 await self._quarantine_adapter(path, reason)
                 return reason
+            pin_problem = self._delta_pin_problem(manifest or {}, delta)
+            if pin_problem:
+                await self._quarantine_adapter(path, pin_problem)
+                return pin_problem
             tombstoned = {
                 (item.assertion_id, item.revision_id)
                 for item in getattr(delta, "tombstones", ())
@@ -517,6 +632,12 @@ class ParametricSelfFeature(Feature):
         if fresh is None:
             await self._quarantine_adapter(path, reason or "governed corpus unavailable")
             return reason
+        pin_problem = self._snapshot_pin_problem(
+            manifest or {}, fresh, require_exact_snapshot=False,
+        )
+        if pin_problem:
+            await self._quarantine_adapter(path, pin_problem)
+            return pin_problem
         current = {
             (item.assertion.assertion_id, item.assertion.revision_id)
             for item in getattr(fresh, "examples", ())
@@ -529,10 +650,6 @@ class ParametricSelfFeature(Feature):
             # The fresh snapshot is now the correct base for a subsequent delta.
             self._live_corpus_snapshot = fresh
         return None
-        try:
-            return bool(hides_persisted_user_content(self.agent))
-        except Exception:  # noqa: BLE001 - never let a probe break the cycle
-            return False
 
     def _require_sovereign_class(self) -> Optional[ToolResult]:
         """Return a refusal ``ToolResult`` for a governed agent, else ``None``.
@@ -1359,6 +1476,11 @@ class ParametricSelfFeature(Feature):
         from .sleep_hook import create_parametric_self_sleep_hook
 
         await self._restore_persisted_config()
+        # A restored pointer is never trusted just because it was persisted.
+        # Verify/quarantine it before this feature registers any serving-adjacent
+        # hook or exposes the adapter through its normal control surface.
+        if self._active_adapter_path:
+            await self._verify_adapter_lineage(self._active_adapter_path)
         # A detached run can't survive a restart; reconcile any lingering
         # in_progress record so introspection never reports a dead run as active.
         await self._reconcile_stale_runs()
