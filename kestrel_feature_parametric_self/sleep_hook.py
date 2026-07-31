@@ -60,7 +60,10 @@ class ParametricSelfSleepHook:
         reason = str(outcome.get("reason") or "")
         if outcome.get("trained") is True:
             outcome.update(success=True, skipped=False)
-        elif reason.startswith(("training disabled", "training skipped", "another training run")):
+        elif reason.startswith((
+            "nightly training disabled", "training disabled", "training skipped",
+            "another training run",
+        )):
             # Expected operational no-ops stay visible without poisoning the
             # sleep dependency graph.
             outcome.update(success=True, skipped=True)
