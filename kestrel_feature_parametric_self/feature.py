@@ -99,6 +99,7 @@ class ParametricSelfFeature(Feature):
             self._manual_runs_enabled = True
             self._training_shutdown_incomplete = None
             self._cycle_task = None
+            self._shutdown_recovery_requires_external_confirmation = False
 
     async def initialize(self) -> None:
         """Initialize the parametric-self feature (training off by default)."""
@@ -127,9 +128,8 @@ class ParametricSelfFeature(Feature):
         # In-flight manual training run (train_now). Detached so the tool call
         # returns immediately; guarded so only one cycle runs at a time.
         self._training_task: Optional[asyncio.Task] = None
-        # A sleep-triggered cycle is not detached like ``_training_task`` but it
-        # can still be live while disable runs. Track it so teardown can cancel
-        # every trigger, not only the manual command path.
+        # A sleep-triggered cycle uses a feature-owned task so teardown can stop
+        # its subprocess work without cancelling the core sleep dispatcher.
         self._cycle_task: Optional[asyncio.Task] = None
         # Serializes the short reservation -> run-record -> task-publication
         # transition.  ``on_disable`` advances the generation before waiting on
@@ -142,6 +142,7 @@ class ParametricSelfFeature(Feature):
         # It deliberately blocks new mutations until a clean lifecycle boundary
         # (normally process restart) rather than pretending a live child is gone.
         self._training_shutdown_incomplete: Optional[str] = None
+        self._shutdown_recovery_requires_external_confirmation = False
         # The currently-running cycle's durable record (run_id, adapter_id,
         # trigger, started_at, state, adapter_path), or None when idle. Set when
         # a cycle begins so the introspection tools can distinguish "no run",
@@ -361,6 +362,9 @@ class ParametricSelfFeature(Feature):
             "recoverable_adapters": recoverable,
             "active_run": active_run,
             "training_shutdown_incomplete": self._training_shutdown_incomplete,
+            "shutdown_recovery_requires_external_confirmation": (
+                self._shutdown_recovery_requires_external_confirmation
+            ),
             "legacy_corpus_cleanup_needed": legacy_cleanup_needed,
         }
         confirmation = (
@@ -1066,7 +1070,9 @@ class ParametricSelfFeature(Feature):
                     incomplete = isinstance(exc, TrainingShutdownIncomplete)
                     if incomplete:
                         await self._mark_training_shutdown_incomplete(
-                            run_id=active_run["run_id"], reason=str(exc),
+                            run_id=active_run["run_id"],
+                            reason=str(exc),
+                            retained_corpus_path=getattr(exc, "corpus_path", None),
                         )
                         keep_guard_held = True
                     else:
@@ -1078,7 +1084,9 @@ class ParametricSelfFeature(Feature):
                     raise
                 except TrainingStillActive as exc:
                     await self._mark_training_shutdown_incomplete(
-                        run_id=active_run["run_id"], reason=str(exc),
+                        run_id=active_run["run_id"],
+                        reason=str(exc),
+                        retained_corpus_path=exc.corpus_path,
                     )
                     keep_guard_held = True
                     logger.warning("parametric-self manual training remains active: %s", exc)
@@ -1361,21 +1369,30 @@ class ParametricSelfFeature(Feature):
         """
         if not self._training_enabled:
             return {"trained": False, "promoted": False, "reason": "nightly training disabled for this agent"}
-        # Do not run on the core sleep dispatcher task: teardown must be able to
-        # cancel this feature-owned task without cancelling the rest of sleep.
+        # Do not run the trainer on the core sleep dispatcher task: teardown
+        # cancels this feature-owned task, while this hook awaits and reports its
+        # terminal outcome honestly to the core sleep dependency graph.
         task = asyncio.create_task(self._run_training_cycle(trigger="nightly"))
-        await asyncio.sleep(0)  # let the owned task acquire its lifecycle fence
-        if task.done():
-            try:
-                return task.result()
-            except TrainingShutdownIncomplete as exc:
-                return {"trained": False, "promoted": False, "reason": str(exc)}
-        return {
-            "trained": False,
-            "promoted": False,
-            "started": True,
-            "reason": "nightly training started in background",
-        }
+        try:
+            return await task
+        except TrainingShutdownIncomplete as exc:
+            return {"trained": False, "promoted": False, "reason": str(exc)}
+        except asyncio.CancelledError:
+            # ``on_disable`` cancels the owned child, not the sleep dispatcher
+            # that is awaiting it. Consume that expected child cancellation so
+            # the surrounding sleep cycle can continue and see an honest result.
+            return {
+                "trained": False,
+                "promoted": False,
+                "reason": "nightly training interrupted while feature was disabled",
+            }
+        except Exception as exc:
+            logger.warning("parametric-self nightly training failed: %s", exc)
+            return {
+                "trained": False,
+                "promoted": False,
+                "reason": f"nightly training failed: {exc}",
+            }
 
     async def _run_training_cycle(self, *, trigger: str) -> Dict[str, Any]:
         """Run one corpus->train->gate->promote cycle and record it in history.
@@ -1438,10 +1455,25 @@ class ParametricSelfFeature(Feature):
             await self._mark_training_shutdown_incomplete(
                 run_id=active_run.get("run_id") if active_run is not None else None,
                 reason=str(exc),
+                retained_corpus_path=getattr(exc, "corpus_path", None),
             )
             keep_guard_held = True
             if isinstance(exc, TrainingStillActive):
                 return {"trained": False, "promoted": False, "reason": str(exc)}
+            raise
+        except Exception as exc:
+            # Keep the durable lifecycle truthful even if an injected adapter or
+            # future locked-cycle branch raises before it performs its own
+            # terminal update. The sleep hook consumes the exception below and
+            # reports this failure rather than leaving an orphaned task warning.
+            active_run = getattr(self, "_active_run", None)
+            if active_run is not None:
+                await self._update_run_history(active_run["run_id"], {
+                    "state": "failed",
+                    "timestamp": _utc_now_iso(),
+                    "reason": f"training error: {exc}",
+                })
+                self._active_run = None
             raise
         finally:
             if not keep_guard_held:
@@ -1495,7 +1527,9 @@ class ParametricSelfFeature(Feature):
                 adapter_id=adapter_id,
             )
             if result.training_active:
-                raise TrainingStillActive(result.reason)
+                raise TrainingStillActive(
+                    result.reason, corpus_path=result.retained_corpus_path or "",
+                )
         except asyncio.CancelledError:
             # Cancellation (e.g. on_disable) marks the record interrupted; that
             # durable update is done by on_disable, not here, because awaiting
@@ -1651,7 +1685,11 @@ class ParametricSelfFeature(Feature):
                 self._active_run = None
 
     async def _mark_training_shutdown_incomplete(
-        self, *, reason: str, run_id: Optional[str] = None,
+        self,
+        *,
+        reason: str,
+        run_id: Optional[str] = None,
+        retained_corpus_path: Optional[str] = None,
     ) -> None:
         """Expose an unconfirmed child shutdown without claiming it is terminal."""
         diagnostic = f"training shutdown incomplete: {reason}"
@@ -1663,12 +1701,17 @@ class ParametricSelfFeature(Feature):
         if active_run.get("run_id") != resolved_run_id:
             return
         active_run["state"] = "shutdown_incomplete"
+        if retained_corpus_path:
+            active_run["retained_corpus_path"] = retained_corpus_path
         try:
-            await self._update_run_history(resolved_run_id, {
+            updates = {
                 "state": "shutdown_incomplete",
                 "timestamp": _utc_now_iso(),
                 "reason": diagnostic,
-            })
+            }
+            if retained_corpus_path:
+                updates["retained_corpus_path"] = retained_corpus_path
+            await self._update_run_history(resolved_run_id, updates)
         except Exception as exc:  # preserve the local safety marker regardless
             logger.warning("Failed to mark parametric-self shutdown incomplete: %s", exc)
 
@@ -1677,11 +1720,16 @@ class ParametricSelfFeature(Feature):
         reason = "run cancelled (feature disabled; bulk trainer stop confirmed)"
         active_run = getattr(self, "_active_run", None)
         run_ids = set()
+        retained_paths = set()
         if active_run is not None and active_run.get("state") == "shutdown_incomplete":
             run_ids.add(active_run["run_id"])
+            if active_run.get("retained_corpus_path"):
+                retained_paths.add(active_run["retained_corpus_path"])
         for entry in await self._load_run_history():
             if entry.get("state") == "shutdown_incomplete" and entry.get("run_id"):
                 run_ids.add(entry["run_id"])
+                if entry.get("retained_corpus_path"):
+                    retained_paths.add(entry["retained_corpus_path"])
         for run_id in run_ids:
             await self._update_run_history(run_id, {
                 "state": "interrupted",
@@ -1690,7 +1738,30 @@ class ParametricSelfFeature(Feature):
             })
         if active_run is not None and active_run.get("run_id") in run_ids:
             self._active_run = None
+        self._delete_confirmed_retained_corpora(retained_paths)
         self._training_shutdown_incomplete = None
+        self._shutdown_recovery_requires_external_confirmation = False
+
+    def _delete_confirmed_retained_corpora(self, paths: set[str]) -> None:
+        """Delete only per-run corpora whose child stop was affirmatively proven."""
+        _, work_dir = self._resolve_paths()
+        if not work_dir:
+            return
+        corpus_root = (Path(work_dir) / "corpus").resolve()
+        for raw_path in paths:
+            try:
+                corpus_dir = Path(raw_path).resolve()
+            except OSError:
+                logger.warning("Could not resolve retained corpus path for cleanup: %s", raw_path)
+                continue
+            if corpus_root not in corpus_dir.parents:
+                logger.warning("Refusing to delete corpus outside per-run root: %s", corpus_dir)
+                continue
+            for name in ("train.jsonl", "valid.jsonl"):
+                try:
+                    (corpus_dir / name).unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Failed to delete confirmed retained corpus %s: %s", corpus_dir / name, exc)
 
     # ------------------------------------------------------------------
     # Run-history store (append-only, capped) — lets the agent introspect
@@ -1782,6 +1853,11 @@ class ParametricSelfFeature(Feature):
                     self._training_shutdown_incomplete = str(
                         entry.get("reason", "training shutdown incomplete")
                     )
+                    # An adapter created after a restart has no process handle
+                    # for this run. Its empty/all-stopped response cannot prove
+                    # that the old child exited, so require operator or
+                    # process-specific recovery evidence before clearing it.
+                    self._shutdown_recovery_requires_external_confirmation = True
                     self._cycle_in_flight = True
             if changed:
                 await storage.add_node(GraphNode(
@@ -1910,6 +1986,12 @@ class ParametricSelfFeature(Feature):
                 except Exception as exc:  # teardown must never raise
                     shutdown_confirmed = False
                     logger.warning("Failed to cancel parametric-self training subprocess(es): %s", exc)
+
+            if self._shutdown_recovery_requires_external_confirmation:
+                # A fresh adapter's empty bulk result is not evidence about a
+                # child launched before process restart. Retain the durable
+                # safety block until recovery is externally verified.
+                shutdown_confirmed = False
 
             if not shutdown_confirmed:
                 active_run = getattr(self, "_active_run", None)

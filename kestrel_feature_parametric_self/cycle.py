@@ -28,9 +28,17 @@ from .text_types import TextLoRAConfig
 class TrainingShutdownIncomplete(asyncio.CancelledError):
     """Cancellation where the trainer child could not be confirmed stopped."""
 
+    def __init__(self, reason: str, *, corpus_path: str | None = None) -> None:
+        super().__init__(reason)
+        self.corpus_path = corpus_path
+
 
 class TrainingStillActive(RuntimeError):
     """Polling ended while a trainer child may still be reading its corpus."""
+
+    def __init__(self, reason: str, *, corpus_path: str) -> None:
+        super().__init__(reason)
+        self.corpus_path = corpus_path
 
 
 class _TrainerProtocol(Protocol):
@@ -62,6 +70,7 @@ class CycleResult:
     corpus_policy_digest: Optional[str] = None
     assertion_lineage: tuple[tuple[str, str], ...] = ()
     training_active: bool = False
+    retained_corpus_path: Optional[str] = None
     legacy_corpus_retained: bool = False
 
 
@@ -159,6 +168,7 @@ async def run_nightly_cycle(
                 corpus_train=stats.train,
                 corpus_valid=stats.valid,
                 training_active=True,
+                retained_corpus_path=corpus_dir,
                 legacy_corpus_retained=legacy_corpus_retained,
             )
 
@@ -208,7 +218,8 @@ async def run_nightly_cycle(
                 training_active = not bool(stopped)
         if training_active:
             raise TrainingShutdownIncomplete(
-                "trainer stop could not be confirmed; corpus retained"
+                "trainer stop could not be confirmed; corpus retained",
+                corpus_path=corpus_dir,
             )
         raise
     finally:

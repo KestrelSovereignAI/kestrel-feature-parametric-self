@@ -371,20 +371,28 @@ async def test_on_disable_surfaces_unconfirmed_trainer_shutdown():
     assert runs[-1]["state"] == "shutdown_incomplete"
 
 
-async def test_confirmed_bulk_shutdown_resolves_prior_incomplete_run():
-    """A later positive bulk confirmation clears the block and terminalizes history."""
+async def test_confirmed_bulk_shutdown_resolves_prior_incomplete_run_and_deletes_corpus(tmp_path):
+    """Same-process stop proof terminalizes history and releases retained input."""
     from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
 
     f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._work_dir = str(tmp_path / "parametric_self")
     f._adapter.is_available = lambda: True
     started = asyncio.Event()
+    retained = tmp_path / "parametric_self" / "corpus" / "run-1"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
+    (retained / "valid.jsonl").write_text('{"text":"private"}\n')
 
     async def _unconfirmed_cycle(*, trigger):
         started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            raise TrainingShutdownIncomplete("trainer stop could not be confirmed; corpus retained")
+            raise TrainingShutdownIncomplete(
+                "trainer stop could not be confirmed; corpus retained",
+                corpus_path=str(retained),
+            )
 
     async def _confirmed_cancel_all():
         return SimpleNamespace(all_stopped=True)
@@ -407,18 +415,25 @@ async def test_confirmed_bulk_shutdown_resolves_prior_incomplete_run():
     runs = await f._load_run_history()
     assert runs[-1]["state"] == "interrupted"
     assert "bulk trainer stop confirmed" in runs[-1]["reason"]
+    assert not (retained / "train.jsonl").exists()
+    assert not (retained / "valid.jsonl").exists()
 
 
-async def test_shutdown_without_bulk_confirmation_keeps_prior_incomplete_block():
+async def test_shutdown_without_bulk_confirmation_keeps_prior_incomplete_block_and_corpus(tmp_path):
     """A missing bulk cancellation capability is unknown, never clean shutdown."""
-    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    retained = tmp_path / "parametric_self" / "corpus" / "unresolved"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
     f._active_run = {
         "run_id": "unresolved", "adapter_id": "adapter", "trigger": "manual",
         "state": "shutdown_incomplete", "adapter_path": "/tmp/adapter",
+        "retained_corpus_path": str(retained),
     }
     await f._append_run_history({
         "run_id": "unresolved", "trigger": "manual", "state": "shutdown_incomplete",
         "reason": "training shutdown incomplete: prior stop was unconfirmed",
+        "retained_corpus_path": str(retained),
     })
     f._training_shutdown_incomplete = "training shutdown incomplete: prior stop was unconfirmed"
     f._adapter.cancel_all = None
@@ -428,6 +443,7 @@ async def test_shutdown_without_bulk_confirmation_keeps_prior_incomplete_block()
     assert f._cycle_in_flight is True
     assert f._active_run is not None
     assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+    assert (retained / "train.jsonl").exists()
 
 
 async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
@@ -469,17 +485,20 @@ async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
 
     restarted._adapter.cancel_all = _confirmed_cancel_all
     await restarted.on_disable()
-    assert restarted._training_shutdown_incomplete is None
-    assert restarted._cycle_in_flight is False
-    resolved_runs = await restarted._load_run_history()
-    assert resolved_runs[-1]["state"] == "interrupted"
+    # A fresh adapter's all_stopped result may only describe its own empty job
+    # set; it is not proof that the prior process's child exited.
+    assert restarted._training_shutdown_incomplete is not None
+    assert restarted._shutdown_recovery_requires_external_confirmation is True
+    assert restarted._cycle_in_flight is True
+    unresolved_runs = await restarted._load_run_history()
+    assert unresolved_runs[-1]["state"] == "shutdown_incomplete"
 
     final = ParametricSelfFeature(agent=f.agent)
     await final.initialize()
     final.agent.get_feature = MagicMock(return_value=final)
     await final.post_all_features_loaded(final.agent)
-    assert final._training_shutdown_incomplete is None
-    assert final._cycle_in_flight is False
+    assert final._training_shutdown_incomplete is not None
+    assert final._cycle_in_flight is True
 
 
 async def test_disable_fences_sleep_cycle_waiting_to_launch():
@@ -516,7 +535,10 @@ async def test_poll_timeout_keeps_manual_lifecycle_blocked_until_confirmed_stop(
     f._adapter.is_available = lambda: True
 
     async def _timed_out_cycle(*, trigger):
-        raise TrainingStillActive("training still active after poll timeout; corpus retained")
+        raise TrainingStillActive(
+            "training still active after poll timeout; corpus retained",
+            corpus_path="/tmp/parametric-self-test-corpus",
+        )
 
     f._run_training_cycle_locked = _timed_out_cycle
     started = await f.parametric_self_train_now()
@@ -553,16 +575,35 @@ async def test_disable_cancels_owned_nightly_task_not_sleep_owner():
 
     f._run_training_cycle_locked = _slow_cycle
     f._adapter.cancel_all = _confirmed_cancel_all
-    owner = asyncio.current_task()
-    outcome = await f.on_post_consolidation({"episodes_created": 1})
-    assert outcome["started"] is True
-    child = f._cycle_task
-    assert child is not None and child is not owner
+    sleep_owner = asyncio.create_task(f.on_post_consolidation({"episodes_created": 1}))
     await asyncio.wait_for(started.wait(), timeout=2)
+    child = f._cycle_task
+    assert child is not None and child is not sleep_owner
     await f.on_disable()
-    assert not owner.cancelled()
+    outcome = await sleep_owner
+    assert "interrupted" in outcome["reason"]
+    assert not sleep_owner.cancelled()
     with pytest.raises(asyncio.CancelledError):
         await child
+
+
+async def test_nightly_exception_is_consumed_and_history_is_failed():
+    """An owned nightly task reports failure instead of leaking an unhandled task."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._adapter.is_available = lambda: True
+
+    async def _broken_cycle(*, trigger):
+        await f._begin_active_run(trigger=trigger, work_dir="/tmp/parametric-self-test")
+        raise RuntimeError("synthetic nightly failure")
+
+    f._run_training_cycle_locked = _broken_cycle
+    outcome = await f.on_post_consolidation({"episodes_created": 1})
+    assert outcome["trained"] is False
+    assert "nightly training failed: synthetic nightly failure" == outcome["reason"]
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "failed"
+    assert "synthetic nightly failure" in runs[-1]["reason"]
 
 
 async def test_status_surfaces_legacy_corpus_cleanup_requirement(tmp_path):
