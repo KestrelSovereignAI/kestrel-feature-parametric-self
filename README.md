@@ -67,7 +67,7 @@ attaches the envelope's `ExternalCapabilityReport` only when it matches the
 fixed repository/revision contract.
 
 Before a drill, the runner verifies pip's VCS provenance for the exact reviewed
-core commit (`265cf418`); a matching catalog shape on another install is not
+core commit (`265cf41831a6d82392771771723184eef75fd7b2`); a matching catalog shape on another install is not
 enough. Every invocation generates a one-time freshness nonce and receipt that
 are bound into the artifact and signed records. Its complete fresh scratch tree
 — including the candidate manifest and corpus files — is removed on success,

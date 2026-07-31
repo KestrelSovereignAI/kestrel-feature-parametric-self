@@ -362,8 +362,16 @@ async def test_external_evidence_default_path_uses_real_core_storage_privacy_and
             feature, scratch_dir=tmp_path / "fresh-real-drill"
         )
         assert all(record.passed for record in envelope.records)
-        terminal = await raw.get_assertion(saved.assertion_id, include_inactive=True)
-        assert terminal is not None and terminal.status.value == "deleted"
+        # Physical erasure removes the canonical row and records only the
+        # blinded operation shell; it is not a lifecycle "deleted" revision.
+        assert await raw.get_assertion(saved.assertion_id, include_inactive=True) is None
+        assert await raw.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertions WHERE assertion_id = ?",
+            (saved.assertion_id,),
+        ) == 0
+        assert await raw.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertion_erased_operation_tombstones"
+        ) == 1
         assert feature._active_adapter_path is None
         assert not (tmp_path / "fresh-real-drill").exists()
     finally:

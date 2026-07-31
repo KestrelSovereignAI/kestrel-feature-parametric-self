@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 # specs/results/artifacts/drill this feature consumes.  The pyproject source
 # pin is the installation boundary; this value makes that boundary visible in
 # the independently signed, content-free envelope.
-CORE_RELEASE_EVIDENCE_COMMIT = "265cf418"
+CORE_RELEASE_EVIDENCE_COMMIT = "265cf41831a6d82392771771723184eef75fd7b2"
 EXTERNAL_GATE_IDS = (
     "external_corpus_consumed",
     "external_candidate_invalidated",
@@ -112,10 +112,7 @@ def _verify_pinned_core_install() -> None:
         commit = payload["vcs_info"]["commit_id"]
     except (PackageNotFoundError, OSError, ValueError, KeyError, TypeError) as error:
         raise ExternalReleaseEvidenceError("pinned core revision provenance is unavailable") from error
-    if not isinstance(commit, str) or (
-        commit != CORE_RELEASE_EVIDENCE_COMMIT
-        and not commit.startswith(CORE_RELEASE_EVIDENCE_COMMIT)
-    ):
+    if not isinstance(commit, str) or commit != CORE_RELEASE_EVIDENCE_COMMIT:
         raise ExternalReleaseEvidenceError("installed core revision does not match #2753 catalog commit")
 
 
@@ -177,6 +174,8 @@ class ExternalReleaseEvidenceEnvelope:
             self.report.capability_id != _CAPABILITY_ID
             or self.report.repository != self.repository
             or self.report.source_revision != self.source_revision
+            or self.report.run_nonce != self.run_nonce
+            or self.report.freshness_receipt != self.freshness_receipt
         ):
             raise ExternalReleaseEvidenceError("external report identity does not match its envelope")
         report_by_gate = {item.gate_id: item for item in self.report.attestations}
@@ -288,7 +287,7 @@ class ParametricSelfExternalEvidenceRunner:
             feature._active_adapter_path = candidate_path
             feature._live_corpus_snapshot = snapshot
 
-            # The default path is a real, scoped core deletion for the exact
+            # The default path is a real, scoped core physical erasure for the exact
             # assertion that produced this snapshot.  ``erase`` remains only
             # for an operator-owned erasure coordinator with a wider physical
             # surface (vectors/exports): it must still produce this core
@@ -337,12 +336,6 @@ class ParametricSelfExternalEvidenceRunner:
                         drill=drill,
                     )
                 )
-            report = ExternalCapabilityReport.attest(
-                capability_id=_CAPABILITY_ID,
-                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
-                attestations=tuple(attestations),
-            )
             receipt = _digest(
                 {
                     "core_release_evidence_commit": CORE_RELEASE_EVIDENCE_COMMIT,
@@ -355,6 +348,14 @@ class ParametricSelfExternalEvidenceRunner:
             if receipt in self._issued_freshness_receipts:
                 raise ExternalReleaseEvidenceError("external evidence freshness receipt was already issued")
             self._issued_freshness_receipts.add(receipt)
+            report = ExternalCapabilityReport.attest(
+                capability_id=_CAPABILITY_ID,
+                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                attestations=tuple(attestations),
+                run_nonce=run_nonce,
+                freshness_receipt=receipt,
+            )
             return ExternalReleaseEvidenceEnvelope(
                 core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
@@ -378,15 +379,14 @@ class ParametricSelfExternalEvidenceRunner:
         run_nonce: str,
     ) -> None:
         storage = getattr(getattr(feature, "agent", None), "storage", None)
-        delete = getattr(storage, "delete_assertion", None)
+        erase = getattr(storage, "erase_assertion", None)
         example = snapshot.examples[0] if snapshot.examples else None
         assertion = getattr(example, "assertion", None)
-        if not callable(delete) or assertion is None:
+        if not callable(erase) or assertion is None:
             raise ExternalReleaseEvidenceError("core physical erasure capability is unavailable")
         try:
-            await delete(
+            await erase(
                 assertion.assertion_id,
-                assertion.revision_id,
                 operation_id=f"parametric-self-release-erasure:{run_nonce}",
             )
         except Exception as error:
