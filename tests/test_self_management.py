@@ -446,6 +446,39 @@ async def test_shutdown_without_bulk_confirmation_keeps_prior_incomplete_block_a
     assert (retained / "train.jsonl").exists()
 
 
+async def test_same_instance_reenable_keeps_process_provenance_for_recovery():
+    """Reloading a live feature must not turn its own stop proof into unknown."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f.agent.get_feature = MagicMock(return_value=f)
+    f._active_run = {
+        "run_id": "same-instance", "adapter_id": "adapter", "trigger": "manual",
+        "state": "shutdown_incomplete", "adapter_path": "/tmp/adapter",
+    }
+    await f._append_run_history({
+        "run_id": "same-instance", "trigger": "manual", "state": "shutdown_incomplete",
+        "reason": "training shutdown incomplete: prior stop was unconfirmed",
+    })
+    f._training_shutdown_incomplete = "training shutdown incomplete: prior stop was unconfirmed"
+
+    async def _unconfirmed_cancel_all():
+        return SimpleNamespace(all_stopped=False)
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    f._adapter.cancel_all = _unconfirmed_cancel_all
+    await f.on_disable()
+    assert f._training_shutdown_incomplete is not None
+
+    await f.post_all_features_loaded(f.agent)
+    assert f._shutdown_recovery_requires_external_confirmation is False
+    f._adapter.cancel_all = _confirmed_cancel_all
+    await f.on_disable()
+    assert f._training_shutdown_incomplete is None
+    assert f._cycle_in_flight is False
+    assert (await f._load_run_history())[-1]["state"] == "interrupted"
+
+
 async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
     """Nightly cancellation enters the same durable safety state as train_now."""
     from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
@@ -567,6 +600,7 @@ async def test_disable_cancels_owned_nightly_task_not_sleep_owner():
     started = asyncio.Event()
 
     async def _slow_cycle(*, trigger):
+        await f._begin_active_run(trigger=trigger, work_dir="/tmp/parametric-self-test")
         started.set()
         await asyncio.Event().wait()
 
@@ -585,6 +619,32 @@ async def test_disable_cancels_owned_nightly_task_not_sleep_owner():
     assert not sleep_owner.cancelled()
     with pytest.raises(asyncio.CancelledError):
         await child
+    assert (await f._load_run_history())[-1]["state"] == "interrupted"
+
+
+async def test_external_sleep_cancellation_propagates_and_terminalizes_nightly_run():
+    """Core cancellation is not a feature disable and must remain observable."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        await f._begin_active_run(trigger=trigger, work_dir="/tmp/parametric-self-test")
+        started.set()
+        await asyncio.Event().wait()
+
+    f._run_training_cycle_locked = _slow_cycle
+    sleep_owner = asyncio.create_task(f.on_post_consolidation({"episodes_created": 1}))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    sleep_owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sleep_owner
+    assert f._active_run is None
+    assert f._cycle_in_flight is False
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+    assert "sleep cycle cancelled" in runs[-1]["reason"]
 
 
 async def test_nightly_exception_is_consumed_and_history_is_failed():
@@ -604,6 +664,21 @@ async def test_nightly_exception_is_consumed_and_history_is_failed():
     runs = await f._load_run_history()
     assert runs[-1]["state"] == "failed"
     assert "synthetic nightly failure" in runs[-1]["reason"]
+
+
+def test_lifecycle_state_backfill_handles_partial_upgrade_shape():
+    """Each lifecycle field is independently restored for upgraded instances."""
+    f = ParametricSelfFeature.__new__(ParametricSelfFeature)
+    f._manual_run_lock = asyncio.Lock()  # present in a partially upgraded object
+    f._ensure_training_lifecycle_state()
+    assert f._manual_run_generation == 0
+    assert f._manual_runs_enabled is True
+    assert f._training_shutdown_incomplete is None
+    assert f._training_task is None
+    assert f._cycle_task is None
+    assert f._active_run is None
+    assert f._cycle_in_flight is False
+    assert f._shutdown_recovery_requires_external_confirmation is False
 
 
 async def test_status_surfaces_legacy_corpus_cleanup_requirement(tmp_path):

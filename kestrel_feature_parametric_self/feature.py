@@ -95,10 +95,21 @@ class ParametricSelfFeature(Feature):
         """Backfill lifecycle state for direct/unit-level calls before initialize."""
         if not hasattr(self, "_manual_run_lock"):
             self._manual_run_lock = asyncio.Lock()
+        if not hasattr(self, "_manual_run_generation"):
             self._manual_run_generation = 0
+        if not hasattr(self, "_manual_runs_enabled"):
             self._manual_runs_enabled = True
+        if not hasattr(self, "_training_shutdown_incomplete"):
             self._training_shutdown_incomplete = None
+        if not hasattr(self, "_training_task"):
+            self._training_task = None
+        if not hasattr(self, "_cycle_task"):
             self._cycle_task = None
+        if not hasattr(self, "_active_run"):
+            self._active_run = None
+        if not hasattr(self, "_cycle_in_flight"):
+            self._cycle_in_flight = False
+        if not hasattr(self, "_shutdown_recovery_requires_external_confirmation"):
             self._shutdown_recovery_requires_external_confirmation = False
 
     async def initialize(self) -> None:
@@ -1369,6 +1380,8 @@ class ParametricSelfFeature(Feature):
         """
         if not self._training_enabled:
             return {"trained": False, "promoted": False, "reason": "nightly training disabled for this agent"}
+        self._ensure_training_lifecycle_state()
+        launch_generation = self._manual_run_generation
         # Do not run the trainer on the core sleep dispatcher task: teardown
         # cancels this feature-owned task, while this hook awaits and reports its
         # terminal outcome honestly to the core sleep dependency graph.
@@ -1376,16 +1389,35 @@ class ParametricSelfFeature(Feature):
         try:
             return await task
         except TrainingShutdownIncomplete as exc:
-            return {"trained": False, "promoted": False, "reason": str(exc)}
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                return {"trained": False, "promoted": False, "reason": str(exc)}
+            # This is also a cancellation signal.  An external sleep-owner
+            # cancellation must propagate; the durable incomplete-shutdown
+            # marker was already written by the owned child.
+            raise
         except asyncio.CancelledError:
-            # ``on_disable`` cancels the owned child, not the sleep dispatcher
-            # that is awaiting it. Consume that expected child cancellation so
-            # the surrounding sleep cycle can continue and see an honest result.
-            return {
-                "trained": False,
-                "promoted": False,
-                "reason": "nightly training interrupted while feature was disabled",
-            }
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                # ``on_disable`` cancels the owned child, not the sleep
+                # dispatcher awaiting it. Consume that expected child
+                # cancellation so the surrounding sleep cycle can continue.
+                return {
+                    "trained": False,
+                    "promoted": False,
+                    "reason": "nightly training interrupted while feature was disabled",
+                }
+            # The core sleep owner itself was cancelled. Its cancellation must
+            # remain observable, but first terminalize the matching durable run
+            # so introspection cannot strand it as ``in_progress``.
+            await self._interrupt_active_run(
+                reason="nightly training interrupted (sleep cycle cancelled)",
+            )
+            raise
         except Exception as exc:
             logger.warning("parametric-self nightly training failed: %s", exc)
             return {
@@ -1840,6 +1872,12 @@ class ParametricSelfFeature(Feature):
             from kestrel_sovereign.storage.async_graph_store import GraphNode
             runs = await self._load_run_history()
             changed = False
+            # Re-enabling the same live feature retains its adapter/process
+            # provenance. Only a fresh feature instance has lost that handle.
+            same_instance_lifecycle = (
+                self._training_shutdown_incomplete is not None
+                or self._active_run is not None
+            )
             for entry in runs:
                 if entry.get("state") == "in_progress":
                     entry["state"] = "interrupted"
@@ -1857,7 +1895,8 @@ class ParametricSelfFeature(Feature):
                     # for this run. Its empty/all-stopped response cannot prove
                     # that the old child exited, so require operator or
                     # process-specific recovery evidence before clearing it.
-                    self._shutdown_recovery_requires_external_confirmation = True
+                    if not same_instance_lifecycle:
+                        self._shutdown_recovery_requires_external_confirmation = True
                     self._cycle_in_flight = True
             if changed:
                 await storage.add_node(GraphNode(
