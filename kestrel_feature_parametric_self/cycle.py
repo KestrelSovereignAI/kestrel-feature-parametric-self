@@ -16,13 +16,29 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 
 from .corpus import build_corpus
 from .fidelity import FidelityGate, parse_final_val_loss
 from .text_types import TextLoRAConfig
+
+
+class TrainingShutdownIncomplete(asyncio.CancelledError):
+    """Cancellation where the trainer child could not be confirmed stopped."""
+
+    def __init__(self, reason: str, *, corpus_path: str | None = None) -> None:
+        super().__init__(reason)
+        self.corpus_path = corpus_path
+
+
+class TrainingStillActive(RuntimeError):
+    """Polling ended while a trainer child may still be reading its corpus."""
+
+    def __init__(self, reason: str, *, corpus_path: str) -> None:
+        super().__init__(reason)
+        self.corpus_path = corpus_path
 
 
 class _TrainerProtocol(Protocol):
@@ -32,6 +48,7 @@ class _TrainerProtocol(Protocol):
     async def start_training(self, agent_id: str, config: TextLoRAConfig) -> TrainingStatus: ...
     async def get_status(self, job_id: str) -> TrainingStatus: ...
     def read_training_log(self, job_id: str) -> str: ...
+    async def cancel(self, job_id: str) -> bool: ...
 
 
 @dataclass
@@ -45,13 +62,24 @@ class CycleResult:
     promoted_adapter_path: Optional[str] = None
     corpus_train: int = 0
     corpus_valid: int = 0
+    corpus_manifest_path: Optional[str] = None
+    corpus_manifest_hash: Optional[str] = None
+    semantic_checkpoint_generation: Optional[int] = None
+    semantic_checkpoint_id: Optional[str] = None
+    corpus_snapshot_hash: Optional[str] = None
+    corpus_policy_digest: Optional[str] = None
+    assertion_lineage: tuple[tuple[str, str], ...] = ()
+    training_active: bool = False
+    retained_corpus_path: Optional[str] = None
+    legacy_corpus_retained: bool = False
 
 
 async def run_nightly_cycle(
     *,
     agent_id: str,
-    db_path: str,
+    db_path: str | None,
     work_dir: str,
+    governed_snapshot: Any,
     adapter: _TrainerProtocol,
     gate: FidelityGate,
     config: TextLoRAConfig,
@@ -63,18 +91,20 @@ async def run_nightly_cycle(
     """Run one corpus->train->gate cycle. Promotes nothing the gate rejects."""
     work = Path(work_dir)
 
-    # One-time cleanup of the PRE-0.3.1 shared corpus location (F377/P8): older
-    # code wrote plaintext train.jsonl/valid.jsonl DIRECTLY at ``work/corpus/``
-    # (not a per-run subdir), and a host upgraded from that version still carries
-    # that plaintext user-derived corpus on disk. Do this FIRST — before the
-    # trainer-availability early return — so the lingering plaintext is removed
-    # even on hosts where the trainer is unavailable or broken (where the cycle
-    # never trains). ``_delete_corpus`` only touches ``<dir>/train.jsonl``/
-    # ``valid.jsonl``, never the new per-run ``work/corpus/<run_id>/`` subdirs.
-    _delete_corpus(str(work / "corpus"))
+    # A pre-0.3.1 host may have plaintext directly under ``work/corpus/``. Its
+    # owner/process cannot be proven after an upgrade, so do NOT delete it here:
+    # an old child could still be reading it. The feature surfaces this retained
+    # cleanup requirement; only an operator/verified process lifecycle may remove
+    # it safely.
+    legacy_corpus_retained = any(
+        (work / "corpus" / name).exists() for name in ("train.jsonl", "valid.jsonl")
+    )
 
     if not adapter.is_available():
-        return CycleResult(False, reason="trainer unavailable on this host")
+        return CycleResult(
+            False, reason="trainer unavailable on this host",
+            legacy_corpus_retained=legacy_corpus_retained,
+        )
     # Each run trains into a UNIQUE staging dir so a rejected candidate can
     # never overwrite the currently-served adapter — the served adapter is the
     # promoted staging dir of a *prior* run, which this run never touches.
@@ -93,11 +123,23 @@ async def run_nightly_cycle(
     # still reading it. True while a started job hasn't reached a terminal state.
     training_active = False
     try:
-        stats = build_corpus(db_path, corpus_dir)
+        stats = build_corpus(
+            db_path,
+            corpus_dir,
+            governed_snapshot=governed_snapshot,
+            manifest_dir=adapter_dir,
+        )
         if stats.train == 0:
             return CycleResult(
                 False, reason="empty corpus — no grounded reflections to train on",
                 corpus_train=0, corpus_valid=stats.valid,
+                corpus_manifest_path=stats.manifest_path,
+                corpus_manifest_hash=stats.manifest_hash,
+                semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
+                semantic_checkpoint_id=stats.semantic_checkpoint_id,
+                corpus_snapshot_hash=stats.snapshot_hash,
+                corpus_policy_digest=stats.policy_digest,
+                assertion_lineage=stats.assertion_lineage,
             )
 
         config.data_dir = corpus_dir
@@ -119,10 +161,22 @@ async def run_nightly_cycle(
         # adapter's lifecycle responsibility (epic #1 follow-up).
         training_active = not status.state.is_terminal()
 
+        if training_active:
+            return CycleResult(
+                False,
+                reason="training still active after poll timeout; corpus retained",
+                corpus_train=stats.train,
+                corpus_valid=stats.valid,
+                training_active=True,
+                retained_corpus_path=corpus_dir,
+                legacy_corpus_retained=legacy_corpus_retained,
+            )
+
         if status.state != TrainingState.COMPLETED:
             return CycleResult(
                 False, reason=f"training did not complete (state={status.state.value}; {status.error or ''})".strip(),
                 corpus_train=stats.train, corpus_valid=stats.valid,
+                legacy_corpus_retained=legacy_corpus_retained,
             )
 
         val_loss = parse_final_val_loss(adapter.read_training_log(status.job_id))
@@ -135,12 +189,38 @@ async def run_nightly_cycle(
             promoted_adapter_path=adapter_dir if decision.promote else None,
             corpus_train=stats.train,
             corpus_valid=stats.valid,
+            corpus_manifest_path=stats.manifest_path,
+            corpus_manifest_hash=stats.manifest_hash,
+            semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
+            semantic_checkpoint_id=stats.semantic_checkpoint_id,
+            corpus_snapshot_hash=stats.snapshot_hash,
+            corpus_policy_digest=stats.policy_digest,
+            assertion_lineage=stats.assertion_lineage,
+            legacy_corpus_retained=legacy_corpus_retained,
         )
     except asyncio.CancelledError:
-        # Cancellation (on_disable / shutdown) tears the trainer subprocess down
-        # via ``cancel_all``, so the corpus is no longer needed — allow the
-        # finally to remove it rather than leaving plaintext behind (codex P2).
-        training_active = False
+        # A task cancellation alone does NOT stop the child process.  Terminate
+        # and wait for the trainer before allowing finally to remove plaintext
+        # corpus input; if the adapter cannot provide that confirmation, preserve
+        # the corpus rather than deleting files a live child may still be reading.
+        # ``cancel(job_id)`` returns an explicit confirmation for THIS cycle's
+        # child. A bulk count (including zero) cannot prove that this particular
+        # process stopped, so it is deliberately not accepted as deletion proof.
+        cancel = getattr(adapter, "cancel", None)
+        if training_active and callable(cancel):
+            try:
+                stopped = await cancel(status.job_id)
+            except Exception:
+                # F377 safety boundary: a failed termination attempt means the
+                # corpus remains available to a potentially live child.
+                pass
+            else:
+                training_active = not bool(stopped)
+        if training_active:
+            raise TrainingShutdownIncomplete(
+                "trainer stop could not be confirmed; corpus retained",
+                corpus_path=corpus_dir,
+            )
         raise
     finally:
         # The corpus is transient training INPUT derived from user-authored
@@ -161,5 +241,3 @@ def _delete_corpus(corpus_dir: str) -> None:
             (corpus / name).unlink(missing_ok=True)
         except OSError:
             pass
-
-

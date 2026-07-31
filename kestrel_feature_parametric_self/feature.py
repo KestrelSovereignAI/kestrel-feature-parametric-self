@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,7 +30,7 @@ from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from .cycle import run_nightly_cycle
+from .cycle import TrainingShutdownIncomplete, TrainingStillActive, run_nightly_cycle
 from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
 from .local_mlx_adapter import LocalMLXAdapter
 from .text_types import TextLoRAConfig
@@ -90,6 +91,27 @@ class ParametricSelfFeature(Feature):
             "on-demand oracle alongside the frontier model"
         )
 
+    def _ensure_training_lifecycle_state(self) -> None:
+        """Backfill lifecycle state for direct/unit-level calls before initialize."""
+        if not hasattr(self, "_manual_run_lock"):
+            self._manual_run_lock = asyncio.Lock()
+        if not hasattr(self, "_manual_run_generation"):
+            self._manual_run_generation = 0
+        if not hasattr(self, "_manual_runs_enabled"):
+            self._manual_runs_enabled = True
+        if not hasattr(self, "_training_shutdown_incomplete"):
+            self._training_shutdown_incomplete = None
+        if not hasattr(self, "_training_task"):
+            self._training_task = None
+        if not hasattr(self, "_cycle_task"):
+            self._cycle_task = None
+        if not hasattr(self, "_active_run"):
+            self._active_run = None
+        if not hasattr(self, "_cycle_in_flight"):
+            self._cycle_in_flight = False
+        if not hasattr(self, "_shutdown_recovery_requires_external_confirmation"):
+            self._shutdown_recovery_requires_external_confirmation = False
+
     async def initialize(self) -> None:
         """Initialize the parametric-self feature (training off by default)."""
         self._adapter = LocalMLXAdapter()           # lazy MLX; inert off Apple Silicon
@@ -98,6 +120,18 @@ class ParametricSelfFeature(Feature):
         self._base_config = TextLoRAConfig()        # base hyperparameters
         self._active_adapter_path: Optional[str] = None   # currently served adapter
         self._last_val_loss: Optional[float] = None        # served adapter's fidelity
+        # The feature never infers a permissive training policy.  An operator or
+        # host must supply this explicit governed-corpus release policy.
+        self._governed_corpus_policy = None
+        self._governed_inference_profile = None
+        # A live snapshot permits incremental tombstone checks during this
+        # process.  It is intentionally not treated as restart-durable proof.
+        self._live_corpus_snapshot = None
+        # Durable metadata is content-free: hashes, checkpoint pins, and exact
+        # assertion/revision lineage only.  Adapter state lives separately from
+        # the immutable candidate-side manifest.
+        self._adapter_lineage: Dict[str, Dict[str, Any]] = {}
+        self._quarantined_adapters: Dict[str, str] = {}
         # Optional overrides (tests / non-standard layouts); else resolved from agent.
         self._db_path: Optional[str] = None
         self._work_dir: Optional[str] = None
@@ -105,11 +139,26 @@ class ParametricSelfFeature(Feature):
         # In-flight manual training run (train_now). Detached so the tool call
         # returns immediately; guarded so only one cycle runs at a time.
         self._training_task: Optional[asyncio.Task] = None
+        # A sleep-triggered cycle uses a feature-owned task so teardown can stop
+        # its subprocess work without cancelling the core sleep dispatcher.
+        self._cycle_task: Optional[asyncio.Task] = None
+        # Serializes the short reservation -> run-record -> task-publication
+        # transition.  ``on_disable`` advances the generation before waiting on
+        # this lock, so a command that was suspended while creating its durable
+        # record can never publish a trainer after disable has begun.
+        self._manual_run_lock = asyncio.Lock()
+        self._manual_run_generation = 0
+        self._manual_runs_enabled = True
+        # Set only when cancellation cannot confirm the spawned child stopped.
+        # It deliberately blocks new mutations until a clean lifecycle boundary
+        # (normally process restart) rather than pretending a live child is gone.
+        self._training_shutdown_incomplete: Optional[str] = None
+        self._shutdown_recovery_requires_external_confirmation = False
         # The currently-running cycle's durable record (run_id, adapter_id,
         # trigger, started_at, state, adapter_path), or None when idle. Set when
         # a cycle begins so the introspection tools can distinguish "no run",
-        # "run in progress", and "run completed/failed" instead of treating an
-        # intermediate Val-loss snapshot as terminal (issue #17).
+        # "run in progress", and "run completed/skipped/failed" instead of
+        # treating an intermediate Val-loss snapshot as terminal (issue #17).
         self._active_run: Optional[Dict[str, Any]] = None
         # Cross-trigger serialization: nightly (on_post_consolidation) and manual
         # (train_now) cycles share the same corpus/work dir and the served-adapter
@@ -138,15 +187,79 @@ class ParametricSelfFeature(Feature):
             "enable_nightly_training": self._training_enabled,
             "base_model": self._base_config.base_model,
             "active_adapter_path": self._active_adapter_path,
+            "governed_corpus_policy": self._policy_mapping(),
         }
 
     async def set_config(self, config: Dict[str, Any]) -> None:
+        prior_policy_digest = getattr(self._governed_corpus_policy, "digest", None)
         if "enable_nightly_training" in config:
             self._training_enabled = bool(config["enable_nightly_training"])
         if config.get("base_model"):
             self._base_config.base_model = str(config["base_model"])
+        if "governed_corpus_policy" in config:
+            self._governed_corpus_policy = self._coerce_policy(
+                config["governed_corpus_policy"]
+            )
+        if "governed_inference_profile" in config:
+            self._governed_inference_profile = config["governed_inference_profile"]
+        # A policy change changes the set of facts that were authorized for an
+        # adapter.  Do not leave a previously-trained adapter served until the
+        # next status/train call happens to notice it.
+        if (
+            "governed_corpus_policy" in config
+            and self._active_adapter_path
+            and prior_policy_digest != getattr(self._governed_corpus_policy, "digest", None)
+        ):
+            await self._quarantine_adapter(
+                self._active_adapter_path,
+                "governed corpus policy updated; rebuild required",
+            )
         # Persist so the enablement survives restarts (durable per-agent gate).
         await self._persist_config()
+
+    def _policy_mapping(self) -> Optional[Dict[str, Any]]:
+        policy = self._governed_corpus_policy
+        serializer = getattr(policy, "to_mapping", None)
+        if callable(serializer):
+            try:
+                value = serializer()
+                return value if isinstance(value, dict) else None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_policy(value: Any):
+        """Accept only the public policy value or its canonical mapping.
+
+        Imports are deliberately runtime-only: non-MLX Linux hosts can still
+        install/import this feature, and an older host is reported as a visible
+        unavailable capability rather than failing package import.
+        """
+        if value is None or hasattr(value, "digest"):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("governed_corpus_policy must be a public policy or mapping")
+        from kestrel_sovereign.knowledge import GovernedCorpusPolicy, OntologyRef
+
+        pins = tuple(OntologyRef.from_mapping(item) for item in value["accepted_ontology_pins"])
+        capabilities = tuple(
+            (str(item["name"]), str(item["version"]))
+            for item in value["accepted_semantic_capability_versions"]
+        )
+        return GovernedCorpusPolicy(
+            policy_id=value["policy_id"], policy_version=value["policy_version"],
+            accepted_epistemic_states=tuple(value["accepted_epistemic_states"]),
+            accepted_visibility=tuple(value["accepted_visibility"]),
+            accepted_privacy_classifications=tuple(value["accepted_privacy_classifications"]),
+            accepted_consent_references=tuple(value["accepted_consent_references"]),
+            accepted_grounding_classes=tuple(value["accepted_grounding_classes"]),
+            accepted_source_kinds=tuple(value["accepted_source_kinds"]),
+            accepted_ontology_pins=pins,
+            accepted_semantic_capability_versions=capabilities,
+            allow_inferred=bool(value.get("allow_inferred", False)),
+            accepted_derivation_profiles=tuple(value.get("accepted_derivation_profiles", ())),
+        )
 
     # ------------------------------------------------------------------
     # Per-agent config persistence (graph node, mirrors the sovereign base)
@@ -169,6 +282,9 @@ class ParametricSelfFeature(Feature):
             # as its anti-regression baseline (it's lost across restarts otherwise).
             "active_adapter_path": self._active_adapter_path,
             "last_val_loss": self._last_val_loss,
+            "governed_corpus_policy": self._policy_mapping(),
+            "adapter_lineage": self._adapter_lineage,
+            "quarantined_adapters": self._quarantined_adapters,
         }
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -208,6 +324,17 @@ class ParametricSelfFeature(Feature):
                 self._active_adapter_path = str(cfg["active_adapter_path"])
             if cfg.get("last_val_loss") is not None:
                 self._last_val_loss = float(cfg["last_val_loss"])
+            if "governed_corpus_policy" in cfg:
+                self._governed_corpus_policy = self._coerce_policy(
+                    cfg.get("governed_corpus_policy")
+                )
+            if isinstance(cfg.get("adapter_lineage"), dict):
+                self._adapter_lineage = dict(cfg["adapter_lineage"])
+            if isinstance(cfg.get("quarantined_adapters"), dict):
+                self._quarantined_adapters = {
+                    str(path): str(reason)
+                    for path, reason in cfg["quarantined_adapters"].items()
+                }
         except Exception as e:
             logger.warning("Failed to restore parametric-self config (ignored): %s", e)
 
@@ -225,6 +352,8 @@ class ParametricSelfFeature(Feature):
     )
     async def parametric_self_status(self) -> ToolResult:
         """Report current state."""
+        if self._active_adapter_path:
+            await self._verify_adapter_lineage(self._active_adapter_path)
         # Surface the recovery state: a completed run can leave a valid candidate
         # on disk with no served pointer; expose those so the operator knows they
         # are adoptable via `!parametric-self-adopt` rather than appearing lost.
@@ -234,6 +363,7 @@ class ParametricSelfFeature(Feature):
             else []
         )
         active_run = self._active_run_progress()
+        legacy_cleanup_needed = self._legacy_corpus_cleanup_needed()
         data = {
             "training_enabled": self._training_enabled,
             "trainer_available": self._adapter.is_available(),
@@ -242,6 +372,11 @@ class ParametricSelfFeature(Feature):
             "served_val_loss": self._last_val_loss,
             "recoverable_adapters": recoverable,
             "active_run": active_run,
+            "training_shutdown_incomplete": self._training_shutdown_incomplete,
+            "shutdown_recovery_requires_external_confirmation": (
+                self._shutdown_recovery_requires_external_confirmation
+            ),
+            "legacy_corpus_cleanup_needed": legacy_cleanup_needed,
         }
         confirmation = (
             "Parametric-self "
@@ -254,6 +389,18 @@ class ParametricSelfFeature(Feature):
                 f" (run {active_run['run_id']}, iter {active_run.get('last_seen_iter')},"
                 f" latest val_loss {active_run.get('latest_val_loss')})."
             )
+        if self._training_shutdown_incomplete:
+            confirmation += f" WARNING: {self._training_shutdown_incomplete}."
+        if self._shutdown_recovery_requires_external_confirmation:
+            confirmation += (
+                " The prior process is not provably owned by this instance; after "
+                "verifying every prior trainer process is absent, a sovereign operator "
+                "must explicitly acknowledge that evidence with "
+                "`!parametric-self-recover-shutdown confirmed_process_absent=true "
+                "evidence=\"<process check>\"`."
+            )
+        if legacy_cleanup_needed:
+            confirmation += " WARNING: legacy corpus plaintext retained; verified cleanup is required."
         if recoverable:
             confirmation += (
                 f" No adapter served; {len(recoverable)} valid candidate(s) recoverable via "
@@ -325,6 +472,326 @@ class ParametricSelfFeature(Feature):
         except Exception:  # noqa: BLE001 - never let a probe break the cycle
             return False
 
+    def _resolved_governed_policy(self):
+        for candidate in (
+            getattr(self.agent, "parametric_self_governed_corpus_policy", None),
+            self._governed_corpus_policy,
+        ):
+            if isinstance(getattr(candidate, "digest", None), str):
+                return candidate
+        return None
+
+    def _resolved_inference_profile(self):
+        if self._governed_inference_profile is not None:
+            return self._governed_inference_profile
+        return getattr(self.agent, "semantic_inference_profile", None)
+
+    async def _request_governed_snapshot(self):
+        """Read only through the host's policy-gated, checkpointed capability."""
+        storage = getattr(self.agent, "storage", None)
+        policy = self._resolved_governed_policy()
+        reader = getattr(storage, "governed_assertion_corpus_snapshot", None)
+        if policy is None:
+            return None, "governed corpus policy is not configured"
+        if not callable(reader):
+            return None, "governed corpus capability unavailable on this host"
+        try:
+            snapshot = await reader(
+                policy=policy,
+                inference_profile=self._resolved_inference_profile(),
+            )
+        except Exception:
+            # Corpus failures may carry provider/tenant/source details.  Keep
+            # this operator-facing skip deliberately content-free.
+            return None, "governed corpus unavailable or semantic maintenance incomplete"
+        if not bool(getattr(snapshot, "verified", False)):
+            return None, "governed corpus returned unverified snapshot"
+        self._live_corpus_snapshot = snapshot
+        return snapshot, None
+
+    @staticmethod
+    def _manifest_lineage(path: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            raw = json.loads((Path(path) / "corpus_manifest.json").read_text())
+            expected = raw.pop("manifest_hash")
+            if not isinstance(expected, str):
+                return None, "candidate manifest hash missing"
+            encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            import hashlib
+            actual = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if actual != expected:
+                return None, "candidate manifest hash mismatch"
+            # Keep the verified receipt separate from the on-disk schema.  It
+            # is compared with the durable feature-side stamp before this
+            # manifest can authorize an existing adapter.
+            raw["_verified_manifest_hash"] = expected
+            return raw, None
+        except Exception:
+            return None, "candidate manifest unavailable"
+
+    async def _quarantine_adapter(self, path: str, reason: str) -> None:
+        self._quarantined_adapters[path] = reason
+        if self._active_adapter_path == path:
+            self._active_adapter_path = None
+            self._last_val_loss = None
+        lineage = self._adapter_lineage.setdefault(path, {})
+        lineage["state"] = "invalid"
+        lineage["invalidation_reason"] = reason
+        await self._persist_config()
+
+    @staticmethod
+    def _manifest_assertion_pairs(manifest: Dict[str, Any]) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for example in manifest.get("examples", ()):
+            lineage = example.get("lineage", {}) if isinstance(example, dict) else {}
+            assertion_id, revision_id = lineage.get("assertion_id"), lineage.get("revision_id")
+            if isinstance(assertion_id, str) and isinstance(revision_id, str):
+                pairs.add((assertion_id, revision_id))
+        return pairs
+
+    @classmethod
+    def _manifest_receipt_stamp(cls, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return the immutable, content-free receipt persisted with an adapter.
+
+        The manifest's self-hash detects accidental corruption, but cannot
+        distinguish a replaced, correctly rehashed manifest from the one that
+        trained the adapter.  The feature graph stores this independent stamp
+        and the verifier compares it before accepting the manifest as lineage.
+        """
+        checkpoint = manifest.get("semantic_checkpoint")
+        capabilities = manifest.get("capability_versions")
+        manifest_hash = manifest.get("_verified_manifest_hash")
+        if (
+            not isinstance(manifest_hash, str)
+            or not isinstance(manifest.get("snapshot_hash"), str)
+            or not isinstance(manifest.get("policy_digest"), str)
+            or not isinstance(checkpoint, Mapping)
+            or not isinstance(capabilities, Mapping)
+        ):
+            return None
+        checkpoint_signature = cls._manifest_checkpoint_signature(manifest)
+        if checkpoint_signature is None or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in capabilities.items()
+        ):
+            return None
+        return {
+            "manifest_hash": manifest_hash,
+            "snapshot_hash": manifest["snapshot_hash"],
+            "policy_digest": manifest["policy_digest"],
+            "semantic_checkpoint": {
+                "tenant_id": checkpoint_signature[0],
+                "generation": checkpoint_signature[1],
+                "event_id": checkpoint_signature[2],
+            },
+            "capability_versions": dict(sorted(capabilities.items())),
+        }
+
+    def _persisted_receipt_problem(self, path: str, manifest: Dict[str, Any]) -> Optional[str]:
+        """Reject a valid-looking manifest that is not the adapter's receipt."""
+        persisted = self._adapter_lineage.get(path)
+        # A manifest validates only itself.  Serving an untracked candidate
+        # would let arbitrary old weights be paired with a freshly valid
+        # manifest, so legacy/untracked artifacts are inspection-only until a
+        # new governed training run creates their durable receipt.
+        if not isinstance(persisted, dict):
+            return "durable adapter lineage receipt unavailable; rebuild required"
+        receipt = self._manifest_receipt_stamp(manifest)
+        if receipt is None:
+            return "candidate manifest governed evidence is malformed"
+        for field, expected in receipt.items():
+            if persisted.get(field) != expected:
+                return "persisted adapter lineage receipt mismatch; rebuild required"
+        return None
+
+    @staticmethod
+    def _checkpoint_signature(checkpoint: Any) -> Optional[tuple[str, int, Optional[str]]]:
+        """Return the public checkpoint identity in the manifest's shape."""
+        tenant_id = getattr(checkpoint, "tenant_id", None)
+        generation = getattr(checkpoint, "generation", None)
+        event_id = getattr(checkpoint, "latest_event_id", getattr(checkpoint, "event_id", None))
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(generation, int)
+            or not isinstance(event_id, (str, type(None)))
+        ):
+            return None
+        return tenant_id, generation, event_id
+
+    @staticmethod
+    def _manifest_checkpoint_signature(manifest: Dict[str, Any]) -> Optional[tuple[str, int, Optional[str]]]:
+        checkpoint = manifest.get("semantic_checkpoint")
+        if not isinstance(checkpoint, dict):
+            return None
+        tenant_id = checkpoint.get("tenant_id")
+        generation, event_id = checkpoint.get("generation"), checkpoint.get("event_id")
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(generation, int)
+            or not isinstance(event_id, (str, type(None)))
+        ):
+            return None
+        return tenant_id, generation, event_id
+
+    def _snapshot_pin_problem(
+        self,
+        manifest: Dict[str, Any],
+        snapshot: Any,
+        *,
+        require_exact_snapshot: bool,
+    ) -> Optional[str]:
+        """Validate the complete receipt that authorized this adapter.
+
+        An assertion/revision pair is not enough: the same pair can be exposed
+        under a different policy, ontology/capability pin, or semantic state.
+        The manifest is a receipt for one immutable snapshot.  A live snapshot
+        must match it byte-for-byte at the public-contract level; a restart
+        snapshot may be newer, but must retain the same policy/capability pins.
+        """
+        expected_policy = manifest.get("policy_digest")
+        expected_hash = manifest.get("snapshot_hash")
+        expected_capabilities = manifest.get("capability_versions")
+        expected_checkpoint = self._manifest_checkpoint_signature(manifest)
+        if (
+            not isinstance(expected_policy, str)
+            or not isinstance(expected_hash, str)
+            or not isinstance(expected_capabilities, Mapping)
+            or not all(isinstance(key, str) and isinstance(value, str)
+                       for key, value in expected_capabilities.items())
+            or expected_checkpoint is None
+        ):
+            return "candidate manifest governed evidence is malformed"
+
+        policy = self._resolved_governed_policy()
+        if getattr(policy, "digest", None) != expected_policy:
+            return "governed corpus policy changed; rebuild required"
+        if getattr(getattr(snapshot, "policy", None), "digest", None) != expected_policy:
+            return "governed corpus policy evidence mismatch; rebuild required"
+        capabilities = getattr(snapshot, "capability_versions", None)
+        if not isinstance(capabilities, Mapping) or dict(capabilities) != dict(expected_capabilities):
+            return "governed semantic capability pins changed; rebuild required"
+
+        checkpoint = self._checkpoint_signature(getattr(snapshot, "checkpoint", None))
+        snapshot_hash = getattr(snapshot, "snapshot_hash", None)
+        if (
+            checkpoint is None
+            or getattr(snapshot, "tenant_id", None) != expected_checkpoint[0]
+            or not isinstance(snapshot_hash, str)
+        ):
+            return "governed corpus snapshot evidence is malformed"
+        if require_exact_snapshot:
+            if checkpoint != expected_checkpoint or snapshot_hash != expected_hash:
+                return "governed corpus snapshot receipt changed; rebuild required"
+        # If a fresh read reports the exact same checkpoint, its receipt hash
+        # must be identical.  A later checkpoint is allowed and its assertion
+        # membership is checked below; it cannot silently change policy/pins.
+        elif checkpoint == expected_checkpoint and snapshot_hash != expected_hash:
+            return "governed corpus snapshot receipt changed; rebuild required"
+        return None
+
+    def _delta_pin_problem(self, manifest: Dict[str, Any], delta: Any) -> Optional[str]:
+        """Check that delta evidence is rooted at the manifest's exact snapshot."""
+        expected_checkpoint = self._manifest_checkpoint_signature(manifest)
+        since_checkpoint = self._checkpoint_signature(getattr(delta, "since_checkpoint", None))
+        checkpoint = self._checkpoint_signature(getattr(delta, "checkpoint", None))
+        observability = getattr(delta, "observability", None)
+        expected_policy = manifest.get("policy_digest")
+        if (
+            expected_checkpoint is None
+            or since_checkpoint != expected_checkpoint
+            or checkpoint is None
+            or checkpoint[0] != expected_checkpoint[0]
+            or not isinstance(getattr(delta, "snapshot_hash", None), str)
+            or getattr(observability, "policy_digest", None) != expected_policy
+        ):
+            return "governed corpus delta evidence mismatch; adapter cannot be verified"
+        return None
+
+    async def _verify_adapter_lineage(self, path: str, *, before_promotion: bool = False) -> Optional[str]:
+        """Quarantine an adapter when its exact governed inputs no longer hold."""
+        manifest, manifest_error = self._manifest_lineage(path)
+        if manifest_error:
+            await self._quarantine_adapter(path, manifest_error)
+            return manifest_error
+        persisted_problem = self._persisted_receipt_problem(path, manifest or {})
+        if persisted_problem:
+            await self._quarantine_adapter(path, persisted_problem)
+            return persisted_problem
+        pairs = self._manifest_assertion_pairs(manifest or {})
+        snapshot = self._live_corpus_snapshot
+        storage = getattr(self.agent, "storage", None)
+        policy = self._resolved_governed_policy()
+        changes = getattr(storage, "governed_assertion_corpus_changes_since", None)
+        if snapshot is not None and callable(changes) and policy is not None:
+            pin_problem = self._snapshot_pin_problem(
+                manifest or {}, snapshot, require_exact_snapshot=True,
+            )
+            if pin_problem:
+                await self._quarantine_adapter(path, pin_problem)
+                return pin_problem
+            try:
+                delta = await changes(
+                    snapshot, policy=policy,
+                    inference_profile=self._resolved_inference_profile(),
+                )
+            except Exception:
+                reason = "governed corpus delta unavailable; adapter cannot be verified"
+                await self._quarantine_adapter(path, reason)
+                return reason
+            pin_problem = self._delta_pin_problem(manifest or {}, delta)
+            if pin_problem:
+                await self._quarantine_adapter(path, pin_problem)
+                return pin_problem
+            tombstoned = {
+                (item.assertion_id, item.revision_id)
+                for item in getattr(delta, "tombstones", ())
+                if isinstance(getattr(item, "assertion_id", None), str)
+                and isinstance(getattr(item, "revision_id", None), str)
+            }
+            removed_ids = {
+                item.assertion_id for item in getattr(delta, "tombstones", ())
+                if isinstance(getattr(item, "assertion_id", None), str)
+            }
+            if tombstoned.intersection(pairs) or any(aid in removed_ids for aid, _ in pairs):
+                reason = "governed assertion lineage invalidated; rebuild required"
+                await self._quarantine_adapter(path, reason)
+                return reason
+            self._live_corpus_snapshot = None  # a delta is evidence only for its base snapshot
+            return None
+
+        # A process restart cannot reuse an in-memory snapshot as durable proof.
+        # Rebuild a fresh approved snapshot and compare exact revisions.
+        fresh, reason = await self._request_governed_snapshot()
+        if fresh is None:
+            await self._quarantine_adapter(path, reason or "governed corpus unavailable")
+            return reason
+        pin_problem = self._snapshot_pin_problem(
+            manifest or {}, fresh, require_exact_snapshot=False,
+        )
+        if pin_problem:
+            await self._quarantine_adapter(path, pin_problem)
+            return pin_problem
+        current = {
+            (item.assertion.assertion_id, item.assertion.revision_id)
+            for item in getattr(fresh, "examples", ())
+        }
+        if not pairs.issubset(current):
+            reason = "governed assertion lineage no longer current; rebuild required"
+            await self._quarantine_adapter(path, reason)
+            return reason
+        if before_promotion:
+            # The fresh snapshot is now the correct base for a subsequent delta.
+            self._live_corpus_snapshot = fresh
+        else:
+            # ``_request_governed_snapshot`` caches its result for a newly
+            # built candidate. A restart/status verification may legitimately
+            # observe a newer checkpoint, which is evidence for membership but
+            # not the adapter's original delta base; never reuse it as one.
+            self._live_corpus_snapshot = None
+        return None
+
     def _require_sovereign_class(self) -> Optional[ToolResult]:
         """Return a refusal ``ToolResult`` for a governed agent, else ``None``.
 
@@ -379,13 +846,28 @@ class ParametricSelfFeature(Feature):
                     except Exception:
                         val_loss = None
                 in_progress = active_id is not None and d.name == active_id
+                manifest, manifest_problem = self._manifest_lineage(str(d))
+                receipt_problem = (
+                    self._persisted_receipt_problem(str(d), manifest)
+                    if manifest is not None else None
+                )
+                lineage_state = self._adapter_lineage.get(str(d), {}).get(
+                    "state", "candidate" if manifest is not None else "untracked"
+                )
+                quarantined_reason = self._quarantined_adapters.get(str(d))
                 adapters.append({
                     "adapter_id": d.name,
                     "path": str(d),
                     "val_loss": val_loss,
                     "served": str(d) == str(served) if served else False,
                     "in_progress": in_progress,
-                    "recoverable": served is None and val_loss is not None and not in_progress,
+                    "recoverable": (
+                        served is None and val_loss is not None and not in_progress
+                        and manifest is not None and not quarantined_reason
+                        and receipt_problem is None
+                    ),
+                    "lineage_state": lineage_state,
+                    "quarantined_reason": quarantined_reason or manifest_problem or receipt_problem,
                 })
         return adapters
 
@@ -507,6 +989,7 @@ class ParametricSelfFeature(Feature):
     )
     async def parametric_self_train_now(self) -> ToolResult:
         """Kick off a training cycle detached; do not block for the full run."""
+        self._ensure_training_lifecycle_state()
         gate = self._require_sovereign_class()
         if gate is not None:
             return gate
@@ -522,45 +1005,125 @@ class ParametricSelfFeature(Feature):
             )
         if not self._adapter.is_available():
             return ToolResult.failed("Trainer unavailable on this host (MLX/Apple Silicon required).")
-        if self._cycle_in_flight or (self._training_task is not None and not self._training_task.done()):
-            return ToolResult.failed("A parametric-self training run is already in progress.")
-
         db_path, work_dir = self._resolve_paths()
-        if not db_path or not work_dir:
-            return ToolResult.failed("Could not resolve agent storage_path for parametric-self training.")
+        if not work_dir:
+            return ToolResult.failed("Could not resolve parametric-self work directory.")
 
-        # Reserve the cross-trigger guard HERE, synchronously, before detaching:
-        # otherwise the nightly hook could fire in the same event-loop turn,
-        # acquire the guard first, and the detached manual run would skip as
-        # "already in progress" — contradicting the "started" we report. There is
-        # no await between the busy-check above and this set, so it is atomic.
-        self._cycle_in_flight = True
-        active_run = await self._begin_active_run(trigger="manual", work_dir=work_dir)
+        # Keep the reservation, durable record creation, and task publication
+        # together.  ``on_disable`` invalidates the captured generation before
+        # it waits for this lock, closing the otherwise possible race where a
+        # command resumes from the record-store await and launches after disable.
+        async with self._manual_run_lock:
+            if not self._manual_runs_enabled:
+                return ToolResult.failed("Parametric-self training is unavailable while this feature is disabled.")
+            if self._training_shutdown_incomplete:
+                return ToolResult.failed(
+                    "Parametric-self training is blocked: "
+                    f"{self._training_shutdown_incomplete}."
+                )
+            if self._cycle_in_flight or (
+                self._training_task is not None and not self._training_task.done()
+            ):
+                return ToolResult.failed("A parametric-self training run is already in progress.")
 
-        # Run detached: a full cycle is ~24 min; the tool returns immediately and
-        # the run record already exists by the time started=True is returned. The
-        # runner calls the LOCKED body (the guard is already held) and clears it
-        # in finally. Errors are logged, not surfaced (poll history/progress for
-        # the outcome).
-        async def _runner() -> None:
+            launch_generation = self._manual_run_generation
+            # Reserve the cross-trigger guard HERE, synchronously, before
+            # detaching: otherwise the nightly hook could fire in the same
+            # event-loop turn and acquire it first.
+            self._cycle_in_flight = True
+            active_run: Optional[Dict[str, Any]] = None
             try:
-                await self._run_training_cycle_locked(trigger="manual")
+                active_run = await self._begin_active_run(trigger="manual", work_dir=work_dir)
             except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                active = getattr(self, "_active_run", None)
-                if active is not None:
-                    await self._update_run_history(active["run_id"], {
-                        "state": "failed",
-                        "timestamp": _utc_now_iso(),
-                        "reason": f"training error: {exc}",
-                    })
-                    self._active_run = None
-                logger.warning("parametric-self manual training run failed: %s", exc)
-            finally:
+                await self._interrupt_active_run(
+                    reason="run cancelled before manual training started",
+                )
                 self._cycle_in_flight = False
+                raise
 
-        self._training_task = asyncio.create_task(_runner())
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                await self._interrupt_active_run(
+                    run_id=active_run["run_id"],
+                    reason="run cancelled (feature disabled before launch)",
+                )
+                self._cycle_in_flight = False
+                return ToolResult.failed(
+                    "Parametric-self training did not start because the feature was disabled."
+                )
+
+            # Run detached: a full cycle is ~24 min; the tool returns immediately
+            # and the run record already exists by the time started=True is
+            # returned. The runner calls the LOCKED body (the guard is already
+            # held) and clears it in finally. Errors are logged, not surfaced
+            # (poll history/progress for the outcome).
+            async def _runner() -> None:
+                keep_guard_held = False
+                try:
+                    outcome = await self._run_training_cycle_locked(trigger="manual")
+                    # The locked body owns normal full-cycle finalization.  It can
+                    # also return before it creates a run (for example, when the
+                    # governed corpus policy is absent or semantic maintenance has
+                    # not produced a usable snapshot).  A detached manual cycle
+                    # already has a durable in-progress record at this point, so
+                    # finish that specific record for every such normal no-op.
+                    # Matching the captured run id prevents a future lifecycle
+                    # change from accidentally finalizing another run.
+                    active = getattr(self, "_active_run", None)
+                    if active is not None and active.get("run_id") == active_run["run_id"]:
+                        trained = bool(outcome.get("trained", False))
+                        await self._update_run_history(active_run["run_id"], {
+                            "state": "completed" if trained else "skipped",
+                            "timestamp": _utc_now_iso(),
+                            "trained": trained,
+                            "promoted": bool(outcome.get("promoted", False)),
+                            "reason": outcome.get("reason", "training completed"),
+                        })
+                        self._active_run = None
+                except asyncio.CancelledError as exc:
+                    # A normal cycle cancellation confirms the child before
+                    # this handler finalizes its run. An explicit incomplete
+                    # shutdown instead keeps an observable nonterminal record.
+                    incomplete = isinstance(exc, TrainingShutdownIncomplete)
+                    if incomplete:
+                        await self._mark_training_shutdown_incomplete(
+                            run_id=active_run["run_id"],
+                            reason=str(exc),
+                            retained_corpus_path=getattr(exc, "corpus_path", None),
+                        )
+                        keep_guard_held = True
+                    else:
+                        await self._interrupt_active_run(
+                            run_id=active_run["run_id"], reason="run cancelled",
+                        )
+                    if self._training_task is asyncio.current_task():
+                        self._training_task = None
+                    raise
+                except TrainingStillActive as exc:
+                    await self._mark_training_shutdown_incomplete(
+                        run_id=active_run["run_id"],
+                        reason=str(exc),
+                        retained_corpus_path=exc.corpus_path,
+                    )
+                    keep_guard_held = True
+                    logger.warning("parametric-self manual training remains active: %s", exc)
+                except Exception as exc:
+                    active = getattr(self, "_active_run", None)
+                    if active is not None and active.get("run_id") == active_run["run_id"]:
+                        await self._update_run_history(active_run["run_id"], {
+                            "state": "failed",
+                            "timestamp": _utc_now_iso(),
+                            "reason": f"training error: {exc}",
+                        })
+                        self._active_run = None
+                    logger.warning("parametric-self manual training run failed: %s", exc)
+                finally:
+                    if not keep_guard_held:
+                        self._cycle_in_flight = False
+
+            self._training_task = asyncio.create_task(_runner())
         return ToolResult.ok(
             confirmation=(
                 "Parametric-self training run started in the background. "
@@ -587,6 +1150,78 @@ class ParametricSelfFeature(Feature):
         return ToolResult.ok(
             confirmation=f"Nightly parametric-self training {state} for this agent.",
             data={"enable_nightly_training": self._training_enabled},
+        )
+
+    @tool(
+        name="parametric-self-recover-shutdown",
+        description=(
+            "Clear a persisted parametric-self incomplete-shutdown block after a "
+            "sovereign operator verifies every prior trainer process is absent; "
+            "requires explicit confirmation plus evidence"
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!parametric-self-recover-shutdown",
+    )
+    async def parametric_self_recover_shutdown(
+        self,
+        confirmed_process_absent: bool = False,
+        evidence: str = "",
+    ) -> ToolResult:
+        """Record an explicit, sovereign recovery proof for an old process.
+
+        A replacement feature instance cannot inspect a child process started by
+        its predecessor. This tool intentionally does not infer that safety from
+        an empty adapter job list: the operator must freshly verify the old
+        trainer is absent, then supply both an affirmative boolean and concise
+        evidence of that verification. Only then may retained corpus plaintext
+        be removed and the durable lifecycle block be terminalized.
+        """
+        self._ensure_training_lifecycle_state()
+        gate = self._require_sovereign_class()
+        if gate is not None:
+            return gate
+        if self._training_shutdown_incomplete is None:
+            return ToolResult.failed("No parametric-self incomplete-shutdown recovery is pending.")
+        if not self._shutdown_recovery_requires_external_confirmation:
+            return ToolResult.failed(
+                "This recovery command is only for an incomplete shutdown restored "
+                "after process restart. This feature instance still has adapter-owned "
+                "shutdown provenance; retry disable so the adapter can affirmatively "
+                "confirm the trainer stopped."
+            )
+        if not _as_bool(confirmed_process_absent):
+            return ToolResult.failed(
+                "Recovery is blocked. First verify every prior trainer process is absent, "
+                "then set confirmed_process_absent=true and provide the check as evidence."
+            )
+        evidence = str(evidence).strip()
+        if len(evidence) < 12:
+            return ToolResult.failed(
+                "Recovery requires non-empty, specific process-absence evidence "
+                "(for example, the command/check and its result)."
+            )
+        active_tasks = (
+            task for task in (self._training_task, self._cycle_task)
+            if task is not None and not task.done() and task is not asyncio.current_task()
+        )
+        if any(active_tasks):
+            return ToolResult.failed(
+                "Recovery is blocked while this feature still owns a live training task."
+            )
+
+        await self._resolve_training_shutdown_incomplete(
+            reason=(
+                "run interrupted after sovereign operator verified prior trainer "
+                f"process absent: {evidence}"
+            ),
+        )
+        self._cycle_in_flight = False
+        return ToolResult.ok(
+            confirmation=(
+                "Incomplete-shutdown recovery recorded after explicit process-absence "
+                "verification; retained per-run corpus input was removed where recorded."
+            ),
+            data={"recovered": True, "evidence": evidence},
         )
 
     @tool(
@@ -661,6 +1296,12 @@ class ParametricSelfFeature(Feature):
                 return ToolResult.failed(
                     f"Adapter '{Path(target_path).name}' has no parseable validation loss "
                     "(incomplete/failed run); refusing to serve it."
+                )
+
+            lineage_problem = await self._verify_adapter_lineage(target_path)
+            if lineage_problem:
+                return ToolResult.failed(
+                    f"Adapter '{Path(target_path).name}' is quarantined: {lineage_problem}."
                 )
 
             self._active_adapter_path = target_path
@@ -745,6 +1386,12 @@ class ParametricSelfFeature(Feature):
                     "(incomplete/failed run); refusing to serve it."
                 )
 
+            lineage_problem = await self._verify_adapter_lineage(target_path)
+            if lineage_problem:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' is quarantined: {lineage_problem}."
+                )
+
             # Same fidelity gate as a nightly promotion, against the current
             # baseline (``prior_val_loss`` is None in the first-adoption case).
             decision = self._gate.evaluate(val_loss, prior_val_loss=self._last_val_loss)
@@ -774,20 +1421,32 @@ class ParametricSelfFeature(Feature):
             self._cycle_in_flight = False
 
     def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve (cognition_db_path, work_dir) for this agent.
+        """Resolve optional reflection DB and required adapter working directory.
 
-        The agent exposes its cognition DB as ``storage_path`` (the SQLite file
-        holding reflection_insights + graph_nodes); the data dir is its parent.
+        The agent may expose a SQLite ``storage_path`` for the optional
+        reflection source; factual training data never comes from that file.
         There is no ``data_dir`` attribute on the agent.
         """
         if self._db_path and self._work_dir:
             return self._db_path, self._work_dir
+        configured_work = getattr(self.agent, "parametric_self_work_dir", None)
+        explicit_work = self._work_dir or (
+            configured_work if isinstance(configured_work, (str, Path)) and str(configured_work) else None
+        )
         storage_path = getattr(self.agent, "storage_path", None)
         if not storage_path:
-            return self._db_path, self._work_dir
+            return self._db_path, str(explicit_work) if explicit_work else None
         db = self._db_path or str(storage_path)
-        work = self._work_dir or str(Path(storage_path).parent / "parametric_self")
+        work = explicit_work or str(Path(storage_path).parent / "parametric_self")
         return db, work
+
+    def _legacy_corpus_cleanup_needed(self) -> bool:
+        """Whether unknown-owner pre-per-run corpus files must be retained."""
+        _, work_dir = self._resolve_paths()
+        if not work_dir:
+            return False
+        legacy_dir = Path(work_dir) / "corpus"
+        return any((legacy_dir / name).exists() for name in ("train.jsonl", "valid.jsonl"))
 
     async def on_post_consolidation(
         self,
@@ -801,7 +1460,51 @@ class ParametricSelfFeature(Feature):
         """
         if not self._training_enabled:
             return {"trained": False, "promoted": False, "reason": "nightly training disabled for this agent"}
-        return await self._run_training_cycle(trigger="nightly")
+        self._ensure_training_lifecycle_state()
+        launch_generation = self._manual_run_generation
+        # Do not run the trainer on the core sleep dispatcher task: teardown
+        # cancels this feature-owned task, while this hook awaits and reports its
+        # terminal outcome honestly to the core sleep dependency graph.
+        task = asyncio.create_task(self._run_training_cycle(trigger="nightly"))
+        try:
+            return await task
+        except TrainingShutdownIncomplete as exc:
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                return {"trained": False, "promoted": False, "reason": str(exc)}
+            # This is also a cancellation signal.  An external sleep-owner
+            # cancellation must propagate; the durable incomplete-shutdown
+            # marker was already written by the owned child.
+            raise
+        except asyncio.CancelledError:
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                # ``on_disable`` cancels the owned child, not the sleep
+                # dispatcher awaiting it. Consume that expected child
+                # cancellation so the surrounding sleep cycle can continue.
+                return {
+                    "trained": False,
+                    "promoted": False,
+                    "reason": "nightly training interrupted while feature was disabled",
+                }
+            # The core sleep owner itself was cancelled. Its cancellation must
+            # remain observable, but first terminalize the matching durable run
+            # so introspection cannot strand it as ``in_progress``.
+            await self._interrupt_active_run(
+                reason="nightly training interrupted (sleep cycle cancelled)",
+            )
+            raise
+        except Exception as exc:
+            logger.warning("parametric-self nightly training failed: %s", exc)
+            return {
+                "trained": False,
+                "promoted": False,
+                "reason": f"nightly training failed: {exc}",
+            }
 
     async def _run_training_cycle(self, *, trigger: str) -> Dict[str, Any]:
         """Run one corpus->train->gate->promote cycle and record it in history.
@@ -823,6 +1526,7 @@ class ParametricSelfFeature(Feature):
         self-modifies, even if ``enable_nightly_training`` was set in persisted
         or externally-supplied config.
         """
+        self._ensure_training_lifecycle_state()
         if not self._is_sovereign_class():
             return {"trained": False, "promoted": False,
                     "reason": "self-modification reserved for sovereign-class agents (Incubator Principle)"}
@@ -833,19 +1537,77 @@ class ParametricSelfFeature(Feature):
             # selectively forgotten — so skip the whole cycle (F377).
             return {"trained": False, "promoted": False,
                     "reason": "training skipped: privacy mode hides persisted user content"}
-        if self._cycle_in_flight:
-            return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
-        self._cycle_in_flight = True
+        # All triggers share the same lifecycle fence as manual launch. Disable
+        # invalidates the generation before it waits on this lock, so a pending
+        # sleep dispatch cannot begin a child after disable starts.
+        async with self._manual_run_lock:
+            if not self._manual_runs_enabled:
+                return {"trained": False, "promoted": False, "reason": "parametric-self feature is disabled"}
+            if self._training_shutdown_incomplete:
+                return {
+                    "trained": False,
+                    "promoted": False,
+                    "reason": self._training_shutdown_incomplete,
+                }
+            if self._cycle_in_flight:
+                return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
+            launch_generation = self._manual_run_generation
+            self._cycle_in_flight = True
+            self._cycle_task = asyncio.current_task()
+        keep_guard_held = False
         try:
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                return {"trained": False, "promoted": False, "reason": "parametric-self feature is disabled"}
             return await self._run_training_cycle_locked(trigger=trigger)
+        except (TrainingShutdownIncomplete, TrainingStillActive) as exc:
+            active_run = getattr(self, "_active_run", None)
+            await self._mark_training_shutdown_incomplete(
+                run_id=active_run.get("run_id") if active_run is not None else None,
+                reason=str(exc),
+                retained_corpus_path=getattr(exc, "corpus_path", None),
+            )
+            keep_guard_held = True
+            if isinstance(exc, TrainingStillActive):
+                return {"trained": False, "promoted": False, "reason": str(exc)}
+            raise
+        except Exception as exc:
+            # Keep the durable lifecycle truthful even if an injected adapter or
+            # future locked-cycle branch raises before it performs its own
+            # terminal update. The sleep hook consumes the exception below and
+            # reports this failure rather than leaving an orphaned task warning.
+            active_run = getattr(self, "_active_run", None)
+            if active_run is not None:
+                await self._update_run_history(active_run["run_id"], {
+                    "state": "failed",
+                    "timestamp": _utc_now_iso(),
+                    "reason": f"training error: {exc}",
+                })
+                self._active_run = None
+            raise
         finally:
-            self._cycle_in_flight = False
+            if not keep_guard_held:
+                self._cycle_in_flight = False
+            if self._cycle_task is asyncio.current_task():
+                self._cycle_task = None
 
     async def _run_training_cycle_locked(self, *, trigger: str) -> Dict[str, Any]:
         """Body of one cycle; only ever called with the in-flight guard held."""
+        # An unsupported local trainer is an expected operational no-op. Check
+        # it before requesting governed data so a Linux/non-MLX sleep cycle
+        # reports SKIPPED rather than a misleading missing-policy failure. On a
+        # supported host, corpus/policy evidence remains a hard prerequisite.
+        if not self._adapter.is_available():
+            return {"trained": False, "promoted": False, "reason": "trainer unavailable on this host"}
         db_path, work_dir = self._resolve_paths()
-        if not db_path or not work_dir:
-            return {"trained": False, "promoted": False, "reason": "could not resolve agent storage_path"}
+        if not work_dir:
+            return {"trained": False, "promoted": False, "reason": "could not resolve parametric-self work directory"}
+
+        governed_snapshot, corpus_reason = await self._request_governed_snapshot()
+        if governed_snapshot is None:
+            return {"trained": False, "promoted": False, "reason": corpus_reason}
 
         agent_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "name", "agent")
         config = TextLoRAConfig.from_dict(self._base_config.to_dict())
@@ -869,16 +1631,23 @@ class ParametricSelfFeature(Feature):
                 agent_id=str(agent_id),
                 db_path=db_path,
                 work_dir=work_dir,
+                governed_snapshot=governed_snapshot,
                 adapter=self._adapter,
                 gate=self._gate,
                 config=config,
                 prior_val_loss=self._last_val_loss,
                 adapter_id=adapter_id,
             )
+            if result.training_active:
+                raise TrainingStillActive(
+                    result.reason, corpus_path=result.retained_corpus_path or "",
+                )
         except asyncio.CancelledError:
             # Cancellation (e.g. on_disable) marks the record interrupted; that
             # durable update is done by on_disable, not here, because awaiting
             # storage during cancellation re-raises immediately.
+            raise
+        except TrainingStillActive:
             raise
         except Exception as exc:
             await self._update_run_history(run_id, {
@@ -889,11 +1658,52 @@ class ParametricSelfFeature(Feature):
             self._active_run = None
             raise
 
+        manifest, manifest_error = self._manifest_lineage(adapter_path)
+        receipt = self._manifest_receipt_stamp(manifest or {}) if manifest_error is None else None
+        candidate_lineage = {
+            "manifest_hash": result.corpus_manifest_hash,
+            "manifest_path": result.corpus_manifest_path,
+            "snapshot_hash": result.corpus_snapshot_hash,
+            "policy_digest": result.corpus_policy_digest,
+            "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
+            "semantic_checkpoint_id": result.semantic_checkpoint_id,
+            "assertion_lineage": [list(pair) for pair in result.assertion_lineage],
+            "state": "candidate",
+        }
+        if receipt is not None and result.corpus_manifest_hash == receipt["manifest_hash"]:
+            candidate_lineage.update(receipt)
+            self._adapter_lineage[adapter_path] = candidate_lineage
+
+        if result.promoted and receipt is None:
+            # A promoted adapter without the immutable corpus receipt is never
+            # a valid served artifact, even if a trainer reports success.
+            result.promoted = False
+            result.promoted_adapter_path = None
+            result.reason = "candidate missing governed corpus manifest"
+        elif result.promoted and result.corpus_manifest_hash != receipt["manifest_hash"]:
+            result.promoted = False
+            result.promoted_adapter_path = None
+            result.reason = "candidate manifest receipt does not match training result"
+
+        if result.promoted and result.promoted_adapter_path:
+            lifecycle_problem = await self._verify_adapter_lineage(
+                result.promoted_adapter_path, before_promotion=True
+            )
+            if lifecycle_problem:
+                result.promoted = False
+                result.promoted_adapter_path = None
+                result.reason = f"candidate quarantined: {lifecycle_problem}"
+
         if result.promoted and result.promoted_adapter_path:
             self._active_adapter_path = result.promoted_adapter_path
             self._last_val_loss = result.val_loss
+            self._adapter_lineage[result.promoted_adapter_path]["state"] = "served"
             # Persist the new served adapter + its val loss so the pointer and
             # the regression baseline survive a restart.
+            await self._persist_config()
+        elif receipt is not None:
+            # Candidate lineage is durable even when fidelity rejects it; an
+            # operator can inspect exactly why it must not silently be served.
             await self._persist_config()
 
         logger.info(
@@ -906,6 +1716,9 @@ class ParametricSelfFeature(Feature):
             "val_loss": result.val_loss,
             "reason": result.reason,
             "corpus_train": result.corpus_train,
+            "corpus_valid": result.corpus_valid,
+            "corpus_manifest_hash": result.corpus_manifest_hash,
+            "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
         }
         await self._update_run_history(run_id, {
             "state": "completed",
@@ -918,6 +1731,11 @@ class ParametricSelfFeature(Feature):
             # Record the served path only on promotion (matches the prior
             # contract); otherwise keep the candidate path for traceability.
             "adapter_path": result.promoted_adapter_path or adapter_path,
+            "corpus_manifest_hash": result.corpus_manifest_hash,
+            "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
+            "semantic_checkpoint_id": result.semantic_checkpoint_id,
+            "corpus_snapshot_hash": result.corpus_snapshot_hash,
+            "corpus_policy_digest": result.corpus_policy_digest,
         })
         self._active_run = None
         return outcome
@@ -953,6 +1771,113 @@ class ParametricSelfFeature(Feature):
         })
         return dict(active_run)
 
+    async def _interrupt_active_run(
+        self, *, reason: str, run_id: Optional[str] = None,
+    ) -> None:
+        """Terminalize the matching active record after cancellation/disable.
+
+        The matching id makes this safe when cancellation and teardown race: the
+        first caller clears the record, and every later caller becomes a no-op.
+        ``_update_run_history`` is already best effort, but clearing the local
+        active state remains essential so the operator never sees a phantom run.
+        """
+        active_run = getattr(self, "_active_run", None)
+        if active_run is None or (run_id is not None and active_run.get("run_id") != run_id):
+            return
+        try:
+            await self._update_run_history(active_run["run_id"], {
+                "state": "interrupted",
+                "timestamp": _utc_now_iso(),
+                "reason": reason,
+            })
+        except Exception as exc:  # cancellation cleanup must not mask cancellation
+            logger.warning("Failed to mark parametric-self run interrupted: %s", exc)
+        finally:
+            if self._active_run is active_run:
+                self._active_run = None
+
+    async def _mark_training_shutdown_incomplete(
+        self,
+        *,
+        reason: str,
+        run_id: Optional[str] = None,
+        retained_corpus_path: Optional[str] = None,
+    ) -> None:
+        """Expose an unconfirmed child shutdown without claiming it is terminal."""
+        diagnostic = f"training shutdown incomplete: {reason}"
+        self._training_shutdown_incomplete = diagnostic
+        active_run = getattr(self, "_active_run", None)
+        if active_run is None:
+            return
+        resolved_run_id = run_id or active_run.get("run_id")
+        if active_run.get("run_id") != resolved_run_id:
+            return
+        active_run["state"] = "shutdown_incomplete"
+        if retained_corpus_path:
+            active_run["retained_corpus_path"] = retained_corpus_path
+        try:
+            updates = {
+                "state": "shutdown_incomplete",
+                "timestamp": _utc_now_iso(),
+                "reason": diagnostic,
+            }
+            if retained_corpus_path:
+                updates["retained_corpus_path"] = retained_corpus_path
+            await self._update_run_history(resolved_run_id, updates)
+        except Exception as exc:  # preserve the local safety marker regardless
+            logger.warning("Failed to mark parametric-self shutdown incomplete: %s", exc)
+
+    async def _resolve_training_shutdown_incomplete(
+        self,
+        *,
+        reason: str = "run cancelled (feature disabled; bulk trainer stop confirmed)",
+    ) -> None:
+        """Clear a prior incomplete-shutdown block after bulk stop confirmation."""
+        active_run = getattr(self, "_active_run", None)
+        run_ids = set()
+        retained_paths = set()
+        if active_run is not None and active_run.get("state") == "shutdown_incomplete":
+            run_ids.add(active_run["run_id"])
+            if active_run.get("retained_corpus_path"):
+                retained_paths.add(active_run["retained_corpus_path"])
+        for entry in await self._load_run_history():
+            if entry.get("state") == "shutdown_incomplete" and entry.get("run_id"):
+                run_ids.add(entry["run_id"])
+                if entry.get("retained_corpus_path"):
+                    retained_paths.add(entry["retained_corpus_path"])
+        for run_id in run_ids:
+            await self._update_run_history(run_id, {
+                "state": "interrupted",
+                "timestamp": _utc_now_iso(),
+                "reason": reason,
+            })
+        if active_run is not None and active_run.get("run_id") in run_ids:
+            self._active_run = None
+        self._delete_confirmed_retained_corpora(retained_paths)
+        self._training_shutdown_incomplete = None
+        self._shutdown_recovery_requires_external_confirmation = False
+
+    def _delete_confirmed_retained_corpora(self, paths: set[str]) -> None:
+        """Delete only per-run corpora whose child stop was affirmatively proven."""
+        _, work_dir = self._resolve_paths()
+        if not work_dir:
+            return
+        corpus_root = (Path(work_dir) / "corpus").resolve()
+        for raw_path in paths:
+            try:
+                corpus_dir = Path(raw_path).resolve()
+            except OSError:
+                logger.warning("Could not resolve retained corpus path for cleanup: %s", raw_path)
+                continue
+            if corpus_root not in corpus_dir.parents:
+                logger.warning("Refusing to delete corpus outside per-run root: %s", corpus_dir)
+                continue
+            for name in ("train.jsonl", "valid.jsonl"):
+                try:
+                    (corpus_dir / name).unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Failed to delete confirmed retained corpus %s: %s", corpus_dir / name, exc)
+
     # ------------------------------------------------------------------
     # Run-history store (append-only, capped) — lets the agent introspect
     # its own training lifecycle (feedback_agent_must_introspect_lifecycle).
@@ -984,9 +1909,10 @@ class ParametricSelfFeature(Feature):
     async def _update_run_history(self, run_id: str, updates: Dict[str, Any]) -> None:
         """Merge ``updates`` into the most recent history entry with ``run_id``.
 
-        Lets a run's record transition in place (``in_progress`` -> ``completed``/
-        ``failed``/``interrupted``) instead of appending a second entry, so an
-        in-flight run is one durable record an agent can poll to completion.
+        Lets a run's record transition in place (``in_progress`` ->
+        ``completed``/``skipped``/``failed``/``interrupted`` or an observable
+        ``shutdown_incomplete`` state) instead of appending a second entry, so
+        an in-flight run is one durable record an agent can poll to completion.
         No-ops if the entry is gone (capped out) — falls back to appending so the
         outcome is never silently lost.
         """
@@ -1029,11 +1955,32 @@ class ParametricSelfFeature(Feature):
             from kestrel_sovereign.storage.async_graph_store import GraphNode
             runs = await self._load_run_history()
             changed = False
+            # Re-enabling the same live feature retains its adapter/process
+            # provenance. Only a fresh feature instance has lost that handle.
+            same_instance_lifecycle = (
+                self._training_shutdown_incomplete is not None
+                or self._active_run is not None
+            )
             for entry in runs:
                 if entry.get("state") == "in_progress":
                     entry["state"] = "interrupted"
                     entry["reason"] = "run interrupted (process restarted before completion)"
                     changed = True
+                elif entry.get("state") == "shutdown_incomplete":
+                    # A replacement feature instance cannot prove the old
+                    # process's child exited. Preserve the safety block and its
+                    # durable diagnostic rather than silently admitting a new
+                    # training mutation alongside a possible survivor.
+                    self._training_shutdown_incomplete = str(
+                        entry.get("reason", "training shutdown incomplete")
+                    )
+                    # An adapter created after a restart has no process handle
+                    # for this run. Its empty/all-stopped response cannot prove
+                    # that the old child exited, so require operator or
+                    # process-specific recovery evidence before clearing it.
+                    if not same_instance_lifecycle:
+                        self._shutdown_recovery_requires_external_confirmation = True
+                    self._cycle_in_flight = True
             if changed:
                 await storage.add_node(GraphNode(
                     node_id=self._history_node_id(),
@@ -1076,7 +2023,14 @@ class ParametricSelfFeature(Feature):
         """
         from .sleep_hook import create_parametric_self_sleep_hook
 
+        self._manual_runs_enabled = True
+
         await self._restore_persisted_config()
+        # A restored pointer is never trusted just because it was persisted.
+        # Verify/quarantine it before this feature registers any serving-adjacent
+        # hook or exposes the adapter through its normal control surface.
+        if self._active_adapter_path:
+            await self._verify_adapter_lineage(self._active_adapter_path)
         # A detached run can't survive a restart; reconcile any lingering
         # in_progress record so introspection never reports a dead run as active.
         await self._reconcile_stale_runs()
@@ -1108,34 +2062,80 @@ class ParametricSelfFeature(Feature):
         ``mlx_lm.lora`` subprocess(es) via the adapter — otherwise an orphaned
         GPU-heavy job keeps running and writing into the adapter dir.
         """
-        task = getattr(self, "_training_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-        self._training_task = None
-        # Force-clear the cross-trigger guard: if the cancel landed before
-        # _runner started, its finally never ran and the guard would stay stuck,
-        # permanently refusing later train/rollback on a re-enabled instance.
-        self._cycle_in_flight = False
-        # Durably mark a cancelled in-flight run interrupted from here (a normal
-        # async context), since the cancelled cycle body cannot await storage.
-        active_run = getattr(self, "_active_run", None)
-        if active_run is not None:
-            try:
-                await self._update_run_history(active_run["run_id"], {
-                    "state": "interrupted",
-                    "timestamp": _utc_now_iso(),
-                    "reason": "run cancelled (feature disabled)",
-                })
-            except Exception as e:  # teardown must never raise
-                logger.warning("Failed to mark parametric-self run interrupted: %s", e)
-            self._active_run = None
+        self._ensure_training_lifecycle_state()
+        # Invalidate an in-progress command BEFORE awaiting the transition lock.
+        # A command that is blocked on durable history creation will see this
+        # generation mismatch and refuse to publish a detached trainer.
+        self._manual_runs_enabled = False
+        self._manual_run_generation += 1
+        async with self._manual_run_lock:
+            tasks = {
+                task for task in (
+                    getattr(self, "_training_task", None),
+                    getattr(self, "_cycle_task", None),
+                )
+                if task is not None and not task.done() and task is not asyncio.current_task()
+            }
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # teardown must never raise
+                    logger.warning("Parametric-self training task failed during disable: %s", exc)
+            self._training_task = None
+            self._cycle_task = None
 
-        adapter = getattr(self, "_adapter", None)
-        if adapter is not None and hasattr(adapter, "cancel_all"):
-            try:
-                await adapter.cancel_all()
-            except Exception as e:  # teardown must never raise
-                logger.warning("Failed to cancel parametric-self training subprocess(es): %s", e)
+            # The task-level cancellation path tears down a live child before it
+            # finalizes history.  Call the adapter here as well for a task that
+            # was cancelled before its runner began, and do it BEFORE state or
+            # history cleanup so corpus cleanup can never race a live trainer.
+            adapter = getattr(self, "_adapter", None)
+            may_have_live_child = (
+                self._active_run is not None or self._training_shutdown_incomplete is not None
+            )
+            shutdown_confirmed = not may_have_live_child
+            if adapter is not None and hasattr(adapter, "cancel_all"):
+                try:
+                    shutdown = await adapter.cancel_all()
+                    shutdown_confirmed = getattr(shutdown, "all_stopped", None) is True
+                    if not shutdown_confirmed:
+                        logger.critical(
+                            "Parametric-self shutdown incomplete: bulk trainer stop did not confirm all children stopped"
+                        )
+                except Exception as exc:  # teardown must never raise
+                    shutdown_confirmed = False
+                    logger.warning("Failed to cancel parametric-self training subprocess(es): %s", exc)
+
+            if self._shutdown_recovery_requires_external_confirmation:
+                # A fresh adapter's empty bulk result is not evidence about a
+                # child launched before process restart. Retain the durable
+                # safety block until recovery is externally verified.
+                shutdown_confirmed = False
+
+            if not shutdown_confirmed:
+                active_run = getattr(self, "_active_run", None)
+                if active_run is not None:
+                    await self._mark_training_shutdown_incomplete(
+                        run_id=active_run["run_id"],
+                        reason="bulk trainer stop did not confirm all children stopped",
+                    )
+                else:
+                    self._training_shutdown_incomplete = (
+                        "training shutdown incomplete: bulk trainer stop did not confirm all children stopped"
+                    )
+                self._cycle_in_flight = True
+            else:
+                # Force-clear the cross-trigger guard: if the cancel landed before
+                # _runner started, its finally never ran and the guard would stay
+                # stuck, permanently refusing later train/rollback on re-enable.
+                self._cycle_in_flight = False
+                if self._training_shutdown_incomplete is not None:
+                    await self._resolve_training_shutdown_incomplete()
+                else:
+                    await self._interrupt_active_run(reason="run cancelled (feature disabled)")
 
         hook = getattr(self, "_sleep_hook", None)
         hooks = getattr(self.agent, "sleep_hooks", None)

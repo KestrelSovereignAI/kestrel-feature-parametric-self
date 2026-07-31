@@ -95,7 +95,10 @@ async def test_training_skipped_when_privacy_hides_user_content(monkeypatch):
     agent = MagicMock()
     agent.is_test_instance = False  # sovereign-class → passes the Incubator gate
     feature = ParametricSelfFeature(agent=agent)
-    monkeypatch.setattr(feature, "_hides_persisted_user_content", lambda: True)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.storage_access.hides_persisted_user_content",
+        lambda _agent: True,
+    )
 
     ran = []
 
@@ -144,7 +147,10 @@ async def test_manual_train_now_refused_under_privacy(monkeypatch):
     feature = ParametricSelfFeature(agent=agent)
     feature._cycle_in_flight = False
     feature._training_task = None
-    monkeypatch.setattr(feature, "_hides_persisted_user_content", lambda: True)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.storage_access.hides_persisted_user_content",
+        lambda _agent: True,
+    )
 
     started = []
     monkeypatch.setattr(

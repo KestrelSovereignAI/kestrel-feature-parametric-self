@@ -2,13 +2,43 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 
-from kestrel_feature_parametric_self import FidelityGate, TextLoRAConfig, run_nightly_cycle
+from kestrel_feature_parametric_self import FidelityGate, TextLoRAConfig, run_nightly_cycle as _run_nightly_cycle
+
+
+def _snapshot():
+    assertion = SimpleNamespace(
+        assertion_id="assertion:cycle", revision_id="revision:cycle",
+        subject=SimpleNamespace(value="https://example.test/agent"),
+        predicate=SimpleNamespace(value="https://example.test/lesson"),
+        object=SimpleNamespace(lexical_form="governed lesson"),
+    )
+    return SimpleNamespace(
+        verified=True, examples=(SimpleNamespace(
+            assertion=assertion, content_hash="sha256:cycle", source_occurrences=(),
+            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+        ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
+        tenant_id="tenant:test",
+        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
+        capability_versions={"semantic_maintenance": "1"},
+    )
+
+
+SNAPSHOT = _snapshot()
+
+
+async def run_nightly_cycle(**kwargs):
+    """Every direct cycle test still supplies the public host snapshot."""
+    kwargs.setdefault("governed_snapshot", SNAPSHOT)
+    return await _run_nightly_cycle(**kwargs)
 
 
 def _db_with(tmp_path, rows, fact=True) -> str:
@@ -19,15 +49,10 @@ def _db_with(tmp_path, rows, fact=True) -> str:
         "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT NOT NULL, "
         "description TEXT, suggested_action TEXT)"
     )
-    con.execute("CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT, label TEXT, properties TEXT)")
     con.executemany(
         "INSERT INTO reflection_insights (id,type,title,description,suggested_action) VALUES (?,?,?,?,?)",
         rows,
     )
-    if fact:
-        con.execute(
-            "INSERT INTO graph_nodes (node_id,node_type,label,properties) VALUES ('n','learned_fact','f','{}')"
-        )
     con.commit()
     con.close()
     return db
@@ -91,6 +116,13 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
     db = _db_with(tmp_path, [("1", "anomaly", "Musing", "A stray thought.", "")], fact=False)
     result = await run_nightly_cycle(
         agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        governed_snapshot=SimpleNamespace(
+            verified=True, examples=(), snapshot_hash="sha256:empty",
+            policy=SimpleNamespace(digest="sha256:policy"),
+            tenant_id="tenant:test",
+            checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
+            capability_versions={"semantic_maintenance": "1"},
+        ),
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -98,11 +130,12 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
     assert "empty corpus" in result.reason
 
 
-async def test_cycle_cleans_up_legacy_shared_corpus_plaintext(tmp_path):
+async def test_cycle_retains_unknown_owner_legacy_shared_corpus_plaintext(tmp_path):
     """#2112/P8: a host upgraded from pre-0.3.1 still has plaintext
     train.jsonl/valid.jsonl at the OLD shared work/corpus/ location (not a
-    per-run subdir). A cycle must best-effort remove them so no user-derived
-    plaintext lingers (F377) — while leaving per-run subdirs untouched."""
+        per-run subdir). Without proof an old child exited, a new cycle must
+        retain them for verified/operator cleanup — while leaving per-run
+        subdirs untouched."""
     from pathlib import Path
 
     work = tmp_path / "work"
@@ -121,16 +154,15 @@ async def test_cycle_cleans_up_legacy_shared_corpus_plaintext(tmp_path):
         config=TextLoRAConfig(), poll_interval=0,
     )
 
-    # Legacy flat plaintext gone.
-    assert not (legacy / "train.jsonl").exists()
-    assert not (legacy / "valid.jsonl").exists()
+    # Legacy flat plaintext retained: an unknown old process may still read it.
+    assert (legacy / "train.jsonl").exists()
+    assert (legacy / "valid.jsonl").exists()
     # Per-run subdir untouched (only the pre-0.3.1 flat files are cleaned).
     assert (legacy / "some-prior-run" / "train.jsonl").exists()
 
 
-async def test_legacy_corpus_cleaned_even_when_trainer_unavailable(tmp_path):
-    """The cleanup must run BEFORE the trainer-availability early return — a host
-    without the trainer (common) would otherwise keep the plaintext forever."""
+async def test_legacy_corpus_retained_even_when_trainer_unavailable(tmp_path):
+    """Availability cannot prove an old trainer is not still reading legacy input."""
     work = tmp_path / "work"
     legacy = work / "corpus"
     legacy.mkdir(parents=True)
@@ -144,8 +176,9 @@ async def test_legacy_corpus_cleaned_even_when_trainer_unavailable(tmp_path):
         config=TextLoRAConfig(), poll_interval=0,
     )
     assert result.trained is False and "unavailable" in result.reason
-    assert not (legacy / "train.jsonl").exists()
-    assert not (legacy / "valid.jsonl").exists()
+    assert result.legacy_corpus_retained is True
+    assert (legacy / "train.jsonl").exists()
+    assert (legacy / "valid.jsonl").exists()
 
 
 async def test_each_run_stages_in_a_unique_dir(tmp_path):
@@ -247,22 +280,91 @@ async def test_cycle_keeps_corpus_when_training_still_running(tmp_path):
 
 
 
-async def test_cycle_deletes_corpus_on_cancellation(tmp_path):
-    """codex P2: on cancellation (on_disable tears down the trainer), the
-    transient corpus must be cleaned up, not left as durable plaintext."""
-    import asyncio as _asyncio
+async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_path, monkeypatch):
+    """Arbitrary task cancellation cannot delete input under a live trainer."""
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    work = tmp_path / "work"
+    events = []
+
+    class _LiveChild(_FakeAdapter):
+        def __init__(self):
+            super().__init__(state=TrainingState.TRAINING)
+            self.started = asyncio.Event()
+            self.corpus = None
+            self.stopped = False
+
+        async def start_training(self, agent_id, config):
+            self.corpus = Path(config.data_dir)
+            self.started.set()
+            return await super().start_training(agent_id, config)
+
+        async def get_status(self, job_id):
+            await asyncio.Event().wait()
+
+        async def cancel(self, job_id):
+            assert self.corpus is not None
+            assert (self.corpus / "train.jsonl").exists()
+            self.stopped = True
+            events.append("child-stopped")
+            return 1
+
+    adapter = _LiveChild()
+    corpus = work / "corpus" / "cancelrun"
+    import kestrel_feature_parametric_self.cycle as cycle_module
+
+    original_delete = cycle_module._delete_corpus
+
+    def _ordered_delete(path):
+        if path == str(corpus) and (corpus / "train.jsonl").exists():
+            assert adapter.stopped
+            events.append("corpus-deleted")
+        original_delete(path)
+
+    monkeypatch.setattr(cycle_module, "_delete_corpus", _ordered_delete)
+    task = asyncio.create_task(run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work), adapter=adapter,
+        gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+        max_polls=5, adapter_id="cancelrun",
+    ))
+    await asyncio.wait_for(adapter.started.wait(), timeout=2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == ["child-stopped", "corpus-deleted"]
+    assert not (corpus / "train.jsonl").exists()
+
+
+async def test_cycle_cancellation_keeps_corpus_when_live_child_wont_confirm_stop(tmp_path):
+    """A failed child-stop confirmation retains the live input."""
     db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
     work = tmp_path / "work"
 
-    class _CancelMidPoll(_FakeAdapter):
-        async def get_status(self, job_id):
-            raise _asyncio.CancelledError()
+    class _UnstoppableChild(_FakeAdapter):
+        def __init__(self):
+            super().__init__(state=TrainingState.TRAINING)
+            self.started = asyncio.Event()
 
-    with pytest.raises(_asyncio.CancelledError):
-        await run_nightly_cycle(
-            agent_id="emma", db_path=db, work_dir=str(work),
-            adapter=_CancelMidPoll(state=TrainingState.TRAINING), gate=FidelityGate(),
-            config=TextLoRAConfig(), poll_interval=0, max_polls=5, adapter_id="cancelrun",
-        )
-    corpus = work / "corpus" / "cancelrun"
-    assert not (corpus / "train.jsonl").exists()  # cleaned up on shutdown
+        async def start_training(self, agent_id, config):
+            self.started.set()
+            return await super().start_training(agent_id, config)
+
+        async def get_status(self, job_id):
+            await asyncio.Event().wait()
+
+        async def cancel(self, job_id):
+            return False
+
+    adapter = _UnstoppableChild()
+    task = asyncio.create_task(run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work), adapter=adapter,
+        gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+        max_polls=5, adapter_id="retainrun",
+    ))
+    await asyncio.wait_for(adapter.started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    corpus = work / "corpus" / "retainrun"
+    assert (corpus / "train.jsonl").exists()

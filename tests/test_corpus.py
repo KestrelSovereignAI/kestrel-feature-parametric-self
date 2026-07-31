@@ -1,106 +1,96 @@
-"""Tests for the reflection-derived corpus builder (Linux-friendly, no MLX)."""
+"""Corpus builder tests: reflections remain distinct; facts use host snapshots."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from kestrel_feature_parametric_self import build_corpus
+from kestrel_feature_parametric_self.corpus import GovernedCorpusRequiredError
 
 
-def _fixture_db(path: Path) -> str:
-    """A minimal cognition DB with the reflection + learned_fact shapes."""
+def _snapshot(*, values=("she/her",), generation=7):
+    examples = []
+    for index, value in enumerate(values):
+        assertion = SimpleNamespace(
+            assertion_id=f"assertion:{index}", revision_id=f"revision:{index}",
+            subject=SimpleNamespace(value="https://example.test/Meridian"),
+            predicate=SimpleNamespace(value="https://example.test/pronouns_when_choice_needed"),
+            object=SimpleNamespace(lexical_form=value),
+        )
+        examples.append(SimpleNamespace(
+            assertion=assertion, content_hash=f"sha256:content-{index}",
+            source_occurrences=(SimpleNamespace(source_occurrence_id=f"source:{index}"),),
+            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+        ))
+    return SimpleNamespace(
+        verified=True, examples=tuple(examples), snapshot_hash="sha256:snapshot",
+        policy=SimpleNamespace(digest="sha256:policy"),
+        tenant_id="tenant:test",
+        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=generation, latest_event_id="event:7"),
+        capability_versions={"semantic_maintenance": "1"},
+    )
+
+
+def _reflection_db(path: Path) -> str:
     db = str(path / "cognition.db")
     con = sqlite3.connect(db)
-    con.executescript(
-        """
-        CREATE TABLE reflection_insights (
-            id TEXT PRIMARY KEY, agent_id TEXT, session_id TEXT, type TEXT,
-            title TEXT NOT NULL, description TEXT, evidence TEXT,
-            confidence REAL, actionable INTEGER, suggested_action TEXT,
-            created_at TIMESTAMP
-        );
-        CREATE TABLE graph_nodes (
-            node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, label TEXT NOT NULL,
-            properties TEXT
-        );
-        """
+    con.execute(
+        "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT, description TEXT, suggested_action TEXT)"
     )
     con.executemany(
-        "INSERT INTO reflection_insights (id, type, title, description, suggested_action) "
-        "VALUES (?,?,?,?,?)",
+        "INSERT INTO reflection_insights VALUES (?,?,?,?,?)",
         [
             ("1", "failure", "Excessive verbosity", "User asked for shorter replies.", "Be concise."),
-            ("2", "success", "Closed an issue end to end", "Verified the PR and merged.", ""),
-            ("3", "anomaly", "Self-musing", "A free-floating thought.", ""),  # not grounded
+            ("2", "success", "Closed an issue", "Verified the PR.", ""),
+            ("3", "anomaly", "Self-musing", "A free-floating thought.", ""),
         ],
     )
-    con.execute(
-        "INSERT INTO graph_nodes (node_id, node_type, label, properties) VALUES (?,?,?,?)",
-        (
-            "n1",
-            "learned_fact",
-            "Pronouns: she/her",
-            json.dumps({"subject": "Meridian", "predicate": "pronouns_when_choice_needed", "value": "she/her"}),
-        ),
-    )
-    con.commit()
-    con.close()
+    con.commit(); con.close()
     return db
 
 
-def test_grounded_only_excludes_self_musing(tmp_path):
-    db = _fixture_db(tmp_path)
-    stats = build_corpus(db, str(tmp_path / "out"), grounded_only=True)
-    # 2 grounded insights (failure, success) + 1 fact; the 'anomaly' is dropped.
-    assert stats.from_insights == 2
+def _build(tmp_path, db_path=None, **kwargs):
+    return build_corpus(
+        db_path, str(tmp_path / "corpus"), governed_snapshot=kwargs.pop("snapshot", _snapshot()),
+        manifest_dir=str(tmp_path / "candidate"), **kwargs,
+    )
+
+
+def test_facts_arrive_from_host_snapshot_without_local_database(tmp_path):
+    stats = _build(tmp_path, None)
+    assert stats.from_insights == 0
     assert stats.from_facts == 1
-    assert stats.total == 3
+    assert stats.assertion_lineage == (("assertion:0", "revision:0"),)
+    rows = (tmp_path / "corpus" / "train.jsonl").read_text()
+    assert "she/her" in rows
 
 
-def test_includes_all_insights_when_not_grounded_only(tmp_path):
-    db = _fixture_db(tmp_path)
-    stats = build_corpus(db, str(tmp_path / "out"), grounded_only=False)
-    assert stats.from_insights == 3  # anomaly now included
+def test_reflection_source_remains_distinct_and_grounded(tmp_path):
+    stats = _build(tmp_path, _reflection_db(tmp_path), grounded_only=True)
+    assert (stats.from_insights, stats.from_facts, stats.total) == (2, 1, 3)
+    manifest = json.loads(Path(stats.manifest_path).read_text())
+    assert {item["source"] for item in manifest["examples"]} == {"reflection", "governed_assertion"}
+    assert "User asked" not in Path(stats.manifest_path).read_text()
 
 
-def test_tiny_corpus_never_empties_train_split(tmp_path):
-    """A single usable example must stay in train, not get held out for valid."""
-    db = str(tmp_path / "tiny.db")
-    con = sqlite3.connect(db)
-    con.execute(
-        "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT NOT NULL, "
-        "description TEXT, suggested_action TEXT)"
-    )
-    con.execute("CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT, label TEXT, properties TEXT)")
-    con.execute(
-        "INSERT INTO reflection_insights (id, type, title, description, suggested_action) VALUES (?,?,?,?,?)",
-        ("1", "failure", "Only lesson", "Keep it short.", ""),
-    )
-    con.commit()
-    con.close()
-
-    out = tmp_path / "out"
-    stats = build_corpus(db, str(out), grounded_only=True, valid_every=10)
-    assert stats.total == 1
-    assert stats.train == 1  # the one example stays in train
-    assert stats.valid == 0
-    assert (out / "train.jsonl").read_text().strip()  # non-empty
+def test_manifest_and_split_are_deterministic_across_shuffled_snapshot(tmp_path):
+    first = _build(tmp_path / "one", None, snapshot=_snapshot(values=("a", "b", "c")), valid_every=2)
+    second = _build(tmp_path / "two", None, snapshot=_snapshot(values=("c", "a", "b")), valid_every=2)
+    left = json.loads(Path(first.manifest_path).read_text())
+    right = json.loads(Path(second.manifest_path).read_text())
+    assert first.manifest_hash == second.manifest_hash
+    assert left["examples"] == right["examples"]
 
 
-def test_writes_valid_chat_jsonl(tmp_path):
-    db = _fixture_db(tmp_path)
-    out = tmp_path / "out"
-    build_corpus(db, str(out), grounded_only=True, valid_every=0)
-    lines = (out / "train.jsonl").read_text().strip().splitlines()
-    assert lines
-    for line in lines:
-        ex = json.loads(line)
-        roles = [m["role"] for m in ex["messages"]]
-        assert roles == ["user", "assistant"]
-        assert ex["messages"][1]["content"]  # non-empty answer
-    # the learned fact is recoverable in the corpus
-    assert any("she/her" in line for line in lines)
+def test_manifest_is_immutable_and_missing_snapshot_is_refused(tmp_path):
+    with pytest.raises(GovernedCorpusRequiredError, match="snapshot_required"):
+        build_corpus(None, str(tmp_path / "out"), governed_snapshot=None, manifest_dir=str(tmp_path / "candidate"))
+    stats = _build(tmp_path)
+    with pytest.raises(GovernedCorpusRequiredError, match="already_exists"):
+        _build(tmp_path)
+    assert Path(stats.manifest_path).is_file()

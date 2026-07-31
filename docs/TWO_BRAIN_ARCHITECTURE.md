@@ -95,7 +95,15 @@ Training turns user-authored content into two artifacts: a **transient corpus**
 ## 6. Where it lives in the system
 
 - **Training trigger:** a new phase in the sleep cycle, after `_consolidate_memories()` in `kestrel_sovereign/agent/sleep.py`. Consolidation already produces the curated corpus.
-- **Corpus source:** the **plaintext** `reflection_insights` + `learned_fact` graph nodes (the sleep cycle's own output). Note: `conversation_history.content` is Fernet-encrypted at rest, so any use of raw turns must decrypt **inside the agent trust boundary**.
+- **Corpus source:** reflection insights remain a separately labelled symbolic-self
+  source. Factual examples arrive only through the host's governed assertion-
+  corpus snapshot after successful semantic maintenance—never by opening a
+  cognition database or reading a graph projection. Every candidate records an
+  immutable, content-free manifest with the policy/capability pins, checkpoint,
+  assertion revisions, hashes, eligibility lineage, and deterministic split.
+  Tombstones quarantine affected candidates/served adapters until a clean
+  rebuild. Note: `conversation_history.content` is Fernet-encrypted at rest, so
+  any use of raw turns must decrypt **inside the agent trust boundary**.
 - **Training adapter:** a new `LocalMLXAdapter` + `TextLoRAConfig` in `features/training/`, **importing** (never copying) the modality-neutral lifecycle types (`TrainingState`/`TrainingJob`/`TrainingStatus`/`TrainingProviderFactory`) and adding a `ProviderType.LOCAL_MLX`. See [§8](#8-build-strategy) — this is Strategy B (parallel LLM path), not a refactor of the image pipeline.
 - **Serving:** the owned brain serves via `mlx_lm.server` (OpenAI-compatible), reached through the existing generic OpenAI-compatible route in `llm/provider_registry.py` — **zero new LLM adapters**, just a config route (vendor/route/model).
 - **Promotion gate:** a held-out fidelity check (§5.2); the nightly adapter is hot-swapped **only if** quality holds. Otherwise the prior adapter stays. This mirrors the forgetting/retention gate already in the sleep cycle.

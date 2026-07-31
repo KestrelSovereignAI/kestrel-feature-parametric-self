@@ -12,12 +12,13 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    # The Feature base class + ToolResult come from the SDK; the neutral
-    # training lifecycle types (TrainingState/TrainingStatus) and the sleep-hook
-    # surface come from core. Floor raised to 0.28.0: this version registers its
-    # sleep hook via the core ``agent.sleep_hooks`` list (kestrel-sovereign
-    # #1784), which first ships in 0.28.0 — a hard contract, not advisory.
-    "kestrel-sovereign>=0.28.0,<1",
+    # The governed assertion-corpus capability is post-0.49.5 and has not yet
+    # been released to PyPI. Pin the reviewed core commit instead of claiming a
+    # released version provides it. Replace this source pin with the first
+    # released core version containing #2817 during the coordinated release.
+    # This is a hard safety contract: older hosts must not fall back to direct
+    # factual reads.
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@5932735a7db02228877985f66b9f1eb56d564f27",
     "kestrel-sovereign-sdk>=0.14.1,<1",
     # The MLX LoRA trainer is Apple-Silicon only and imported lazily, so it is
     # platform-gated: it installs on arm64 macOS and is simply absent elsewhere
@@ -45,6 +46,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_parametric_self"]
+
+[tool.hatch.metadata]
+# The pre-release governed-corpus host is deliberately pinned to its reviewed
+# source commit until the coordinated core release publishes a version floor.
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

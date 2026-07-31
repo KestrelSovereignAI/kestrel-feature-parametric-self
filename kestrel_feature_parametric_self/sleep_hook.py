@@ -16,11 +16,22 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+from kestrel_sovereign.agent.sleep import SleepHookContract, SleepHookPhase
+
 logger = logging.getLogger(__name__)
 
 
 class ParametricSelfSleepHook:
     """Integrates parametric-self nightly training into the sleep cycle."""
+
+    # The core scheduler turns this declarative edge into a hard-success
+    # prerequisite: training cannot consume a corpus after partial/failed
+    # semantic maintenance, even if a hook was registered earlier.
+    sleep_hook_contract = SleepHookContract(
+        hook_id="kestrel_feature_parametric_self.training",
+        phase=SleepHookPhase.TRAINING,
+        after=("kestrel_sovereign.semantic_maintenance",),
+    )
 
     def __init__(self, feature) -> None:
         self.feature = feature
@@ -32,10 +43,36 @@ class ParametricSelfSleepHook:
     async def on_post_consolidation(self, agent, consolidation_result: Dict[str, Any]) -> Dict[str, Any]:
         """Delegate to the feature's post-consolidation training cycle."""
         try:
-            return await self.feature.on_post_consolidation(consolidation_result)
+            result = await self.feature.on_post_consolidation(consolidation_result)
         except Exception as exc:  # never let a training failure block sleep
             logger.warning("parametric-self post-consolidation failed: %s", exc)
-            return {"trained": False, "promoted": False, "reason": f"error: {exc}"}
+            return {
+                "success": False, "skipped": False, "trained": False,
+                "promoted": False, "reason": f"error: {exc}",
+            }
+        if not isinstance(result, dict):
+            return {
+                "success": False, "skipped": False, "trained": False,
+                "promoted": False, "reason": "invalid training hook result",
+            }
+
+        outcome = dict(result)
+        reason = str(outcome.get("reason") or "")
+        if outcome.get("trained") is True:
+            outcome.update(success=True, skipped=False)
+        elif reason.startswith((
+            "nightly training disabled", "training disabled", "training skipped",
+            "another training run", "trainer unavailable on this host",
+            "empty corpus", "nightly training interrupted while feature was disabled",
+        )):
+            # Expected operational no-ops stay visible without poisoning the
+            # sleep dependency graph.
+            outcome.update(success=True, skipped=True)
+        else:
+            # In particular, unavailable/unverified governed corpus evidence
+            # is a failure, never the core's implicit-success fallback.
+            outcome.update(success=False, skipped=False)
+        return outcome
 
 
 def create_parametric_self_sleep_hook(agent) -> Optional[ParametricSelfSleepHook]:

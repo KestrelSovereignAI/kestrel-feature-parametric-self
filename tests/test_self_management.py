@@ -8,6 +8,9 @@ gate: governed/test instances must be refused, sovereign-class agents allowed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +18,41 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_feature_parametric_self import ParametricSelfFeature
+
+
+def _snapshot():
+    assertion = SimpleNamespace(
+        assertion_id="assertion:test", revision_id="revision:test",
+        subject=SimpleNamespace(value="https://example.test/agent"),
+        predicate=SimpleNamespace(value="https://example.test/lesson"),
+        object=SimpleNamespace(lexical_form="lesson"),
+    )
+    return SimpleNamespace(
+        verified=True, examples=(SimpleNamespace(
+            assertion=assertion, content_hash="sha256:test", source_occurrences=(),
+            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+        ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
+        tenant_id="tenant:test",
+        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
+        capability_versions={"semantic_maintenance": "1"},
+    )
+
+
+def _write_governed_manifest(candidate):
+    raw = {
+        "schema_version": 1, "corpus_policy_version": "parametric-self-corpus-v1",
+        "policy_digest": "sha256:policy", "snapshot_hash": "sha256:snapshot",
+        "semantic_checkpoint": {"tenant_id": "tenant:test", "generation": 1, "event_id": "event:1"},
+        "capability_versions": {"semantic_maintenance": "1"},
+        "counts": {"total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1},
+        "examples": [{"example_id": "example:1", "source": "governed_assertion", "split": "train", "lineage": {
+            "assertion_id": "assertion:test", "revision_id": "revision:test", "content_hash": "sha256:test",
+            "source_occurrence_ids": [], "eligibility": "included",
+        }}],
+    }
+    encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    raw["manifest_hash"] = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+    (candidate / "corpus_manifest.json").write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
 
 
 class _FakeStorage:
@@ -28,6 +66,12 @@ class _FakeStorage:
 
     async def get_node(self, node_id):
         return self.nodes.get(node_id)
+
+    async def governed_assertion_corpus_snapshot(self, **_kwargs):
+        return _snapshot()
+
+    async def governed_assertion_corpus_changes_since(self, _snapshot_value, **_kwargs):
+        return SimpleNamespace(tombstones=())
 
 
 def _agent(storage=None, *, is_test_instance=False, storage_path=None):
@@ -47,7 +91,16 @@ async def _feature(storage=None, *, is_test_instance=False, storage_path=None):
         storage, is_test_instance=is_test_instance, storage_path=storage_path,
     ))
     await f.initialize()
+    f._governed_corpus_policy = SimpleNamespace(digest="sha256:policy")
     return f
+
+
+def _stamp_adapter_receipt(feature, candidate) -> None:
+    manifest, error = feature._manifest_lineage(str(candidate))
+    assert error is None
+    receipt = feature._manifest_receipt_stamp(manifest or {})
+    assert receipt is not None
+    feature._adapter_lineage[str(candidate)] = {**receipt, "state": "candidate"}
 
 
 # ----------------------------------------------------------------------
@@ -104,6 +157,10 @@ async def test_mutation_tools_refused_for_governed_agent():
     for result in (
         await f.parametric_self_train_now(),
         await f.parametric_self_set_enabled(True),
+        await f.parametric_self_recover_shutdown(
+            confirmed_process_absent=True,
+            evidence="checked process table; no trainer remains",
+        ),
         await f.parametric_self_rollback(),
     ):
         assert result.status == ToolResultStatus.ERROR
@@ -233,7 +290,7 @@ async def test_on_disable_cancels_in_flight_training_task():
 
     async def _cancel_all():
         cancel_all_called.set()
-        return 0
+        return SimpleNamespace(all_stopped=True)
 
     f._adapter.cancel_all = _cancel_all
 
@@ -245,6 +302,9 @@ async def test_on_disable_cancels_in_flight_training_task():
     await f.on_disable()
     assert f._training_task is None
     assert cancel_all_called.is_set()  # subprocess termination requested
+    assert f._training_shutdown_incomplete is None
+    assert f._cycle_in_flight is False
+    assert (await f.parametric_self_status()).data["training_shutdown_incomplete"] is None
     with pytest.raises(asyncio.CancelledError):
         await task
 
@@ -274,6 +334,551 @@ async def test_on_disable_clears_guard_when_cancel_precedes_runner():
     assert runs[-1]["state"] == "interrupted"
 
 
+async def test_on_disable_surfaces_unconfirmed_trainer_shutdown():
+    """Disable must not claim a live child stopped when bulk confirmation fails."""
+    from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
+
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    f.agent.sleep_hooks = []
+    started = asyncio.Event()
+
+    async def _unconfirmed_cycle(*, trigger):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise TrainingShutdownIncomplete("trainer stop could not be confirmed; corpus retained")
+
+    async def _unconfirmed_cancel_all():
+        return SimpleNamespace(all_stopped=False)
+
+    f._run_training_cycle_locked = _unconfirmed_cycle
+    f._adapter.cancel_all = _unconfirmed_cancel_all
+    result = await f.parametric_self_train_now()
+    assert result.status == ToolResultStatus.OK
+    task = f._training_task
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await f.on_disable()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert f._training_task is None
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert f._active_run["state"] == "shutdown_incomplete"
+    status = await f.parametric_self_status()
+    assert "shutdown incomplete" in status.confirmation
+    assert "shutdown incomplete" in status.data["training_shutdown_incomplete"]
+    assert status.data["active_run"]["state"] == "shutdown_incomplete"
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "shutdown_incomplete"
+
+
+async def test_confirmed_bulk_shutdown_resolves_prior_incomplete_run_and_deletes_corpus(tmp_path):
+    """Same-process stop proof terminalizes history and releases retained input."""
+    from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
+
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._work_dir = str(tmp_path / "parametric_self")
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+    retained = tmp_path / "parametric_self" / "corpus" / "run-1"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
+    (retained / "valid.jsonl").write_text('{"text":"private"}\n')
+
+    async def _unconfirmed_cycle(*, trigger):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise TrainingShutdownIncomplete(
+                "trainer stop could not be confirmed; corpus retained",
+                corpus_path=str(retained),
+            )
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    f._run_training_cycle_locked = _unconfirmed_cycle
+    f._adapter.cancel_all = _confirmed_cancel_all
+    started_result = await f.parametric_self_train_now()
+    assert started_result.status == ToolResultStatus.OK
+    task = f._training_task
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await f.on_disable()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert f._training_shutdown_incomplete is None
+    assert f._cycle_in_flight is False
+    assert f._active_run is None
+    status = await f.parametric_self_status()
+    assert status.data["training_shutdown_incomplete"] is None
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+    assert "bulk trainer stop confirmed" in runs[-1]["reason"]
+    assert not (retained / "train.jsonl").exists()
+    assert not (retained / "valid.jsonl").exists()
+
+
+async def test_shutdown_without_bulk_confirmation_keeps_prior_incomplete_block_and_corpus(tmp_path):
+    """A missing bulk cancellation capability is unknown, never clean shutdown."""
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    retained = tmp_path / "parametric_self" / "corpus" / "unresolved"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
+    f._active_run = {
+        "run_id": "unresolved", "adapter_id": "adapter", "trigger": "manual",
+        "state": "shutdown_incomplete", "adapter_path": "/tmp/adapter",
+        "retained_corpus_path": str(retained),
+    }
+    await f._append_run_history({
+        "run_id": "unresolved", "trigger": "manual", "state": "shutdown_incomplete",
+        "reason": "training shutdown incomplete: prior stop was unconfirmed",
+        "retained_corpus_path": str(retained),
+    })
+    f._training_shutdown_incomplete = "training shutdown incomplete: prior stop was unconfirmed"
+    f._adapter.cancel_all = None
+
+    await f.on_disable()
+    assert f._training_shutdown_incomplete is not None
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+    assert (retained / "train.jsonl").exists()
+
+
+async def test_same_instance_reenable_keeps_process_provenance_for_recovery():
+    """Reloading a live feature must not turn its own stop proof into unknown."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f.agent.get_feature = MagicMock(return_value=f)
+    f._active_run = {
+        "run_id": "same-instance", "adapter_id": "adapter", "trigger": "manual",
+        "state": "shutdown_incomplete", "adapter_path": "/tmp/adapter",
+    }
+    await f._append_run_history({
+        "run_id": "same-instance", "trigger": "manual", "state": "shutdown_incomplete",
+        "reason": "training shutdown incomplete: prior stop was unconfirmed",
+    })
+    f._training_shutdown_incomplete = "training shutdown incomplete: prior stop was unconfirmed"
+
+    async def _unconfirmed_cancel_all():
+        return SimpleNamespace(all_stopped=False)
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    f._adapter.cancel_all = _unconfirmed_cancel_all
+    await f.on_disable()
+    assert f._training_shutdown_incomplete is not None
+
+    await f.post_all_features_loaded(f.agent)
+    assert f._shutdown_recovery_requires_external_confirmation is False
+    f._adapter.cancel_all = _confirmed_cancel_all
+    await f.on_disable()
+    assert f._training_shutdown_incomplete is None
+    assert f._cycle_in_flight is False
+    assert (await f._load_run_history())[-1]["state"] == "interrupted"
+
+
+async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
+    """Nightly cancellation enters the same durable safety state as train_now."""
+    from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
+
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._adapter.is_available = lambda: True
+
+    async def _unconfirmed_cycle(*, trigger):
+        active = await f._begin_active_run(trigger=trigger, work_dir=str(tmp_path / "work"))
+        assert active["trigger"] == "nightly"
+        raise TrainingShutdownIncomplete("trainer stop could not be confirmed; corpus retained")
+
+    f._run_training_cycle_locked = _unconfirmed_cycle
+    with pytest.raises(TrainingShutdownIncomplete):
+        await f._run_training_cycle(trigger="nightly")
+
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert f._active_run["state"] == "shutdown_incomplete"
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "shutdown_incomplete"
+    blocked = await f.parametric_self_train_now()
+    assert blocked.status == ToolResultStatus.ERROR
+    assert "shutdown incomplete" in (blocked.error or "")
+
+    # The durable marker survives feature reconstruction and remains a block.
+    restarted = ParametricSelfFeature(agent=f.agent)
+    await restarted.initialize()
+    restarted.agent.get_feature = MagicMock(return_value=restarted)
+    await restarted.post_all_features_loaded(restarted.agent)
+    assert restarted._training_shutdown_incomplete is not None
+    assert restarted._cycle_in_flight is True
+    assert (await restarted.parametric_self_status()).data["training_shutdown_incomplete"]
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    restarted._adapter.cancel_all = _confirmed_cancel_all
+    await restarted.on_disable()
+    # A fresh adapter's all_stopped result may only describe its own empty job
+    # set; it is not proof that the prior process's child exited.
+    assert restarted._training_shutdown_incomplete is not None
+    assert restarted._shutdown_recovery_requires_external_confirmation is True
+    assert restarted._cycle_in_flight is True
+    unresolved_runs = await restarted._load_run_history()
+    assert unresolved_runs[-1]["state"] == "shutdown_incomplete"
+
+    final = ParametricSelfFeature(agent=f.agent)
+    await final.initialize()
+    final.agent.get_feature = MagicMock(return_value=final)
+    await final.post_all_features_loaded(final.agent)
+    assert final._training_shutdown_incomplete is not None
+    assert final._cycle_in_flight is True
+
+
+async def test_restored_shutdown_requires_explicit_sovereign_recovery_evidence(tmp_path):
+    """A restart block has one explicit, auditable recovery path—not a silent ack."""
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    retained = tmp_path / "parametric_self" / "corpus" / "old-run"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
+    await f._append_run_history({
+        "run_id": "old-run", "trigger": "nightly", "state": "shutdown_incomplete",
+        "reason": "training shutdown incomplete: old process was not confirmed stopped",
+        "retained_corpus_path": str(retained),
+    })
+
+    restarted = ParametricSelfFeature(agent=f.agent)
+    await restarted.initialize()
+    restarted.agent.get_feature = MagicMock(return_value=restarted)
+    await restarted.post_all_features_loaded(restarted.agent)
+    status = await restarted.parametric_self_status()
+    assert status.data["shutdown_recovery_requires_external_confirmation"] is True
+    assert "!parametric-self-recover-shutdown" in status.confirmation
+
+    refused = await restarted.parametric_self_recover_shutdown()
+    assert refused.status == ToolResultStatus.ERROR
+    assert "confirmed_process_absent=true" in (refused.error or "")
+    assert restarted._training_shutdown_incomplete is not None
+    assert (retained / "train.jsonl").exists()
+
+    recovered = await restarted.parametric_self_recover_shutdown(
+        confirmed_process_absent=True,
+        evidence="ps check at 2026-07-31 confirmed no prior mlx_lm.lora process",
+    )
+    assert recovered.status == ToolResultStatus.OK
+    assert restarted._training_shutdown_incomplete is None
+    assert restarted._shutdown_recovery_requires_external_confirmation is False
+    assert restarted._cycle_in_flight is False
+    assert not (retained / "train.jsonl").exists()
+    runs = await restarted._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+    assert "sovereign operator verified" in runs[-1]["reason"]
+
+    final = ParametricSelfFeature(agent=f.agent)
+    await final.initialize()
+    final.agent.get_feature = MagicMock(return_value=final)
+    await final.post_all_features_loaded(final.agent)
+    assert final._training_shutdown_incomplete is None
+    assert final._shutdown_recovery_requires_external_confirmation is False
+    assert final._cycle_in_flight is False
+
+
+async def test_disable_fences_sleep_cycle_waiting_to_launch():
+    """A sleep dispatch already queued on the lifecycle lock cannot start post-disable."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    launches = []
+
+    async def _should_not_launch(*, trigger):
+        launches.append(trigger)
+        return {"trained": True, "promoted": False}
+
+    f._run_training_cycle_locked = _should_not_launch
+    await f._manual_run_lock.acquire()
+    nightly = asyncio.create_task(f._run_training_cycle(trigger="nightly"))
+    await asyncio.sleep(0)
+    disable = asyncio.create_task(f.on_disable())
+    await asyncio.sleep(0)
+    f._manual_run_lock.release()
+
+    outcome = await nightly
+    await disable
+    assert outcome["trained"] is False
+    assert outcome["reason"] == "parametric-self feature is disabled"
+    assert launches == []
+    assert f._cycle_in_flight is False
+
+
+async def test_poll_timeout_keeps_manual_lifecycle_blocked_until_confirmed_stop(tmp_path):
+    """A returned poll timeout is nonterminal while the trainer may still write."""
+    from kestrel_feature_parametric_self.cycle import TrainingStillActive
+
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._adapter.is_available = lambda: True
+    retained = tmp_path / "parametric_self" / "corpus" / "still-live"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
+
+    async def _timed_out_cycle(*, trigger):
+        raise TrainingStillActive(
+            "training still active after poll timeout; corpus retained",
+            corpus_path=str(retained),
+        )
+
+    f._run_training_cycle_locked = _timed_out_cycle
+    started = await f.parametric_self_train_now()
+    assert started.status == ToolResultStatus.OK
+    await f._training_task
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert f._active_run["state"] == "shutdown_incomplete"
+    assert "still active" in f._training_shutdown_incomplete
+    blocked = await f.parametric_self_train_now()
+    assert blocked.status == ToolResultStatus.ERROR
+    assert "still active" in (blocked.error or "")
+
+    # No affirmative bulk capability means disable must preserve the block.
+    f._adapter.cancel_all = None
+    await f.on_disable()
+    assert f._cycle_in_flight is True
+    assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+    assert (retained / "train.jsonl").exists()
+
+    # This is a same-process stop failure, so an operator-looking string cannot
+    # bypass the adapter-specific stop proof or remove corpus a child may read.
+    refused = await f.parametric_self_recover_shutdown(
+        confirmed_process_absent=True,
+        evidence="ps check at 2026-07-31 showed no prior trainer process",
+    )
+    assert refused.status == ToolResultStatus.ERROR
+    assert "only for an incomplete shutdown restored" in (refused.error or "")
+    assert f._training_shutdown_incomplete is not None
+    assert f._cycle_in_flight is True
+    assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+    assert (retained / "train.jsonl").exists()
+
+
+async def test_disable_cancels_owned_nightly_task_not_sleep_owner():
+    """The sleep dispatcher survives while its feature-owned nightly child stops."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        await f._begin_active_run(trigger=trigger, work_dir="/tmp/parametric-self-test")
+        started.set()
+        await asyncio.Event().wait()
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    f._run_training_cycle_locked = _slow_cycle
+    f._adapter.cancel_all = _confirmed_cancel_all
+    sleep_owner = asyncio.create_task(f.on_post_consolidation({"episodes_created": 1}))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    child = f._cycle_task
+    assert child is not None and child is not sleep_owner
+    await f.on_disable()
+    outcome = await sleep_owner
+    assert "interrupted" in outcome["reason"]
+    assert not sleep_owner.cancelled()
+    with pytest.raises(asyncio.CancelledError):
+        await child
+    assert (await f._load_run_history())[-1]["state"] == "interrupted"
+
+
+async def test_external_sleep_cancellation_propagates_and_terminalizes_nightly_run():
+    """Core cancellation is not a feature disable and must remain observable."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        await f._begin_active_run(trigger=trigger, work_dir="/tmp/parametric-self-test")
+        started.set()
+        await asyncio.Event().wait()
+
+    f._run_training_cycle_locked = _slow_cycle
+    sleep_owner = asyncio.create_task(f.on_post_consolidation({"episodes_created": 1}))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    sleep_owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sleep_owner
+    assert f._active_run is None
+    assert f._cycle_in_flight is False
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+    assert "sleep cycle cancelled" in runs[-1]["reason"]
+
+
+async def test_nightly_exception_is_consumed_and_history_is_failed():
+    """An owned nightly task reports failure instead of leaking an unhandled task."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._adapter.is_available = lambda: True
+
+    async def _broken_cycle(*, trigger):
+        await f._begin_active_run(trigger=trigger, work_dir="/tmp/parametric-self-test")
+        raise RuntimeError("synthetic nightly failure")
+
+    f._run_training_cycle_locked = _broken_cycle
+    outcome = await f.on_post_consolidation({"episodes_created": 1})
+    assert outcome["trained"] is False
+    assert "nightly training failed: synthetic nightly failure" == outcome["reason"]
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "failed"
+    assert "synthetic nightly failure" in runs[-1]["reason"]
+
+
+def test_lifecycle_state_backfill_handles_partial_upgrade_shape():
+    """Each lifecycle field is independently restored for upgraded instances."""
+    f = ParametricSelfFeature.__new__(ParametricSelfFeature)
+    f._manual_run_lock = asyncio.Lock()  # present in a partially upgraded object
+    f._ensure_training_lifecycle_state()
+    assert f._manual_run_generation == 0
+    assert f._manual_runs_enabled is True
+    assert f._training_shutdown_incomplete is None
+    assert f._training_task is None
+    assert f._cycle_task is None
+    assert f._active_run is None
+    assert f._cycle_in_flight is False
+    assert f._shutdown_recovery_requires_external_confirmation is False
+
+
+async def test_status_surfaces_legacy_corpus_cleanup_requirement(tmp_path):
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    legacy = tmp_path / "parametric_self" / "corpus"
+    legacy.mkdir(parents=True)
+    (legacy / "train.jsonl").write_text('{"text":"legacy"}\n')
+
+    status = await f.parametric_self_status()
+    assert status.data["legacy_corpus_cleanup_needed"] is True
+    assert "legacy corpus plaintext retained" in status.confirmation
+
+
+async def test_train_now_cancellation_during_history_reservation_recovers():
+    """Cancelling the command while its run record is awaited releases all state."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    entered = asyncio.Event()
+    never = asyncio.Event()
+    original_append = f._append_run_history
+
+    async def _blocked_append(entry):
+        entered.set()
+        await never.wait()
+
+    f._append_run_history = _blocked_append
+    command = asyncio.create_task(f.parametric_self_train_now())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    command.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await command
+
+    assert f._cycle_in_flight is False
+    assert f._training_task is None
+    assert f._active_run is None
+    progress = await f.parametric_self_progress()
+    assert progress.data == {"active_run": None}
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+
+    f._append_run_history = original_append
+
+    async def _fast_cycle(*, trigger):
+        return {"trained": False, "promoted": False, "reason": "test skip"}
+
+    f._run_training_cycle_locked = _fast_cycle
+    recovered = await f.parametric_self_train_now()
+    assert recovered.status == ToolResultStatus.OK
+    await f._training_task
+    runs = await f._load_run_history()
+    assert [run["state"] for run in runs] == ["interrupted", "skipped"]
+
+
+async def test_cancelled_detached_manual_run_is_terminal_and_recoverable():
+    """External task cancellation cannot strand progress/history as in-progress."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        started.set()
+        await asyncio.Event().wait()
+
+    f._run_training_cycle_locked = _slow_cycle
+    result = await f.parametric_self_train_now()
+    assert result.status == ToolResultStatus.OK
+    task = f._training_task
+    await asyncio.wait_for(started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert f._cycle_in_flight is False
+    assert f._training_task is None
+    assert f._active_run is None
+    progress = await f.parametric_self_progress()
+    assert progress.data == {"active_run": None}
+    runs = await f._load_run_history()
+    assert len(runs) == 1
+    assert runs[0]["state"] == "interrupted"
+    assert runs[0]["reason"] == "run cancelled"
+
+    async def _fast_cycle(*, trigger):
+        return {"trained": False, "promoted": False, "reason": "test skip"}
+
+    f._run_training_cycle_locked = _fast_cycle
+    recovered = await f.parametric_self_train_now()
+    assert recovered.status == ToolResultStatus.OK
+    await f._training_task
+    runs = await f._load_run_history()
+    assert [run["state"] for run in runs] == ["interrupted", "skipped"]
+
+
+async def test_disable_during_manual_record_creation_prevents_runner_launch():
+    """Disable invalidates a suspended train_now command before it can detach."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cycle_calls = []
+
+    async def _blocked_append(entry):
+        entered.set()
+        await release.wait()
+
+    async def _should_not_run(*, trigger):
+        cycle_calls.append(trigger)
+        return {"trained": True, "promoted": False}
+
+    f._append_run_history = _blocked_append
+    f._run_training_cycle_locked = _should_not_run
+    command = asyncio.create_task(f.parametric_self_train_now())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    disable = asyncio.create_task(f.on_disable())
+    await asyncio.sleep(0)
+    release.set()
+
+    result = await command
+    await disable
+    assert result.status == ToolResultStatus.ERROR
+    assert "did not start" in (result.error or "")
+    assert cycle_calls == []
+    assert f._training_task is None
+    assert f._cycle_in_flight is False
+    assert f._active_run is None
+    progress = await f.parametric_self_progress()
+    assert progress.data == {"active_run": None}
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+
+
 async def test_rollback_default_to_previous_promoted(tmp_path):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"
@@ -282,8 +887,11 @@ async def test_rollback_default_to_previous_promoted(tmp_path):
     for d, loss in ((old, "2.900"), (new, "2.600")):
         d.mkdir(parents=True)
         (d / "train.log").write_text(f"Val loss {loss}\n")
+        _write_governed_manifest(d)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, old)
+    _stamp_adapter_receipt(f, new)
     # History records both promotions; new is currently served.
     await f._append_run_history({"promoted": True, "adapter_path": str(old), "trigger": "nightly"})
     await f._append_run_history({"promoted": True, "adapter_path": str(new), "trigger": "nightly"})
@@ -305,8 +913,10 @@ async def test_rollback_explicit_adapter_id(tmp_path, arg):
     target = cands / "pick99"
     target.mkdir(parents=True)
     (target / "train.log").write_text("Val loss 2.750\n")
+    _write_governed_manifest(target)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, target)
     f._active_adapter_path = "/some/other/served"
     # Accept both the split form ("pick99") and a leaked key=value token.
     result = await f.parametric_self_rollback(adapter_id=arg)
@@ -383,11 +993,12 @@ async def test_nightly_cycle_skips_when_manual_run_in_flight():
 # Adoption / recovery path (candidate on disk, no served pointer)
 # ----------------------------------------------------------------------
 
-async def test_adapters_marks_recoverable_when_unserved(tmp_path):
-    """A valid candidate with no served pointer is flagged recoverable."""
+async def test_adapters_leaves_untracked_candidates_inspection_only(tmp_path):
+    """A valid-looking legacy candidate is visible but cannot be served."""
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     # No served adapter (the legacy/interrupted-run state).
     assert f._active_adapter_path is None
@@ -395,29 +1006,33 @@ async def test_adapters_marks_recoverable_when_unserved(tmp_path):
     result = await f.parametric_self_adapters()
     assert result.status == ToolResultStatus.OK
     by_id = {a["adapter_id"]: a for a in result.data["adapters"]}
-    assert by_id["ded33cd017d9"]["recoverable"] is True
+    assert by_id["ded33cd017d9"]["recoverable"] is False
     assert by_id["ded33cd017d9"]["served"] is False
-    assert result.data["recoverable_adapters"] == ["ded33cd017d9"]
+    assert "durable adapter lineage receipt unavailable" in by_id["ded33cd017d9"]["quarantined_reason"]
+    assert result.data["recoverable_adapters"] == []
 
 
-async def test_status_exposes_recoverable_candidates(tmp_path):
+async def test_status_keeps_untracked_candidates_non_serving(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
 
     result = await f.parametric_self_status()
     assert result.status == ToolResultStatus.OK
     assert result.data["served_adapter"] is None
-    assert result.data["recoverable_adapters"] == ["ded33cd017d9"]
+    assert result.data["recoverable_adapters"] == []
 
 
 async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_governed_manifest(cands)
     storage = _FakeStorage()
     f = await _feature(storage, storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
 
     result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
     assert result.status == ToolResultStatus.OK
@@ -434,7 +1049,9 @@ async def test_adopt_accepts_leaked_key_value_token(tmp_path, arg):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Val loss 2.688\n")
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
     result = await f.parametric_self_adopt(adapter_id=arg)
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(cands)
@@ -489,7 +1106,9 @@ async def test_adopt_rejects_candidate_failing_fidelity_gate(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "toobad"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Val loss 3.500\n")  # > max_val_loss (3.0)
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
     result = await f.parametric_self_adopt(adapter_id="toobad")
     assert result.status == ToolResultStatus.ERROR
     assert "fidelity gate" in (result.error or "")
@@ -603,14 +1222,29 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
         runs = await f._load_run_history()
         seen_states.append(runs[-1]["state"])  # in_progress while running
         from kestrel_feature_parametric_self.cycle import CycleResult
+        from kestrel_feature_parametric_self.corpus import build_corpus
+        candidate = kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"]
+        stats = build_corpus(
+            kwargs["db_path"], kwargs["work_dir"] + "/corpus",
+            governed_snapshot=kwargs["governed_snapshot"], manifest_dir=candidate,
+        )
         return CycleResult(
             trained=True, promoted=True, reason="ok", val_loss=1.2,
-            promoted_adapter_path=kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"],
-            corpus_train=5,
+            promoted_adapter_path=candidate,
+            corpus_train=5, corpus_manifest_path=stats.manifest_path,
+            corpus_manifest_hash=stats.manifest_hash,
+            semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
+            semantic_checkpoint_id=stats.semantic_checkpoint_id,
+            corpus_snapshot_hash=stats.snapshot_hash,
+            corpus_policy_digest=stats.policy_digest,
+            assertion_lineage=stats.assertion_lineage,
         )
 
     orig = feat_mod.run_nightly_cycle
     feat_mod.run_nightly_cycle = _fake_run_cycle
+    async def _valid_lineage(*_args, **_kwargs):
+        return None
+    f._verify_adapter_lineage = _valid_lineage
     try:
         outcome = await real_run(trigger="manual")
     finally:
@@ -627,6 +1261,8 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
 async def test_cycle_marks_failed_on_exception(tmp_path):
     db = _db_path_with_corpus(tmp_path)
     f = await _feature(_FakeStorage(), storage_path=db)
+    # Reach the patched training exception path on Linux CI as well as macOS.
+    f._adapter.is_available = lambda: True
     import kestrel_feature_parametric_self.feature as feat_mod
 
     async def _boom(**kwargs):

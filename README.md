@@ -28,6 +28,44 @@ uv pip install kestrel-feature-parametric-self
 The package registers `ParametricSelfFeature` through the
 `kestrel_sovereign.features` entry point group.
 
+The governed-corpus host surface is currently under development in core. Until
+the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
+this package source-pins the reviewed capability commit (`5932735a`) rather
+than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
+must replace that pin with the published capability-bearing version.
+
+## Governed training corpus
+
+Nightly training remains disabled by default and requires an explicit
+`GovernedCorpusPolicy` from the host/operator before it can use factual
+examples. The feature asks the agent's storage capability for a checkpointed,
+policy-pinned governed assertion snapshot after successful semantic
+maintenance; it never reads factual graph rows or a local database directly.
+Reflection insights remain a distinct source.
+
+Each candidate retains an immutable, content-free manifest of its accepted
+assertion/revision lineage and semantic checkpoint. A tombstone, stale
+revision, missing manifest, or unverifiable host capability quarantines the
+affected candidate or served adapter until it is rebuilt. This is intentionally
+a visible no-op rather than a fallback to ungoverned factual training.
+
+## Incomplete-shutdown recovery
+
+If status reports a shutdown restored from a prior process, training remains
+blocked and any retained per-run corpus stays in place. A new adapter's empty
+job list cannot prove that an old trainer exited. After a sovereign operator
+checks that every prior trainer process is absent, they must record that fresh
+evidence explicitly:
+
+```text
+!parametric-self-recover-shutdown confirmed_process_absent=true evidence="ps check found no prior mlx_lm.lora process"
+```
+
+The command is sovereign-class gated. It refuses an omitted/false confirmation,
+missing evidence, or a still-live feature-owned task; on success it
+terminalizes the durable run record and removes only its recorded per-run
+corpus files.
+
 ## Development
 
 ```bash

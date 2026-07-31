@@ -15,7 +15,8 @@ class: ParametricSelfFeature
 
 # Dependencies
 requires:
-  - storage          # For reading the training corpus and adapter pointers
+  - storage          # Governed corpus capability + adapter pointers
+  - semantic_maintenance  # Checkpointed governed corpus prerequisite
 
 optional:
   - reflection       # Corpus source (insights + per-turn facts); P1
@@ -43,6 +44,9 @@ tools:
   - name: parametric-self-set-enabled
     description: Enable/disable nightly training for this agent (durable)
     command: "!parametric-self-enable"
+  - name: parametric-self-recover-shutdown
+    description: Sovereign-only explicit recovery after verifying a prior trainer process is absent
+    command: "!parametric-self-recover-shutdown"
   - name: parametric-self-rollback
     description: Roll the served adapter back to a prior candidate
     command: "!parametric-self-rollback"
@@ -54,13 +58,16 @@ tools:
 hooks:
   - event: post_consolidation
     method: on_post_consolidation
-    description: Nightly LoRA training on the night's consolidated reflections (P2)
+    description: Nightly LoRA training after successful semantic maintenance, using reflections plus a governed assertion snapshot
 
 # Configuration
 config:
   # Apple-Silicon only; the trainer no-ops elsewhere.
   enable_nightly_training: false   # Off until P2 lands the real trainer
   base_model: "gemma-4-31B-it-mlx-4bit"
+  # Required before a run can use factual examples. The operator supplies an
+  # explicit GovernedCorpusPolicy; missing/failed semantic maintenance skips.
+  governed_corpus_policy: null
   # In-loop integration is path-first; promotion to always-on prior is gated.
   in_loop: false
 

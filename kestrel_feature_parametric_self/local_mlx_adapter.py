@@ -20,6 +20,7 @@ MLX is imported lazily and only used on Apple Silicon; on any other platform
 
 from __future__ import annotations
 
+import asyncio
 import platform
 import sys
 import time
@@ -50,6 +51,14 @@ class _Job:
     process: Optional["object"] = None  # subprocess.Popen, set on launch
     log_path: Optional[str] = None      # captured mlx_lm.lora stdout/stderr
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CancelAllResult:
+    """Bulk shutdown outcome kept distinct from a count of stopped children."""
+
+    cancelled: int
+    all_stopped: bool
 
 
 def _mlx_available() -> bool:
@@ -186,26 +195,50 @@ class LocalMLXAdapter:
         job = self._jobs.get(job_id)
         if job is None or job.process is None:
             return False
-        if job.process.poll() is None:
-            job.process.terminate()
-        job.state = TrainingState.CANCELLED
-        return True
+        stopped = await self._terminate_and_wait(job.process)
+        if stopped:
+            job.state = TrainingState.CANCELLED
+        return stopped
 
-    async def cancel_all(self) -> int:
+    async def cancel_all(self) -> CancelAllResult:
         """Terminate every still-running training subprocess.
 
         Used on feature disable/shutdown: cancelling the asyncio polling task
         does not stop the spawned ``mlx_lm.lora`` child, which would otherwise
-        keep running GPU-heavy and writing into the adapter dir. Returns the
-        number of live jobs terminated.
+        keep running GPU-heavy and writing into the adapter dir. Returns an
+        explicit all-targets-stopped confirmation plus the count of live jobs
+        terminated. ``cancelled=0, all_stopped=True`` is the separate no-live-
+        jobs case; a count alone is never proof about a specific child.
         """
         cancelled = 0
+        all_stopped = True
         for job in self._jobs.values():
             if job.process is not None and job.process.poll() is None:
-                job.process.terminate()
-                job.state = TrainingState.CANCELLED
-                cancelled += 1
-        return cancelled
+                if await self._terminate_and_wait(job.process):
+                    job.state = TrainingState.CANCELLED
+                    cancelled += 1
+                else:
+                    all_stopped = False
+        return CancelAllResult(cancelled=cancelled, all_stopped=all_stopped)
+
+    @staticmethod
+    async def _terminate_and_wait(process) -> bool:
+        """Terminate a child and confirm it exited before callers drop inputs."""
+        if process.poll() is not None:
+            return True
+        try:
+            process.terminate()
+            await asyncio.to_thread(process.wait, 5)
+        except Exception:
+            # A stubborn child gets one escalation.  If it still cannot be
+            # confirmed dead, callers retain its corpus instead of racing it.
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    await asyncio.to_thread(process.wait, 5)
+            except Exception:
+                return False
+        return process.poll() is not None
 
     async def cleanup(self, job_id: str) -> None:
         self._jobs.pop(job_id, None)
