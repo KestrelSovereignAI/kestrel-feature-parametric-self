@@ -30,7 +30,7 @@ The package registers `ParametricSelfFeature` through the
 
 The governed-corpus host surface is currently under development in core. Until
 the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
-this package source-pins the reviewed capability commit (`5932735a`) rather
+this package source-pins the reviewed capability commit (`265cf418`) rather
 than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
 must replace that pin with the published capability-bearing version.
 
@@ -48,6 +48,23 @@ assertion/revision lineage and semantic checkpoint. A tombstone, stale
 revision, missing manifest, or unverifiable host capability quarantines the
 affected candidate or served adapter until it is rebuilt. This is intentionally
 a visible no-op rather than a fallback to ungoverned factual training.
+
+## Semantic release erasure evidence
+
+The #2753 external-adapter drill is available through
+`ParametricSelfExternalEvidenceRunner`. It must run only against an isolated
+agent and receives the real, scoped core erasure action for that agent's fresh
+governed assertion. The runner builds the corpus through core's governed
+snapshot, stamps the candidate receipt, invokes the erasure, then requires the
+feature's own lineage verifier to quarantine both the candidate and its served
+eligibility before it signs anything.
+
+The emitted envelope is content-free: it contains fixed core gate/spec/drill
+bindings, positive/zero aggregates, opaque artifacts, and Ed25519
+external-CI signatures. It is not a release-ready claim. Core verifies those
+signatures later against its operator-owned `TrustedExecutionPolicy` and
+attaches the envelope's `ExternalCapabilityReport` only when it matches the
+fixed repository/revision contract.
 
 ## Incomplete-shutdown recovery
 

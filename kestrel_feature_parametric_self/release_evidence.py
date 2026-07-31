@@ -1,0 +1,339 @@
+"""External-CI evidence for the parametric-self erasure release gates.
+
+This module is deliberately an *executor*, not a generic JSON formatter.  It
+drives an isolated :class:`ParametricSelfFeature` through the governed-corpus
+and adapter-lineage paths, waits for a caller-supplied real erasure action, and
+only then signs the three external gate records declared by Kestrel core.
+
+The resulting envelope contains aggregates, immutable catalog bindings, and
+opaque digests only.  It contains no assertion text, tenant ID, filesystem
+path, command line, or erasure implementation detail.  Core still decides
+whether the external-CI signing key is trusted when it assembles a release.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import shutil
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from kestrel_sovereign.knowledge.corpus import GovernedCorpusSnapshot
+from kestrel_sovereign.knowledge.release_evidence import (
+    PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+    PARAMETRIC_SELF_EVIDENCE_REVISION,
+    release_gate_specs,
+)
+from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
+from kestrel_sovereign.knowledge.release_evidence_models import (
+    ArtifactReference,
+    EvidenceRecord,
+    EvidenceState,
+    ExecutionSource,
+    ExternalCapabilityReport,
+    ExternalGateAttestation,
+    GateSpec,
+    ReleaseEvidenceError,
+)
+
+from .corpus import build_corpus
+
+if TYPE_CHECKING:
+    from .feature import ParametricSelfFeature
+
+
+# This is the merged core revision that introduced the catalog whose exact
+# specs/results/artifacts/drill this feature consumes.  The pyproject source
+# pin is the installation boundary; this value makes that boundary visible in
+# the independently signed, content-free envelope.
+CORE_RELEASE_EVIDENCE_COMMIT = "265cf418"
+EXTERNAL_GATE_IDS = (
+    "external_corpus_consumed",
+    "external_candidate_invalidated",
+    "external_served_eligibility_rejected",
+)
+_CAPABILITY_ID = "parametric_self_governed_corpus"
+
+
+class ExternalReleaseEvidenceError(ValueError):
+    """The isolated external erasure drill did not establish a required fact."""
+
+
+ErasureAction = Callable[[], None | Awaitable[None]]
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _external_specs() -> dict[str, GateSpec]:
+    specs = {spec.gate_id: spec for spec in release_gate_specs()}
+    selected = {gate_id: specs.get(gate_id) for gate_id in EXTERNAL_GATE_IDS}
+    if set(selected) != set(EXTERNAL_GATE_IDS) or any(
+        spec is None for spec in selected.values()
+    ):
+        raise ExternalReleaseEvidenceError("core external release gate catalog is incomplete")
+    result = {gate_id: spec for gate_id, spec in selected.items() if spec is not None}
+    if any(
+        spec.category != "external_adapter"
+        or spec.runner.runner_id != "external_ci"
+        or spec.owner != "parametric_self"
+        or spec.correlation is None
+        for spec in result.values()
+    ):
+        raise ExternalReleaseEvidenceError("core external release gate catalog does not match the adapter contract")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalReleaseEvidenceEnvelope:
+    """Content-free, independently signed external-CI submission for core.
+
+    It is intentionally not a readiness claim: every record is signed, but
+    only core's operator-owned :class:`TrustedExecutionPolicy` may trust it.
+    """
+
+    core_release_evidence_commit: str
+    repository: str
+    source_revision: str
+    records: tuple[EvidenceRecord, ...]
+    report: ExternalCapabilityReport
+
+    def __post_init__(self) -> None:
+        if self.core_release_evidence_commit != CORE_RELEASE_EVIDENCE_COMMIT:
+            raise ExternalReleaseEvidenceError("external evidence must bind the #2753 core catalog commit")
+        if self.repository != PARAMETRIC_SELF_EVIDENCE_REPOSITORY:
+            raise ExternalReleaseEvidenceError("external evidence repository does not match core contract")
+        if self.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION:
+            raise ExternalReleaseEvidenceError("external evidence revision does not match core contract")
+        specs = _external_specs()
+        by_gate = {record.gate_id: record for record in self.records}
+        if set(by_gate) != set(specs) or len(by_gate) != len(self.records):
+            raise ExternalReleaseEvidenceError("external evidence must contain each declared adapter gate once")
+        for gate_id, record in by_gate.items():
+            spec = specs[gate_id]
+            try:
+                spec.validate_attestation(record)
+            except ReleaseEvidenceError as error:
+                raise ExternalReleaseEvidenceError("external record does not bind the current core gate spec") from error
+            if (
+                record.state is not EvidenceState.PASSED
+                or record.execution_attestation is None
+                or record.execution_attestation.source is not ExecutionSource.EXTERNAL_CI
+            ):
+                raise ExternalReleaseEvidenceError("external evidence records must be externally signed passes")
+        if (
+            self.report.capability_id != _CAPABILITY_ID
+            or self.report.repository != self.repository
+            or self.report.source_revision != self.source_revision
+        ):
+            raise ExternalReleaseEvidenceError("external report identity does not match its envelope")
+        report_by_gate = {item.gate_id: item for item in self.report.attestations}
+        if set(report_by_gate) != set(by_gate):
+            raise ExternalReleaseEvidenceError("external report must contain each signed adapter gate once")
+        for gate_id, record in by_gate.items():
+            item = report_by_gate.get(gate_id)
+            if (
+                item is None
+                or item.gate_spec_digest != specs[gate_id].digest
+                or item.result_digest != record.run_digest
+                or item.artifact != record.artifact
+                or item.drill != specs[gate_id].correlation
+            ):
+                raise ExternalReleaseEvidenceError("external report is not bound to its signed record")
+
+    @property
+    def trust_status(self) -> str:
+        return "external_signature_requires_core_policy_verification"
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "core_release_evidence_commit": self.core_release_evidence_commit,
+            "repository": self.repository,
+            "source_revision": self.source_revision,
+            "trust_status": self.trust_status,
+            "records": [record.to_mapping() for record in self.records],
+            "report": self.report.to_mapping(),
+        }
+
+    def write(self, output: Path, *, overwrite: bool = False) -> None:
+        """Write one aggregate-only artifact without replacing another run."""
+        if output.exists() and not overwrite:
+            raise ExternalReleaseEvidenceError("refusing to replace existing external evidence envelope")
+        if not output.parent.is_dir():
+            raise ExternalReleaseEvidenceError("external evidence output parent does not exist")
+        output.write_text(_canonical_json(self.to_mapping()) + "\n", encoding="utf-8")
+
+
+class ParametricSelfExternalEvidenceRunner:
+    """Execute the real external corpus → invalidation → serving drill.
+
+    ``erase`` is the isolated environment's actual administrative deletion
+    operation.  This runner does not accept a caller-supplied observation,
+    status, gate ID, artifact reference, or record: it derives every release
+    value from core's fixed catalog and the feature's post-erasure state.
+    """
+
+    def __init__(self, signing_identity: CatalogSigningIdentity) -> None:
+        if (
+            not isinstance(signing_identity, CatalogSigningIdentity)
+            or signing_identity.source is not ExecutionSource.EXTERNAL_CI
+        ):
+            raise ExternalReleaseEvidenceError("external evidence requires an external_ci signing identity")
+        self._identity = signing_identity
+
+    async def run(
+        self,
+        feature: "ParametricSelfFeature",
+        *,
+        scratch_dir: Path,
+        erase: ErasureAction,
+    ) -> ExternalReleaseEvidenceEnvelope:
+        """Run one fresh, correlated drill and return its signed envelope.
+
+        The caller is responsible for supplying an isolated Kite/test agent and
+        an erasure action scoped to the governed assertion created for this
+        drill.  A no-op, unrelated deletion, stale snapshot, untracked
+        candidate, or still-served adapter all fail closed.
+        """
+        if not callable(erase):
+            raise ExternalReleaseEvidenceError("external erasure action must be callable")
+        specs = _external_specs()
+        scratch_dir = Path(scratch_dir)
+        if scratch_dir.exists():
+            raise ExternalReleaseEvidenceError("external evidence scratch directory must be fresh")
+        if getattr(feature, "_active_adapter_path", None) is not None:
+            raise ExternalReleaseEvidenceError("external drill requires an isolated feature with no served adapter")
+
+        snapshot, problem = await feature._request_governed_snapshot()
+        if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
+            raise ExternalReleaseEvidenceError("core governed corpus snapshot is unavailable or invalid")
+        if not snapshot.examples:
+            raise ExternalReleaseEvidenceError("external erasure drill requires a non-empty governed corpus")
+
+        candidate = scratch_dir / "candidate"
+        corpus_dir = scratch_dir / "corpus"
+        try:
+            stats = build_corpus(
+                None,
+                str(corpus_dir),
+                governed_snapshot=snapshot,
+                manifest_dir=str(candidate),
+            )
+            if stats.from_facts <= 0 or not stats.assertion_lineage:
+                raise ExternalReleaseEvidenceError("core governed corpus did not contribute an erasure-tracked example")
+            manifest, manifest_problem = feature._manifest_lineage(str(candidate))
+            receipt = feature._manifest_receipt_stamp(manifest or {}) if manifest else None
+            if manifest_problem or receipt is None:
+                raise ExternalReleaseEvidenceError("candidate lineage receipt could not be established")
+
+            candidate_path = str(candidate)
+            feature._adapter_lineage[candidate_path] = {**receipt, "state": "candidate"}
+            feature._active_adapter_path = candidate_path
+            feature._live_corpus_snapshot = snapshot
+
+            result = erase()
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not None:
+                raise ExternalReleaseEvidenceError("external erasure action must not supply a result claim")
+
+            invalidation_reason = await feature._verify_adapter_lineage(candidate_path)
+            lineage = feature._adapter_lineage.get(candidate_path, {})
+            if not invalidation_reason or lineage.get("state") != "invalid":
+                raise ExternalReleaseEvidenceError("erasure did not invalidate the governed corpus candidate")
+            if feature._active_adapter_path is not None:
+                raise ExternalReleaseEvidenceError("erasure did not reject served adapter eligibility")
+
+            # All three gates are proven by one core-correlated drill.  The
+            # aggregate deliberately reveals neither the assertion count nor its
+            # identity: positive/zero is sufficient to bind the gate schema.
+            observations: Mapping[str, Mapping[str, object]] = {
+                "external_corpus_consumed": {"erased_count": 1, "remaining_count": 0},
+                "external_candidate_invalidated": {"erased_count": 1, "remaining_count": 0},
+                "external_served_eligibility_rejected": {"erased_count": 1, "remaining_count": 0},
+            }
+            records = tuple(
+                self._record(specs[gate_id], observations[gate_id])
+                for gate_id in EXTERNAL_GATE_IDS
+            )
+            attestations: list[ExternalGateAttestation] = []
+            for record in records:
+                artifact = record.artifact
+                drill = specs[record.gate_id].correlation
+                if record.run_digest is None or artifact is None or drill is None:
+                    raise ExternalReleaseEvidenceError("signed external record is missing a core binding")
+                attestations.append(
+                    ExternalGateAttestation(
+                        gate_id=record.gate_id,
+                        gate_spec_digest=specs[record.gate_id].digest,
+                        result_digest=record.run_digest,
+                        artifact=artifact,
+                        drill=drill,
+                    )
+                )
+            report = ExternalCapabilityReport.attest(
+                capability_id=_CAPABILITY_ID,
+                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                attestations=tuple(attestations),
+            )
+            return ExternalReleaseEvidenceEnvelope(
+                core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                records=records,
+                report=report,
+            )
+        finally:
+            # ``train.jsonl`` / ``valid.jsonl`` contain governed plaintext.
+            # This exact fresh scratch child exists solely for the drill, so
+            # delete it on success and every failure path.
+            if corpus_dir.is_dir():
+                shutil.rmtree(corpus_dir)
+
+    def _record(self, spec: GateSpec, observation: Mapping[str, object]) -> EvidenceRecord:
+        # The artifact is a digest of only catalog-bound aggregate fields; it
+        # cannot be used to smuggle an assertion, tenant, filesystem path, or
+        # caller-controlled log into core's release report.
+        artifact_digest = _digest(
+            {
+                "core_release_evidence_commit": CORE_RELEASE_EVIDENCE_COMMIT,
+                "gate_id": spec.gate_id,
+                "gate_spec_digest": spec.digest,
+                "observation": dict(observation),
+            }
+        )
+        artifact = ArtifactReference(f"ci://sha256/{artifact_digest}", artifact_digest)
+        _, run_digest = EvidenceRecord._bound_run_digest(
+            spec,
+            observation,
+            artifact,
+            state=EvidenceState.PASSED,
+        )
+        return EvidenceRecord._from_trusted_execution(
+            spec,
+            observation,
+            artifact,
+            state=EvidenceState.PASSED,
+            execution_attestation=self._identity.sign(
+                kind="evidence_record", spec=spec, run_digest=run_digest
+            ),
+        )
+
+
+__all__ = [
+    "CORE_RELEASE_EVIDENCE_COMMIT",
+    "EXTERNAL_GATE_IDS",
+    "ExternalReleaseEvidenceEnvelope",
+    "ExternalReleaseEvidenceError",
+    "ParametricSelfExternalEvidenceRunner",
+]

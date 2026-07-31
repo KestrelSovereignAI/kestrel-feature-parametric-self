@@ -359,7 +359,7 @@ def test_governed_core_dependency_is_source_pinned_and_exposes_its_contract():
 
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     requirements = pyproject.read_text()
-    assert "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@5932735a7db02228877985f66b9f1eb56d564f27" in requirements
+    assert "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@265cf418" in requirements
     assert "kestrel-sovereign>=0.49.5" not in requirements
     assert GovernedCorpusPolicy is not None
     assert GovernedCorpusSnapshot is not None
