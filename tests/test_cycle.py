@@ -130,11 +130,12 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
     assert "empty corpus" in result.reason
 
 
-async def test_cycle_cleans_up_legacy_shared_corpus_plaintext(tmp_path):
+async def test_cycle_retains_unknown_owner_legacy_shared_corpus_plaintext(tmp_path):
     """#2112/P8: a host upgraded from pre-0.3.1 still has plaintext
     train.jsonl/valid.jsonl at the OLD shared work/corpus/ location (not a
-    per-run subdir). A cycle must best-effort remove them so no user-derived
-    plaintext lingers (F377) — while leaving per-run subdirs untouched."""
+        per-run subdir). Without proof an old child exited, a new cycle must
+        retain them for verified/operator cleanup — while leaving per-run
+        subdirs untouched."""
     from pathlib import Path
 
     work = tmp_path / "work"
@@ -153,16 +154,15 @@ async def test_cycle_cleans_up_legacy_shared_corpus_plaintext(tmp_path):
         config=TextLoRAConfig(), poll_interval=0,
     )
 
-    # Legacy flat plaintext gone.
-    assert not (legacy / "train.jsonl").exists()
-    assert not (legacy / "valid.jsonl").exists()
+    # Legacy flat plaintext retained: an unknown old process may still read it.
+    assert (legacy / "train.jsonl").exists()
+    assert (legacy / "valid.jsonl").exists()
     # Per-run subdir untouched (only the pre-0.3.1 flat files are cleaned).
     assert (legacy / "some-prior-run" / "train.jsonl").exists()
 
 
-async def test_legacy_corpus_cleaned_even_when_trainer_unavailable(tmp_path):
-    """The cleanup must run BEFORE the trainer-availability early return — a host
-    without the trainer (common) would otherwise keep the plaintext forever."""
+async def test_legacy_corpus_retained_even_when_trainer_unavailable(tmp_path):
+    """Availability cannot prove an old trainer is not still reading legacy input."""
     work = tmp_path / "work"
     legacy = work / "corpus"
     legacy.mkdir(parents=True)
@@ -176,8 +176,9 @@ async def test_legacy_corpus_cleaned_even_when_trainer_unavailable(tmp_path):
         config=TextLoRAConfig(), poll_interval=0,
     )
     assert result.trained is False and "unavailable" in result.reason
-    assert not (legacy / "train.jsonl").exists()
-    assert not (legacy / "valid.jsonl").exists()
+    assert result.legacy_corpus_retained is True
+    assert (legacy / "train.jsonl").exists()
+    assert (legacy / "valid.jsonl").exists()
 
 
 async def test_each_run_stages_in_a_unique_dir(tmp_path):

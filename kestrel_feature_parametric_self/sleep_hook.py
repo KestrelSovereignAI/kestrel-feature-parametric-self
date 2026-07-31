@@ -58,7 +58,7 @@ class ParametricSelfSleepHook:
 
         outcome = dict(result)
         reason = str(outcome.get("reason") or "")
-        if outcome.get("trained") is True:
+        if outcome.get("trained") is True or outcome.get("started") is True:
             outcome.update(success=True, skipped=False)
         elif reason.startswith((
             "nightly training disabled", "training disabled", "training skipped",

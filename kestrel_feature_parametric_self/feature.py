@@ -30,7 +30,7 @@ from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from .cycle import TrainingShutdownIncomplete, run_nightly_cycle
+from .cycle import TrainingShutdownIncomplete, TrainingStillActive, run_nightly_cycle
 from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
 from .local_mlx_adapter import LocalMLXAdapter
 from .text_types import TextLoRAConfig
@@ -351,6 +351,7 @@ class ParametricSelfFeature(Feature):
             else []
         )
         active_run = self._active_run_progress()
+        legacy_cleanup_needed = self._legacy_corpus_cleanup_needed()
         data = {
             "training_enabled": self._training_enabled,
             "trainer_available": self._adapter.is_available(),
@@ -360,6 +361,7 @@ class ParametricSelfFeature(Feature):
             "recoverable_adapters": recoverable,
             "active_run": active_run,
             "training_shutdown_incomplete": self._training_shutdown_incomplete,
+            "legacy_corpus_cleanup_needed": legacy_cleanup_needed,
         }
         confirmation = (
             "Parametric-self "
@@ -374,6 +376,8 @@ class ParametricSelfFeature(Feature):
             )
         if self._training_shutdown_incomplete:
             confirmation += f" WARNING: {self._training_shutdown_incomplete}."
+        if legacy_cleanup_needed:
+            confirmation += " WARNING: legacy corpus plaintext retained; verified cleanup is required."
         if recoverable:
             confirmation += (
                 f" No adapter served; {len(recoverable)} valid candidate(s) recoverable via "
@@ -1072,6 +1076,12 @@ class ParametricSelfFeature(Feature):
                     if self._training_task is asyncio.current_task():
                         self._training_task = None
                     raise
+                except TrainingStillActive as exc:
+                    await self._mark_training_shutdown_incomplete(
+                        run_id=active_run["run_id"], reason=str(exc),
+                    )
+                    keep_guard_held = True
+                    logger.warning("parametric-self manual training remains active: %s", exc)
                 except Exception as exc:
                     active = getattr(self, "_active_run", None)
                     if active is not None and active.get("run_id") == active_run["run_id"]:
@@ -1331,6 +1341,14 @@ class ParametricSelfFeature(Feature):
         work = explicit_work or str(Path(storage_path).parent / "parametric_self")
         return db, work
 
+    def _legacy_corpus_cleanup_needed(self) -> bool:
+        """Whether unknown-owner pre-per-run corpus files must be retained."""
+        _, work_dir = self._resolve_paths()
+        if not work_dir:
+            return False
+        legacy_dir = Path(work_dir) / "corpus"
+        return any((legacy_dir / name).exists() for name in ("train.jsonl", "valid.jsonl"))
+
     async def on_post_consolidation(
         self,
         consolidation_result: Dict[str, Any],
@@ -1343,7 +1361,21 @@ class ParametricSelfFeature(Feature):
         """
         if not self._training_enabled:
             return {"trained": False, "promoted": False, "reason": "nightly training disabled for this agent"}
-        return await self._run_training_cycle(trigger="nightly")
+        # Do not run on the core sleep dispatcher task: teardown must be able to
+        # cancel this feature-owned task without cancelling the rest of sleep.
+        task = asyncio.create_task(self._run_training_cycle(trigger="nightly"))
+        await asyncio.sleep(0)  # let the owned task acquire its lifecycle fence
+        if task.done():
+            try:
+                return task.result()
+            except TrainingShutdownIncomplete as exc:
+                return {"trained": False, "promoted": False, "reason": str(exc)}
+        return {
+            "trained": False,
+            "promoted": False,
+            "started": True,
+            "reason": "nightly training started in background",
+        }
 
     async def _run_training_cycle(self, *, trigger: str) -> Dict[str, Any]:
         """Run one corpus->train->gate->promote cycle and record it in history.
@@ -1401,13 +1433,15 @@ class ParametricSelfFeature(Feature):
             ):
                 return {"trained": False, "promoted": False, "reason": "parametric-self feature is disabled"}
             return await self._run_training_cycle_locked(trigger=trigger)
-        except TrainingShutdownIncomplete as exc:
+        except (TrainingShutdownIncomplete, TrainingStillActive) as exc:
             active_run = getattr(self, "_active_run", None)
             await self._mark_training_shutdown_incomplete(
                 run_id=active_run.get("run_id") if active_run is not None else None,
                 reason=str(exc),
             )
             keep_guard_held = True
+            if isinstance(exc, TrainingStillActive):
+                return {"trained": False, "promoted": False, "reason": str(exc)}
             raise
         finally:
             if not keep_guard_held:
@@ -1460,10 +1494,14 @@ class ParametricSelfFeature(Feature):
                 prior_val_loss=self._last_val_loss,
                 adapter_id=adapter_id,
             )
+            if result.training_active:
+                raise TrainingStillActive(result.reason)
         except asyncio.CancelledError:
             # Cancellation (e.g. on_disable) marks the record interrupted; that
             # durable update is done by on_disable, not here, because awaiting
             # storage during cancellation re-raises immediately.
+            raise
+        except TrainingStillActive:
             raise
         except Exception as exc:
             await self._update_run_history(run_id, {

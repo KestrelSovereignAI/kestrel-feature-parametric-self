@@ -29,6 +29,10 @@ class TrainingShutdownIncomplete(asyncio.CancelledError):
     """Cancellation where the trainer child could not be confirmed stopped."""
 
 
+class TrainingStillActive(RuntimeError):
+    """Polling ended while a trainer child may still be reading its corpus."""
+
+
 class _TrainerProtocol(Protocol):
     """The slice of LocalMLXAdapter the cycle needs (so fakes can stand in)."""
 
@@ -57,6 +61,8 @@ class CycleResult:
     corpus_snapshot_hash: Optional[str] = None
     corpus_policy_digest: Optional[str] = None
     assertion_lineage: tuple[tuple[str, str], ...] = ()
+    training_active: bool = False
+    legacy_corpus_retained: bool = False
 
 
 async def run_nightly_cycle(
@@ -76,18 +82,20 @@ async def run_nightly_cycle(
     """Run one corpus->train->gate cycle. Promotes nothing the gate rejects."""
     work = Path(work_dir)
 
-    # One-time cleanup of the PRE-0.3.1 shared corpus location (F377/P8): older
-    # code wrote plaintext train.jsonl/valid.jsonl DIRECTLY at ``work/corpus/``
-    # (not a per-run subdir), and a host upgraded from that version still carries
-    # that plaintext user-derived corpus on disk. Do this FIRST — before the
-    # trainer-availability early return — so the lingering plaintext is removed
-    # even on hosts where the trainer is unavailable or broken (where the cycle
-    # never trains). ``_delete_corpus`` only touches ``<dir>/train.jsonl``/
-    # ``valid.jsonl``, never the new per-run ``work/corpus/<run_id>/`` subdirs.
-    _delete_corpus(str(work / "corpus"))
+    # A pre-0.3.1 host may have plaintext directly under ``work/corpus/``. Its
+    # owner/process cannot be proven after an upgrade, so do NOT delete it here:
+    # an old child could still be reading it. The feature surfaces this retained
+    # cleanup requirement; only an operator/verified process lifecycle may remove
+    # it safely.
+    legacy_corpus_retained = any(
+        (work / "corpus" / name).exists() for name in ("train.jsonl", "valid.jsonl")
+    )
 
     if not adapter.is_available():
-        return CycleResult(False, reason="trainer unavailable on this host")
+        return CycleResult(
+            False, reason="trainer unavailable on this host",
+            legacy_corpus_retained=legacy_corpus_retained,
+        )
     # Each run trains into a UNIQUE staging dir so a rejected candidate can
     # never overwrite the currently-served adapter — the served adapter is the
     # promoted staging dir of a *prior* run, which this run never touches.
@@ -144,10 +152,21 @@ async def run_nightly_cycle(
         # adapter's lifecycle responsibility (epic #1 follow-up).
         training_active = not status.state.is_terminal()
 
+        if training_active:
+            return CycleResult(
+                False,
+                reason="training still active after poll timeout; corpus retained",
+                corpus_train=stats.train,
+                corpus_valid=stats.valid,
+                training_active=True,
+                legacy_corpus_retained=legacy_corpus_retained,
+            )
+
         if status.state != TrainingState.COMPLETED:
             return CycleResult(
                 False, reason=f"training did not complete (state={status.state.value}; {status.error or ''})".strip(),
                 corpus_train=stats.train, corpus_valid=stats.valid,
+                legacy_corpus_retained=legacy_corpus_retained,
             )
 
         val_loss = parse_final_val_loss(adapter.read_training_log(status.job_id))
@@ -167,6 +186,7 @@ async def run_nightly_cycle(
             corpus_snapshot_hash=stats.snapshot_hash,
             corpus_policy_digest=stats.policy_digest,
             assertion_lineage=stats.assertion_lineage,
+            legacy_corpus_retained=legacy_corpus_retained,
         )
     except asyncio.CancelledError:
         # A task cancellation alone does NOT stop the child process.  Terminate

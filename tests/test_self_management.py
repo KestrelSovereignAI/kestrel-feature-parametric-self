@@ -508,6 +508,74 @@ async def test_disable_fences_sleep_cycle_waiting_to_launch():
     assert f._cycle_in_flight is False
 
 
+async def test_poll_timeout_keeps_manual_lifecycle_blocked_until_confirmed_stop():
+    """A returned poll timeout is nonterminal while the trainer may still write."""
+    from kestrel_feature_parametric_self.cycle import TrainingStillActive
+
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+
+    async def _timed_out_cycle(*, trigger):
+        raise TrainingStillActive("training still active after poll timeout; corpus retained")
+
+    f._run_training_cycle_locked = _timed_out_cycle
+    started = await f.parametric_self_train_now()
+    assert started.status == ToolResultStatus.OK
+    await f._training_task
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert f._active_run["state"] == "shutdown_incomplete"
+    assert "still active" in f._training_shutdown_incomplete
+    blocked = await f.parametric_self_train_now()
+    assert blocked.status == ToolResultStatus.ERROR
+    assert "still active" in (blocked.error or "")
+
+    # No affirmative bulk capability means disable must preserve the block.
+    f._adapter.cancel_all = None
+    await f.on_disable()
+    assert f._cycle_in_flight is True
+    assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+
+
+async def test_disable_cancels_owned_nightly_task_not_sleep_owner():
+    """The sleep dispatcher survives while its feature-owned nightly child stops."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._training_enabled = True
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        started.set()
+        await asyncio.Event().wait()
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    f._run_training_cycle_locked = _slow_cycle
+    f._adapter.cancel_all = _confirmed_cancel_all
+    owner = asyncio.current_task()
+    outcome = await f.on_post_consolidation({"episodes_created": 1})
+    assert outcome["started"] is True
+    child = f._cycle_task
+    assert child is not None and child is not owner
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await f.on_disable()
+    assert not owner.cancelled()
+    with pytest.raises(asyncio.CancelledError):
+        await child
+
+
+async def test_status_surfaces_legacy_corpus_cleanup_requirement(tmp_path):
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    legacy = tmp_path / "parametric_self" / "corpus"
+    legacy.mkdir(parents=True)
+    (legacy / "train.jsonl").write_text('{"text":"legacy"}\n')
+
+    status = await f.parametric_self_status()
+    assert status.data["legacy_corpus_cleanup_needed"] is True
+    assert "legacy corpus plaintext retained" in status.confirmation
+
+
 async def test_train_now_cancellation_during_history_reservation_recovers():
     """Cancelling the command while its run record is awaited releases all state."""
     f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
