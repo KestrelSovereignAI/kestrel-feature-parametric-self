@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -491,23 +492,35 @@ class ParametricSelfFeature(Feature):
         return pairs
 
     @staticmethod
-    def _checkpoint_signature(checkpoint: Any) -> Optional[tuple[int, Optional[str]]]:
+    def _checkpoint_signature(checkpoint: Any) -> Optional[tuple[str, int, Optional[str]]]:
         """Return the public checkpoint identity in the manifest's shape."""
+        tenant_id = getattr(checkpoint, "tenant_id", None)
         generation = getattr(checkpoint, "generation", None)
         event_id = getattr(checkpoint, "latest_event_id", getattr(checkpoint, "event_id", None))
-        if not isinstance(generation, int) or not isinstance(event_id, (str, type(None))):
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(generation, int)
+            or not isinstance(event_id, (str, type(None)))
+        ):
             return None
-        return generation, event_id
+        return tenant_id, generation, event_id
 
     @staticmethod
-    def _manifest_checkpoint_signature(manifest: Dict[str, Any]) -> Optional[tuple[int, Optional[str]]]:
+    def _manifest_checkpoint_signature(manifest: Dict[str, Any]) -> Optional[tuple[str, int, Optional[str]]]:
         checkpoint = manifest.get("semantic_checkpoint")
         if not isinstance(checkpoint, dict):
             return None
+        tenant_id = checkpoint.get("tenant_id")
         generation, event_id = checkpoint.get("generation"), checkpoint.get("event_id")
-        if not isinstance(generation, int) or not isinstance(event_id, (str, type(None))):
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(generation, int)
+            or not isinstance(event_id, (str, type(None)))
+        ):
             return None
-        return generation, event_id
+        return tenant_id, generation, event_id
 
     def _snapshot_pin_problem(
         self,
@@ -531,7 +544,7 @@ class ParametricSelfFeature(Feature):
         if (
             not isinstance(expected_policy, str)
             or not isinstance(expected_hash, str)
-            or not isinstance(expected_capabilities, dict)
+            or not isinstance(expected_capabilities, Mapping)
             or not all(isinstance(key, str) and isinstance(value, str)
                        for key, value in expected_capabilities.items())
             or expected_checkpoint is None
@@ -544,12 +557,16 @@ class ParametricSelfFeature(Feature):
         if getattr(getattr(snapshot, "policy", None), "digest", None) != expected_policy:
             return "governed corpus policy evidence mismatch; rebuild required"
         capabilities = getattr(snapshot, "capability_versions", None)
-        if not isinstance(capabilities, dict) or dict(capabilities) != expected_capabilities:
+        if not isinstance(capabilities, Mapping) or dict(capabilities) != dict(expected_capabilities):
             return "governed semantic capability pins changed; rebuild required"
 
         checkpoint = self._checkpoint_signature(getattr(snapshot, "checkpoint", None))
         snapshot_hash = getattr(snapshot, "snapshot_hash", None)
-        if checkpoint is None or not isinstance(snapshot_hash, str):
+        if (
+            checkpoint is None
+            or getattr(snapshot, "tenant_id", None) != expected_checkpoint[0]
+            or not isinstance(snapshot_hash, str)
+        ):
             return "governed corpus snapshot evidence is malformed"
         if require_exact_snapshot:
             if checkpoint != expected_checkpoint or snapshot_hash != expected_hash:
@@ -572,6 +589,7 @@ class ParametricSelfFeature(Feature):
             expected_checkpoint is None
             or since_checkpoint != expected_checkpoint
             or checkpoint is None
+            or checkpoint[0] != expected_checkpoint[0]
             or not isinstance(getattr(delta, "snapshot_hash", None), str)
             or getattr(observability, "policy_digest", None) != expected_policy
         ):

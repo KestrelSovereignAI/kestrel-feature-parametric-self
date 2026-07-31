@@ -24,7 +24,8 @@ def _snapshot():
             assertion=assertion, content_hash="sha256:cycle", source_occurrences=(),
             decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
         ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
-        checkpoint=SimpleNamespace(generation=1, latest_event_id="event:1"),
+        tenant_id="tenant:test",
+        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
         capability_versions={"semantic_maintenance": "1"},
     )
 
@@ -116,7 +117,8 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
         governed_snapshot=SimpleNamespace(
             verified=True, examples=(), snapshot_hash="sha256:empty",
             policy=SimpleNamespace(digest="sha256:policy"),
-            checkpoint=SimpleNamespace(generation=1, latest_event_id="event:1"),
+            tenant_id="tenant:test",
+            checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
             capability_versions={"semantic_maintenance": "1"},
         ),
         adapter=_FakeAdapter(), gate=FidelityGate(),

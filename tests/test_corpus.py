@@ -30,7 +30,8 @@ def _snapshot(*, values=("she/her",), generation=7):
     return SimpleNamespace(
         verified=True, examples=tuple(examples), snapshot_hash="sha256:snapshot",
         policy=SimpleNamespace(digest="sha256:policy"),
-        checkpoint=SimpleNamespace(generation=generation, latest_event_id="event:7"),
+        tenant_id="tenant:test",
+        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=generation, latest_event_id="event:7"),
         capability_versions={"semantic_maintenance": "1"},
     )
 

@@ -28,6 +28,12 @@ uv pip install kestrel-feature-parametric-self
 The package registers `ParametricSelfFeature` through the
 `kestrel_sovereign.features` entry point group.
 
+The governed-corpus host surface is currently under development in core. Until
+the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
+this package source-pins the reviewed capability commit (`5932735a`) rather
+than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
+must replace that pin with the published capability-bearing version.
+
 ## Governed training corpus
 
 Nightly training remains disabled by default and requires an explicit

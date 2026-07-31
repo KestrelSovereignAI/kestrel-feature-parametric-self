@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +14,7 @@ from kestrel_feature_parametric_self import ParametricSelfFeature, ParametricSel
 def _snapshot(
     *, revision="revision:one", policy_digest="sha256:policy",
     capability_versions=None, generation=4, event_id="event:4", snapshot_hash=None,
+    tenant_id="tenant:test",
 ):
     assertion = SimpleNamespace(
         assertion_id="assertion:one", revision_id=revision,
@@ -28,8 +29,9 @@ def _snapshot(
             decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
         ),),
         snapshot_hash=snapshot_hash or f"sha256:snapshot:{revision}",
+        tenant_id=tenant_id,
         policy=SimpleNamespace(digest=policy_digest),
-        checkpoint=SimpleNamespace(generation=generation, latest_event_id=event_id),
+        checkpoint=SimpleNamespace(tenant_id=tenant_id, generation=generation, latest_event_id=event_id),
         capability_versions=capability_versions or {"semantic_maintenance": "1"},
     )
 
@@ -176,7 +178,7 @@ async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
     async def wrong_base(_snapshot_value, **_kwargs):
         return SimpleNamespace(
             tombstones=(),
-            since_checkpoint=SimpleNamespace(generation=3, latest_event_id="event:3"),
+            since_checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=3, latest_event_id="event:3"),
             checkpoint=baseline.checkpoint,
             snapshot_hash="sha256:delta",
             observability=SimpleNamespace(policy_digest="sha256:policy"),
@@ -187,6 +189,79 @@ async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
     feature._live_corpus_snapshot = baseline
     reason = await feature._verify_adapter_lineage(str(candidate))
     assert reason == "governed corpus delta evidence mismatch; adapter cannot be verified"
+
+
+async def test_delta_from_a_foreign_tenant_is_never_accepted(tmp_path):
+    baseline = _snapshot()
+    candidate = tmp_path / "candidate"
+    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
+    host = _Host(baseline)
+
+    async def foreign_tenant(_snapshot_value, **_kwargs):
+        return SimpleNamespace(
+            tombstones=(),
+            since_checkpoint=SimpleNamespace(
+                tenant_id="tenant:other", generation=4, latest_event_id="event:4",
+            ),
+            checkpoint=SimpleNamespace(
+                tenant_id="tenant:other", generation=5, latest_event_id="event:5",
+            ),
+            snapshot_hash="sha256:delta",
+            observability=SimpleNamespace(policy_digest="sha256:policy"),
+        )
+
+    host.governed_assertion_corpus_changes_since = foreign_tenant
+    feature = await _feature(host, tmp_path)
+    feature._live_corpus_snapshot = baseline
+    reason = await feature._verify_adapter_lineage(str(candidate))
+    assert reason == "governed corpus delta evidence mismatch; adapter cannot be verified"
+
+
+async def test_real_core_mappingproxy_capability_versions_are_accepted(tmp_path):
+    """The public core snapshot freezes its version map; do not reject it as non-dict."""
+    from kestrel_sovereign.knowledge.corpus import (
+        CORPUS_SCHEMA_VERSION,
+        CorpusCheckpoint,
+        GovernedCorpusObservability,
+        GovernedCorpusSnapshot,
+    )
+
+    checkpoint = CorpusCheckpoint("tenant:test", 4, "event:4")
+    snapshot = GovernedCorpusSnapshot(
+        CORPUS_SCHEMA_VERSION,
+        "tenant:test",
+        checkpoint,
+        MappingProxyType({"semantic_maintenance": "1"}),
+        SimpleNamespace(digest="sha256:policy"),
+        (),
+        "sha256:snapshot",
+        GovernedCorpusObservability(0, 0, {}, "sha256:snapshot", "sha256:policy", 4),
+    )
+    feature = await _feature(_Host(snapshot), tmp_path)
+    manifest = {
+        "policy_digest": "sha256:policy",
+        "snapshot_hash": "sha256:snapshot",
+        "semantic_checkpoint": {
+            "tenant_id": "tenant:test", "generation": 4, "event_id": "event:4",
+        },
+        "capability_versions": {"semantic_maintenance": "1"},
+    }
+    assert feature._snapshot_pin_problem(manifest, snapshot, require_exact_snapshot=True) is None
+
+
+def test_governed_core_dependency_is_source_pinned_and_exposes_its_contract():
+    """Never resolve a released pre-capability core under a compatible-looking floor."""
+    from kestrel_sovereign.knowledge import GovernedCorpusPolicy, GovernedCorpusSnapshot
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    requirements = pyproject.read_text()
+    assert "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@5932735a7db02228877985f66b9f1eb56d564f27" in requirements
+    assert "kestrel-sovereign>=0.49.5" not in requirements
+    assert GovernedCorpusPolicy is not None
+    assert GovernedCorpusSnapshot is not None
+    assert callable(getattr(AsyncStorage, "governed_assertion_corpus_snapshot", None))
+    assert callable(getattr(AsyncStorage, "governed_assertion_corpus_changes_since", None))
 
 
 async def test_explicit_policy_update_immediately_invalidates_served_adapter(tmp_path):

@@ -32,7 +32,8 @@ def _snapshot():
             assertion=assertion, content_hash="sha256:test", source_occurrences=(),
             decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
         ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
-        checkpoint=SimpleNamespace(generation=1, latest_event_id="event:1"),
+        tenant_id="tenant:test",
+        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
         capability_versions={"semantic_maintenance": "1"},
     )
 
@@ -41,7 +42,7 @@ def _write_governed_manifest(candidate):
     raw = {
         "schema_version": 1, "corpus_policy_version": "parametric-self-corpus-v1",
         "policy_digest": "sha256:policy", "snapshot_hash": "sha256:snapshot",
-        "semantic_checkpoint": {"generation": 1, "event_id": "event:1"},
+        "semantic_checkpoint": {"tenant_id": "tenant:test", "generation": 1, "event_id": "event:1"},
         "capability_versions": {"semantic_maintenance": "1"},
         "counts": {"total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1},
         "examples": [{"example_id": "example:1", "source": "governed_assertion", "split": "train", "lineage": {

@@ -233,7 +233,16 @@ def build_corpus(
     policy_digest = getattr(policy, "digest", None)
     snapshot_hash = getattr(governed_snapshot, "snapshot_hash", None)
     generation = getattr(checkpoint, "generation", None)
-    if not isinstance(policy_digest, str) or not isinstance(snapshot_hash, str) or type(generation) is not int:
+    checkpoint_tenant = getattr(checkpoint, "tenant_id", None)
+    snapshot_tenant = getattr(governed_snapshot, "tenant_id", None)
+    if (
+        not isinstance(policy_digest, str)
+        or not isinstance(snapshot_hash, str)
+        or type(generation) is not int
+        or not isinstance(checkpoint_tenant, str)
+        or not checkpoint_tenant
+        or checkpoint_tenant != snapshot_tenant
+    ):
         raise GovernedCorpusRequiredError("governed_corpus_snapshot_metadata_invalid")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -260,6 +269,7 @@ def build_corpus(
         "policy_digest": policy_digest,
         "snapshot_hash": snapshot_hash,
         "semantic_checkpoint": {
+            "tenant_id": checkpoint_tenant,
             "generation": generation,
             "event_id": getattr(checkpoint, "latest_event_id", None),
         },

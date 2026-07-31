@@ -1475,7 +1475,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "kestrel-sovereign", specifier = ">=0.49.5,<1" },
+    { name = "kestrel-sovereign", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=5932735a7db02228877985f66b9f1eb56d564f27" },
     { name = "kestrel-sovereign-sdk", specifier = ">=0.14.1,<1" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
@@ -1594,7 +1594,7 @@ all = [
 [[package]]
 name = "kestrel-sovereign"
 version = "0.49.5"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=5932735a7db02228877985f66b9f1eb56d564f27#5932735a7db02228877985f66b9f1eb56d564f27" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
@@ -1655,10 +1655,6 @@ dependencies = [
     { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "urllib3" },
     { name = "uvicorn" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/77/41/09c550a0d02fb05b36b255e2fe40ab4ce1e33c47d6fdb2e4ee9361769f2b/kestrel_sovereign-0.49.5.tar.gz", hash = "sha256:d4317ed9ffd848ab64c945f2d2560301ffbed5de522ee2f1262d65ccc49dfe72", size = 4058996, upload-time = "2026-07-31T14:22:11.611Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/74/55/9f6a0beef4c0d76816c3fe81a4ebf130de952b7ed5b2a789c93d08f515e1/kestrel_sovereign-0.49.5-py3-none-any.whl", hash = "sha256:56ca6ca8e04d431fa267ecd953af370d800909f2a9acbb04aa0991a6ebce2862", size = 4514520, upload-time = "2026-07-31T14:22:09.185Z" },
 ]
 
 [[package]]
