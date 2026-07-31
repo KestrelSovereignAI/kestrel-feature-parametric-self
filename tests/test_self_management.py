@@ -371,6 +371,79 @@ async def test_on_disable_surfaces_unconfirmed_trainer_shutdown():
     assert runs[-1]["state"] == "shutdown_incomplete"
 
 
+async def test_confirmed_bulk_shutdown_resolves_prior_incomplete_run():
+    """A later positive bulk confirmation clears the block and terminalizes history."""
+    from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
+
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _unconfirmed_cycle(*, trigger):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise TrainingShutdownIncomplete("trainer stop could not be confirmed; corpus retained")
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    f._run_training_cycle_locked = _unconfirmed_cycle
+    f._adapter.cancel_all = _confirmed_cancel_all
+    started_result = await f.parametric_self_train_now()
+    assert started_result.status == ToolResultStatus.OK
+    task = f._training_task
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await f.on_disable()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert f._training_shutdown_incomplete is None
+    assert f._cycle_in_flight is False
+    assert f._active_run is None
+    status = await f.parametric_self_status()
+    assert status.data["training_shutdown_incomplete"] is None
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+    assert "bulk trainer stop confirmed" in runs[-1]["reason"]
+
+
+async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
+    """Nightly cancellation enters the same durable safety state as train_now."""
+    from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
+
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    f._adapter.is_available = lambda: True
+
+    async def _unconfirmed_cycle(*, trigger):
+        active = await f._begin_active_run(trigger=trigger, work_dir=str(tmp_path / "work"))
+        assert active["trigger"] == "nightly"
+        raise TrainingShutdownIncomplete("trainer stop could not be confirmed; corpus retained")
+
+    f._run_training_cycle_locked = _unconfirmed_cycle
+    with pytest.raises(TrainingShutdownIncomplete):
+        await f._run_training_cycle(trigger="nightly")
+
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert f._active_run["state"] == "shutdown_incomplete"
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "shutdown_incomplete"
+    blocked = await f.parametric_self_train_now()
+    assert blocked.status == ToolResultStatus.ERROR
+    assert "shutdown incomplete" in (blocked.error or "")
+
+    # The durable marker survives feature reconstruction and remains a block.
+    restarted = ParametricSelfFeature(agent=f.agent)
+    await restarted.initialize()
+    restarted.agent.get_feature = MagicMock(return_value=restarted)
+    await restarted.post_all_features_loaded(restarted.agent)
+    assert restarted._training_shutdown_incomplete is not None
+    assert restarted._cycle_in_flight is True
+    assert (await restarted.parametric_self_status()).data["training_shutdown_incomplete"]
+
+
 async def test_train_now_cancellation_during_history_reservation_recovers():
     """Cancelling the command while its run record is awaited releases all state."""
     f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")

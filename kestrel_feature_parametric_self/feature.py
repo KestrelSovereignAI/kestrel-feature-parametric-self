@@ -1019,6 +1019,7 @@ class ParametricSelfFeature(Feature):
             # held) and clears it in finally. Errors are logged, not surfaced
             # (poll history/progress for the outcome).
             async def _runner() -> None:
+                keep_guard_held = False
                 try:
                     outcome = await self._run_training_cycle_locked(trigger="manual")
                     # The locked body owns normal full-cycle finalization.  It can
@@ -1049,16 +1050,13 @@ class ParametricSelfFeature(Feature):
                         await self._mark_training_shutdown_incomplete(
                             run_id=active_run["run_id"], reason=str(exc),
                         )
+                        keep_guard_held = True
                     else:
                         await self._interrupt_active_run(
                             run_id=active_run["run_id"], reason="run cancelled",
                         )
                     if self._training_task is asyncio.current_task():
                         self._training_task = None
-                    if incomplete:
-                        # Do not release the shared mutation guard while the
-                        # child may still be alive and writing its adapter.
-                        self._cycle_in_flight = True
                     raise
                 except Exception as exc:
                     active = getattr(self, "_active_run", None)
@@ -1071,7 +1069,7 @@ class ParametricSelfFeature(Feature):
                         self._active_run = None
                     logger.warning("parametric-self manual training run failed: %s", exc)
                 finally:
-                    if self._training_shutdown_incomplete is None:
+                    if not keep_guard_held:
                         self._cycle_in_flight = False
 
             self._training_task = asyncio.create_task(_runner())
@@ -1366,10 +1364,20 @@ class ParametricSelfFeature(Feature):
         if self._cycle_in_flight:
             return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
         self._cycle_in_flight = True
+        keep_guard_held = False
         try:
             return await self._run_training_cycle_locked(trigger=trigger)
+        except TrainingShutdownIncomplete as exc:
+            active_run = getattr(self, "_active_run", None)
+            await self._mark_training_shutdown_incomplete(
+                run_id=active_run.get("run_id") if active_run is not None else None,
+                reason=str(exc),
+            )
+            keep_guard_held = True
+            raise
         finally:
-            self._cycle_in_flight = False
+            if not keep_guard_held:
+                self._cycle_in_flight = False
 
     async def _run_training_cycle_locked(self, *, trigger: str) -> Dict[str, Any]:
         """Body of one cycle; only ever called with the in-flight guard held."""
@@ -1569,23 +1577,36 @@ class ParametricSelfFeature(Feature):
                 self._active_run = None
 
     async def _mark_training_shutdown_incomplete(
-        self, *, run_id: str, reason: str,
+        self, *, reason: str, run_id: Optional[str] = None,
     ) -> None:
         """Expose an unconfirmed child shutdown without claiming it is terminal."""
         diagnostic = f"training shutdown incomplete: {reason}"
         self._training_shutdown_incomplete = diagnostic
         active_run = getattr(self, "_active_run", None)
-        if active_run is None or active_run.get("run_id") != run_id:
+        if active_run is None:
+            return
+        resolved_run_id = run_id or active_run.get("run_id")
+        if active_run.get("run_id") != resolved_run_id:
             return
         active_run["state"] = "shutdown_incomplete"
         try:
-            await self._update_run_history(run_id, {
+            await self._update_run_history(resolved_run_id, {
                 "state": "shutdown_incomplete",
                 "timestamp": _utc_now_iso(),
                 "reason": diagnostic,
             })
         except Exception as exc:  # preserve the local safety marker regardless
             logger.warning("Failed to mark parametric-self shutdown incomplete: %s", exc)
+
+    async def _resolve_training_shutdown_incomplete(self) -> None:
+        """Clear a prior incomplete-shutdown block after bulk stop confirmation."""
+        active_run = getattr(self, "_active_run", None)
+        if active_run is not None and active_run.get("state") == "shutdown_incomplete":
+            await self._interrupt_active_run(
+                run_id=active_run["run_id"],
+                reason="run cancelled (feature disabled; bulk trainer stop confirmed)",
+            )
+        self._training_shutdown_incomplete = None
 
     # ------------------------------------------------------------------
     # Run-history store (append-only, capped) — lets the agent introspect
@@ -1811,7 +1832,10 @@ class ParametricSelfFeature(Feature):
                 # _runner started, its finally never ran and the guard would stay
                 # stuck, permanently refusing later train/rollback on re-enable.
                 self._cycle_in_flight = False
-                await self._interrupt_active_run(reason="run cancelled (feature disabled)")
+                if self._training_shutdown_incomplete is not None:
+                    await self._resolve_training_shutdown_incomplete()
+                else:
+                    await self._interrupt_active_run(reason="run cancelled (feature disabled)")
 
         hook = getattr(self, "_sleep_hook", None)
         hooks = getattr(self.agent, "sleep_hooks", None)
