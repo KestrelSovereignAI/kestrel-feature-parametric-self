@@ -8,6 +8,7 @@ import pytest
 from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 
 from kestrel_feature_parametric_self import (
+    ParametricSelfFeature,
     ParametricSelfSleepHook,
     create_parametric_self_sleep_hook,
 )
@@ -71,6 +72,42 @@ async def test_expected_local_training_noops_are_structured_sleep_skips(reason):
     assert out["success"] is True
     assert out["skipped"] is True
     assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.SKIPPED
+
+
+async def test_enabled_unsupported_trainer_skips_before_governed_policy_lookup():
+    """A real feature hook on an unsupported host must not fail for no policy."""
+    agent = MagicMock()
+    agent.is_test_instance = False
+    agent.storage = None
+    agent.storage_path = None
+    agent.parametric_self_governed_corpus_policy = None
+    feature = ParametricSelfFeature(agent=agent)
+    await feature.initialize()
+    feature._training_enabled = True
+    feature._adapter.is_available = lambda: False
+
+    out = await ParametricSelfSleepHook(feature).on_post_consolidation(agent, {})
+
+    assert out["reason"] == "trainer unavailable on this host"
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.SKIPPED
+
+
+async def test_enabled_supported_trainer_without_policy_remains_a_sleep_failure(tmp_path):
+    agent = MagicMock()
+    agent.is_test_instance = False
+    agent.storage = None
+    agent.storage_path = None
+    agent.parametric_self_work_dir = str(tmp_path / "work")
+    agent.parametric_self_governed_corpus_policy = None
+    feature = ParametricSelfFeature(agent=agent)
+    await feature.initialize()
+    feature._training_enabled = True
+    feature._adapter.is_available = lambda: True
+
+    out = await ParametricSelfSleepHook(feature).on_post_consolidation(agent, {})
+
+    assert out["reason"] == "governed corpus policy is not configured"
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
 
 
 async def test_pre_sleep_is_skipped():

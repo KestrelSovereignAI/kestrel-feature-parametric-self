@@ -730,6 +730,12 @@ class ParametricSelfFeature(Feature):
         if before_promotion:
             # The fresh snapshot is now the correct base for a subsequent delta.
             self._live_corpus_snapshot = fresh
+        else:
+            # ``_request_governed_snapshot`` caches its result for a newly
+            # built candidate. A restart/status verification may legitimately
+            # observe a newer checkpoint, which is evidence for membership but
+            # not the adapter's original delta base; never reuse it as one.
+            self._live_corpus_snapshot = None
         return None
 
     def _require_sovereign_class(self) -> Optional[ToolResult]:
@@ -1281,6 +1287,12 @@ class ParametricSelfFeature(Feature):
 
     async def _run_training_cycle_locked(self, *, trigger: str) -> Dict[str, Any]:
         """Body of one cycle; only ever called with the in-flight guard held."""
+        # An unsupported local trainer is an expected operational no-op. Check
+        # it before requesting governed data so a Linux/non-MLX sleep cycle
+        # reports SKIPPED rather than a misleading missing-policy failure. On a
+        # supported host, corpus/policy evidence remains a hard prerequisite.
+        if not self._adapter.is_available():
+            return {"trained": False, "promoted": False, "reason": "trainer unavailable on this host"}
         db_path, work_dir = self._resolve_paths()
         if not work_dir:
             return {"trained": False, "promoted": False, "reason": "could not resolve parametric-self work directory"}
