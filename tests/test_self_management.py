@@ -95,6 +95,14 @@ async def _feature(storage=None, *, is_test_instance=False, storage_path=None):
     return f
 
 
+def _stamp_adapter_receipt(feature, candidate) -> None:
+    manifest, error = feature._manifest_lineage(str(candidate))
+    assert error is None
+    receipt = feature._manifest_receipt_stamp(manifest or {})
+    assert receipt is not None
+    feature._adapter_lineage[str(candidate)] = {**receipt, "state": "candidate"}
+
+
 # ----------------------------------------------------------------------
 # View tools (ungated)
 # ----------------------------------------------------------------------
@@ -330,6 +338,8 @@ async def test_rollback_default_to_previous_promoted(tmp_path):
         _write_governed_manifest(d)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, old)
+    _stamp_adapter_receipt(f, new)
     # History records both promotions; new is currently served.
     await f._append_run_history({"promoted": True, "adapter_path": str(old), "trigger": "nightly"})
     await f._append_run_history({"promoted": True, "adapter_path": str(new), "trigger": "nightly"})
@@ -354,6 +364,7 @@ async def test_rollback_explicit_adapter_id(tmp_path, arg):
     _write_governed_manifest(target)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, target)
     f._active_adapter_path = "/some/other/served"
     # Accept both the split form ("pick99") and a leaked key=value token.
     result = await f.parametric_self_rollback(adapter_id=arg)
@@ -430,8 +441,8 @@ async def test_nightly_cycle_skips_when_manual_run_in_flight():
 # Adoption / recovery path (candidate on disk, no served pointer)
 # ----------------------------------------------------------------------
 
-async def test_adapters_marks_recoverable_when_unserved(tmp_path):
-    """A valid candidate with no served pointer is flagged recoverable."""
+async def test_adapters_leaves_untracked_candidates_inspection_only(tmp_path):
+    """A valid-looking legacy candidate is visible but cannot be served."""
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
@@ -443,12 +454,13 @@ async def test_adapters_marks_recoverable_when_unserved(tmp_path):
     result = await f.parametric_self_adapters()
     assert result.status == ToolResultStatus.OK
     by_id = {a["adapter_id"]: a for a in result.data["adapters"]}
-    assert by_id["ded33cd017d9"]["recoverable"] is True
+    assert by_id["ded33cd017d9"]["recoverable"] is False
     assert by_id["ded33cd017d9"]["served"] is False
-    assert result.data["recoverable_adapters"] == ["ded33cd017d9"]
+    assert "durable adapter lineage receipt unavailable" in by_id["ded33cd017d9"]["quarantined_reason"]
+    assert result.data["recoverable_adapters"] == []
 
 
-async def test_status_exposes_recoverable_candidates(tmp_path):
+async def test_status_keeps_untracked_candidates_non_serving(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
@@ -458,7 +470,7 @@ async def test_status_exposes_recoverable_candidates(tmp_path):
     result = await f.parametric_self_status()
     assert result.status == ToolResultStatus.OK
     assert result.data["served_adapter"] is None
-    assert result.data["recoverable_adapters"] == ["ded33cd017d9"]
+    assert result.data["recoverable_adapters"] == []
 
 
 async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
@@ -468,6 +480,7 @@ async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
     _write_governed_manifest(cands)
     storage = _FakeStorage()
     f = await _feature(storage, storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
 
     result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
     assert result.status == ToolResultStatus.OK
@@ -486,6 +499,7 @@ async def test_adopt_accepts_leaked_key_value_token(tmp_path, arg):
     (cands / "train.log").write_text("Val loss 2.688\n")
     _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
     result = await f.parametric_self_adopt(adapter_id=arg)
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(cands)
@@ -542,6 +556,7 @@ async def test_adopt_rejects_candidate_failing_fidelity_gate(tmp_path):
     (cands / "train.log").write_text("Val loss 3.500\n")  # > max_val_loss (3.0)
     _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
     result = await f.parametric_self_adopt(adapter_id="toobad")
     assert result.status == ToolResultStatus.ERROR
     assert "fidelity gate" in (result.error or "")

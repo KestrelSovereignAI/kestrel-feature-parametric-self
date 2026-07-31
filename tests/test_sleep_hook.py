@@ -55,6 +55,24 @@ async def test_governed_corpus_unavailability_is_a_visible_sleep_failure():
     assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["trainer unavailable on this host", "empty corpus — no grounded reflections to train on"],
+)
+async def test_expected_local_training_noops_are_structured_sleep_skips(reason):
+    feature = MagicMock()
+    feature.on_post_consolidation = AsyncMock(return_value={
+        "trained": False, "promoted": False, "reason": reason,
+    })
+    hook = ParametricSelfSleepHook(feature)
+
+    out = await hook.on_post_consolidation(MagicMock(), {})
+
+    assert out["success"] is True
+    assert out["skipped"] is True
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.SKIPPED
+
+
 async def test_pre_sleep_is_skipped():
     hook = ParametricSelfSleepHook(MagicMock())
     out = await hook.on_pre_sleep(MagicMock())

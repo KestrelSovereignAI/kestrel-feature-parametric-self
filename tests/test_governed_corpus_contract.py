@@ -79,6 +79,14 @@ async def _feature(host, tmp_path):
     return feature
 
 
+def _stamp(feature, candidate) -> None:
+    manifest, error = feature._manifest_lineage(str(candidate))
+    assert error is None
+    receipt = feature._manifest_receipt_stamp(manifest or {})
+    assert receipt is not None
+    feature._adapter_lineage[str(candidate)] = {**receipt, "state": "candidate"}
+
+
 async def test_unavailable_or_incomplete_host_capability_is_a_visible_skip(tmp_path):
     feature = await _feature(_Host(_snapshot(), fail_snapshot=True), tmp_path)
     outcome = await feature._run_training_cycle_locked(trigger="nightly")
@@ -107,6 +115,7 @@ async def test_tombstone_quarantines_served_adapter_and_clean_rebuild_is_eligibl
     )
     host = _Host(snapshot, tombstones=(tombstone,))
     feature = await _feature(host, tmp_path)
+    _stamp(feature, candidate)
     feature._active_adapter_path = str(candidate)
     feature._live_corpus_snapshot = snapshot
 
@@ -122,6 +131,7 @@ async def test_tombstone_quarantines_served_adapter_and_clean_rebuild_is_eligibl
     )
     clean_host = _Host(_snapshot(revision="revision:two"))
     clean_feature = await _feature(clean_host, tmp_path)
+    _stamp(clean_feature, clean_candidate)
     assert await clean_feature._verify_adapter_lineage(str(clean_candidate)) is None
 
 
@@ -137,6 +147,20 @@ async def test_adapter_without_manifest_is_never_served(tmp_path):
     assert "quarantined" in (outcome.error or "")
 
 
+async def test_untracked_candidate_with_valid_manifest_is_inspection_only_not_adoptable(tmp_path):
+    host = _Host(_snapshot())
+    feature = await _feature(host, tmp_path)
+    candidate = tmp_path / "work" / "candidates" / "untracked"
+    candidate.mkdir(parents=True)
+    (candidate / "train.log").write_text("Val loss 1.2\n")
+    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=host.snapshot, manifest_dir=str(candidate))
+
+    outcome = await feature.parametric_self_adopt("untracked")
+    assert outcome.status.value == "error"
+    assert "durable adapter lineage receipt unavailable" in (outcome.error or "")
+    assert feature._active_adapter_path is None
+
+
 async def test_same_lineage_with_changed_policy_or_capability_pins_is_quarantined(tmp_path):
     baseline = _snapshot()
     candidate = tmp_path / "candidate"
@@ -144,6 +168,7 @@ async def test_same_lineage_with_changed_policy_or_capability_pins_is_quarantine
 
     policy_host = _Host(baseline)
     policy_feature = await _feature(policy_host, tmp_path)
+    _stamp(policy_feature, candidate)
     policy_feature._live_corpus_snapshot = baseline
     policy_feature.agent.parametric_self_governed_corpus_policy = SimpleNamespace(digest="sha256:new-policy")
     reason = await policy_feature._verify_adapter_lineage(str(candidate))
@@ -152,6 +177,7 @@ async def test_same_lineage_with_changed_policy_or_capability_pins_is_quarantine
 
     changed_pins = _snapshot(capability_versions={"semantic_maintenance": "2"})
     pin_feature = await _feature(_Host(changed_pins), tmp_path)
+    _stamp(pin_feature, candidate)
     pin_feature._live_corpus_snapshot = changed_pins
     reason = await pin_feature._verify_adapter_lineage(str(candidate))
     assert reason == "governed semantic capability pins changed; rebuild required"
@@ -164,6 +190,7 @@ async def test_same_checkpoint_with_changed_snapshot_receipt_is_quarantined(tmp_
 
     altered = _snapshot(snapshot_hash="sha256:other-receipt")
     feature = await _feature(_Host(altered), tmp_path)
+    _stamp(feature, candidate)
     feature._live_corpus_snapshot = altered
     reason = await feature._verify_adapter_lineage(str(candidate))
     assert reason == "governed corpus snapshot receipt changed; rebuild required"
@@ -203,6 +230,8 @@ async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
     candidate = tmp_path / "candidate"
     build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
     host = _Host(baseline)
+    feature = await _feature(host, tmp_path)
+    _stamp(feature, candidate)
 
     async def wrong_base(_snapshot_value, **_kwargs):
         return SimpleNamespace(
@@ -214,7 +243,6 @@ async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
         )
 
     host.governed_assertion_corpus_changes_since = wrong_base
-    feature = await _feature(host, tmp_path)
     feature._live_corpus_snapshot = baseline
     reason = await feature._verify_adapter_lineage(str(candidate))
     assert reason == "governed corpus delta evidence mismatch; adapter cannot be verified"
@@ -225,6 +253,8 @@ async def test_delta_from_a_foreign_tenant_is_never_accepted(tmp_path):
     candidate = tmp_path / "candidate"
     build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
     host = _Host(baseline)
+    feature = await _feature(host, tmp_path)
+    _stamp(feature, candidate)
 
     async def foreign_tenant(_snapshot_value, **_kwargs):
         return SimpleNamespace(
@@ -240,7 +270,6 @@ async def test_delta_from_a_foreign_tenant_is_never_accepted(tmp_path):
         )
 
     host.governed_assertion_corpus_changes_since = foreign_tenant
-    feature = await _feature(host, tmp_path)
     feature._live_corpus_snapshot = baseline
     reason = await feature._verify_adapter_lineage(str(candidate))
     assert reason == "governed corpus delta evidence mismatch; adapter cannot be verified"
@@ -324,9 +353,31 @@ async def test_restart_quarantines_missing_or_stale_manifest_before_hook_registr
     stale_host = _Host(_snapshot(revision="revision:two", generation=5, event_id="event:5"))
     first = await _feature(stale_host, tmp_path)
     first._active_adapter_path = str(candidate)
+    _stamp(first, candidate)
     await first._persist_config()
     restarted = await _feature(stale_host, tmp_path)
     restarted.agent.get_feature = MagicMock(return_value=restarted)
     await restarted.post_all_features_loaded(restarted.agent)
     assert restarted._active_adapter_path is None
     assert "lineage no longer current" in restarted._quarantined_adapters[str(candidate)]
+
+
+async def test_restart_quarantines_when_persisted_adapter_receipt_is_lost(tmp_path):
+    snapshot = _snapshot()
+    candidate = tmp_path / "candidate"
+    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=snapshot, manifest_dir=str(candidate))
+    host = _Host(snapshot)
+    first = await _feature(host, tmp_path)
+    _stamp(first, candidate)
+    first._active_adapter_path = str(candidate)
+    await first._persist_config()
+    # Simulate a partial persistence loss while the adapter directory remains.
+    host.nodes[first._config_node_id()].properties["config"]["adapter_lineage"] = {}
+
+    restarted = await _feature(host, tmp_path)
+    restarted.agent.get_feature = MagicMock(return_value=restarted)
+    await restarted.post_all_features_loaded(restarted.agent)
+    assert restarted._active_adapter_path is None
+    assert restarted._quarantined_adapters[str(candidate)] == (
+        "durable adapter lineage receipt unavailable; rebuild required"
+    )

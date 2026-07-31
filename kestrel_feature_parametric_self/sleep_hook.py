@@ -62,7 +62,8 @@ class ParametricSelfSleepHook:
             outcome.update(success=True, skipped=False)
         elif reason.startswith((
             "nightly training disabled", "training disabled", "training skipped",
-            "another training run",
+            "another training run", "trainer unavailable on this host",
+            "empty corpus",
         )):
             # Expected operational no-ops stay visible without poisoning the
             # sleep dependency graph.

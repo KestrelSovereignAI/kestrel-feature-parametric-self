@@ -536,11 +536,12 @@ class ParametricSelfFeature(Feature):
     def _persisted_receipt_problem(self, path: str, manifest: Dict[str, Any]) -> Optional[str]:
         """Reject a valid-looking manifest that is not the adapter's receipt."""
         persisted = self._adapter_lineage.get(path)
-        # A candidate not created by this feature has no durable training stamp
-        # to compare. It is still subject to all manifest + host lineage gates;
-        # once this feature records a stamp, every field is mandatory.
-        if persisted is None:
-            return None
+        # A manifest validates only itself.  Serving an untracked candidate
+        # would let arbitrary old weights be paired with a freshly valid
+        # manifest, so legacy/untracked artifacts are inspection-only until a
+        # new governed training run creates their durable receipt.
+        if not isinstance(persisted, dict):
+            return "durable adapter lineage receipt unavailable; rebuild required"
         receipt = self._manifest_receipt_stamp(manifest)
         if receipt is None:
             return "candidate manifest governed evidence is malformed"
@@ -786,6 +787,10 @@ class ParametricSelfFeature(Feature):
                         val_loss = None
                 in_progress = active_id is not None and d.name == active_id
                 manifest, manifest_problem = self._manifest_lineage(str(d))
+                receipt_problem = (
+                    self._persisted_receipt_problem(str(d), manifest)
+                    if manifest is not None else None
+                )
                 lineage_state = self._adapter_lineage.get(str(d), {}).get(
                     "state", "candidate" if manifest is not None else "untracked"
                 )
@@ -799,9 +804,10 @@ class ParametricSelfFeature(Feature):
                     "recoverable": (
                         served is None and val_loss is not None and not in_progress
                         and manifest is not None and not quarantined_reason
+                        and receipt_problem is None
                     ),
                     "lineage_state": lineage_state,
-                    "quarantined_reason": quarantined_reason or manifest_problem,
+                    "quarantined_reason": quarantined_reason or manifest_problem or receipt_problem,
                 })
         return adapters
 
