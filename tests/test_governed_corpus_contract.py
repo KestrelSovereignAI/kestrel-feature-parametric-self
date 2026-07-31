@@ -169,6 +169,35 @@ async def test_same_checkpoint_with_changed_snapshot_receipt_is_quarantined(tmp_
     assert reason == "governed corpus snapshot receipt changed; rebuild required"
 
 
+async def test_rehashed_replacement_manifest_cannot_relabel_existing_adapter_weights(tmp_path):
+    """The durable receipt, not a self-consistent replacement manifest, binds weights."""
+    trained_snapshot = _snapshot(revision="revision:one")
+    candidate = tmp_path / "candidate"
+    build_corpus(None, str(tmp_path / "corpus-old"), governed_snapshot=trained_snapshot, manifest_dir=str(candidate))
+    host = _Host(_snapshot(revision="revision:two", generation=5, event_id="event:5"))
+    feature = await _feature(host, tmp_path)
+    original_manifest, error = feature._manifest_lineage(str(candidate))
+    assert error is None
+    feature._adapter_lineage[str(candidate)] = {
+        **(feature._manifest_receipt_stamp(original_manifest or {}) or {}),
+        "state": "served",
+    }
+    feature._active_adapter_path = str(candidate)
+
+    replacement = tmp_path / "replacement"
+    build_corpus(
+        None, str(tmp_path / "corpus-new"), governed_snapshot=host.snapshot,
+        manifest_dir=str(replacement),
+    )
+    target = candidate / "corpus_manifest.json"
+    target.chmod(0o644)
+    target.write_text((replacement / "corpus_manifest.json").read_text())
+
+    reason = await feature._verify_adapter_lineage(str(candidate))
+    assert reason == "persisted adapter lineage receipt mismatch; rebuild required"
+    assert feature._active_adapter_path is None
+
+
 async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
     baseline = _snapshot()
     candidate = tmp_path / "candidate"

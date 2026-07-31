@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 
 from kestrel_feature_parametric_self import (
     ParametricSelfSleepHook,
@@ -21,6 +22,8 @@ async def test_wrapper_delegates_to_feature():
 
     feature.on_post_consolidation.assert_awaited_once_with({"episodes_created": 2})
     assert out["promoted"] is True
+    assert out["success"] is True
+    assert out["skipped"] is False
 
 
 async def test_wrapper_swallows_training_errors():
@@ -32,12 +35,31 @@ async def test_wrapper_swallows_training_errors():
 
     assert out["trained"] is False
     assert "boom" in out["reason"]
+    assert out["success"] is False
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
+
+
+async def test_governed_corpus_unavailability_is_a_visible_sleep_failure():
+    feature = MagicMock()
+    feature.on_post_consolidation = AsyncMock(return_value={
+        "trained": False,
+        "promoted": False,
+        "reason": "governed corpus unavailable or semantic maintenance incomplete",
+    })
+    hook = ParametricSelfSleepHook(feature)
+
+    out = await hook.on_post_consolidation(MagicMock(), {})
+
+    assert out["success"] is False
+    assert out["skipped"] is False
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
 
 
 async def test_pre_sleep_is_skipped():
     hook = ParametricSelfSleepHook(MagicMock())
     out = await hook.on_pre_sleep(MagicMock())
     assert out["skipped"] is True
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.SKIPPED
 
 
 def test_factory_returns_none_when_feature_absent():

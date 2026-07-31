@@ -467,6 +467,10 @@ class ParametricSelfFeature(Feature):
             actual = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             if actual != expected:
                 return None, "candidate manifest hash mismatch"
+            # Keep the verified receipt separate from the on-disk schema.  It
+            # is compared with the durable feature-side stamp before this
+            # manifest can authorize an existing adapter.
+            raw["_verified_manifest_hash"] = expected
             return raw, None
         except Exception:
             return None, "candidate manifest unavailable"
@@ -490,6 +494,60 @@ class ParametricSelfFeature(Feature):
             if isinstance(assertion_id, str) and isinstance(revision_id, str):
                 pairs.add((assertion_id, revision_id))
         return pairs
+
+    @classmethod
+    def _manifest_receipt_stamp(cls, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return the immutable, content-free receipt persisted with an adapter.
+
+        The manifest's self-hash detects accidental corruption, but cannot
+        distinguish a replaced, correctly rehashed manifest from the one that
+        trained the adapter.  The feature graph stores this independent stamp
+        and the verifier compares it before accepting the manifest as lineage.
+        """
+        checkpoint = manifest.get("semantic_checkpoint")
+        capabilities = manifest.get("capability_versions")
+        manifest_hash = manifest.get("_verified_manifest_hash")
+        if (
+            not isinstance(manifest_hash, str)
+            or not isinstance(manifest.get("snapshot_hash"), str)
+            or not isinstance(manifest.get("policy_digest"), str)
+            or not isinstance(checkpoint, Mapping)
+            or not isinstance(capabilities, Mapping)
+        ):
+            return None
+        checkpoint_signature = cls._manifest_checkpoint_signature(manifest)
+        if checkpoint_signature is None or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in capabilities.items()
+        ):
+            return None
+        return {
+            "manifest_hash": manifest_hash,
+            "snapshot_hash": manifest["snapshot_hash"],
+            "policy_digest": manifest["policy_digest"],
+            "semantic_checkpoint": {
+                "tenant_id": checkpoint_signature[0],
+                "generation": checkpoint_signature[1],
+                "event_id": checkpoint_signature[2],
+            },
+            "capability_versions": dict(sorted(capabilities.items())),
+        }
+
+    def _persisted_receipt_problem(self, path: str, manifest: Dict[str, Any]) -> Optional[str]:
+        """Reject a valid-looking manifest that is not the adapter's receipt."""
+        persisted = self._adapter_lineage.get(path)
+        # A candidate not created by this feature has no durable training stamp
+        # to compare. It is still subject to all manifest + host lineage gates;
+        # once this feature records a stamp, every field is mandatory.
+        if persisted is None:
+            return None
+        receipt = self._manifest_receipt_stamp(manifest)
+        if receipt is None:
+            return "candidate manifest governed evidence is malformed"
+        for field, expected in receipt.items():
+            if persisted.get(field) != expected:
+                return "persisted adapter lineage receipt mismatch; rebuild required"
+        return None
 
     @staticmethod
     def _checkpoint_signature(checkpoint: Any) -> Optional[tuple[str, int, Optional[str]]]:
@@ -602,6 +660,10 @@ class ParametricSelfFeature(Feature):
         if manifest_error:
             await self._quarantine_adapter(path, manifest_error)
             return manifest_error
+        persisted_problem = self._persisted_receipt_problem(path, manifest or {})
+        if persisted_problem:
+            await self._quarantine_adapter(path, persisted_problem)
+            return persisted_problem
         pairs = self._manifest_assertion_pairs(manifest or {})
         snapshot = self._live_corpus_snapshot
         storage = getattr(self.agent, "storage", None)
@@ -1264,6 +1326,8 @@ class ParametricSelfFeature(Feature):
             self._active_run = None
             raise
 
+        manifest, manifest_error = self._manifest_lineage(adapter_path)
+        receipt = self._manifest_receipt_stamp(manifest or {}) if manifest_error is None else None
         candidate_lineage = {
             "manifest_hash": result.corpus_manifest_hash,
             "manifest_path": result.corpus_manifest_path,
@@ -1274,15 +1338,20 @@ class ParametricSelfFeature(Feature):
             "assertion_lineage": [list(pair) for pair in result.assertion_lineage],
             "state": "candidate",
         }
-        if result.corpus_manifest_hash:
+        if receipt is not None and result.corpus_manifest_hash == receipt["manifest_hash"]:
+            candidate_lineage.update(receipt)
             self._adapter_lineage[adapter_path] = candidate_lineage
 
-        if result.promoted and not result.corpus_manifest_hash:
+        if result.promoted and receipt is None:
             # A promoted adapter without the immutable corpus receipt is never
             # a valid served artifact, even if a trainer reports success.
             result.promoted = False
             result.promoted_adapter_path = None
             result.reason = "candidate missing governed corpus manifest"
+        elif result.promoted and result.corpus_manifest_hash != receipt["manifest_hash"]:
+            result.promoted = False
+            result.promoted_adapter_path = None
+            result.reason = "candidate manifest receipt does not match training result"
 
         if result.promoted and result.promoted_adapter_path:
             lifecycle_problem = await self._verify_adapter_lineage(
@@ -1300,7 +1369,7 @@ class ParametricSelfFeature(Feature):
             # Persist the new served adapter + its val loss so the pointer and
             # the regression baseline survive a restart.
             await self._persist_config()
-        elif result.corpus_manifest_hash:
+        elif receipt is not None:
             # Candidate lineage is durable even when fidelity rejects it; an
             # operator can inspect exactly why it must not silently be served.
             await self._persist_config()

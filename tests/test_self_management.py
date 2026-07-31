@@ -655,10 +655,22 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
         runs = await f._load_run_history()
         seen_states.append(runs[-1]["state"])  # in_progress while running
         from kestrel_feature_parametric_self.cycle import CycleResult
+        from kestrel_feature_parametric_self.corpus import build_corpus
+        candidate = kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"]
+        stats = build_corpus(
+            kwargs["db_path"], kwargs["work_dir"] + "/corpus",
+            governed_snapshot=kwargs["governed_snapshot"], manifest_dir=candidate,
+        )
         return CycleResult(
             trained=True, promoted=True, reason="ok", val_loss=1.2,
-            promoted_adapter_path=kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"],
-            corpus_train=5, corpus_manifest_hash="sha256:fake",
+            promoted_adapter_path=candidate,
+            corpus_train=5, corpus_manifest_path=stats.manifest_path,
+            corpus_manifest_hash=stats.manifest_hash,
+            semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
+            semantic_checkpoint_id=stats.semantic_checkpoint_id,
+            corpus_snapshot_hash=stats.snapshot_hash,
+            corpus_policy_digest=stats.policy_digest,
+            assertion_lineage=stats.assertion_lineage,
         )
 
     orig = feat_mod.run_nightly_cycle
