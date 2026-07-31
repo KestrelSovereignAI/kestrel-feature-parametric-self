@@ -612,17 +612,20 @@ async def test_disable_fences_sleep_cycle_waiting_to_launch():
     assert f._cycle_in_flight is False
 
 
-async def test_poll_timeout_keeps_manual_lifecycle_blocked_until_confirmed_stop():
+async def test_poll_timeout_keeps_manual_lifecycle_blocked_until_confirmed_stop(tmp_path):
     """A returned poll timeout is nonterminal while the trainer may still write."""
     from kestrel_feature_parametric_self.cycle import TrainingStillActive
 
-    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     f._adapter.is_available = lambda: True
+    retained = tmp_path / "parametric_self" / "corpus" / "still-live"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
 
     async def _timed_out_cycle(*, trigger):
         raise TrainingStillActive(
             "training still active after poll timeout; corpus retained",
-            corpus_path="/tmp/parametric-self-test-corpus",
+            corpus_path=str(retained),
         )
 
     f._run_training_cycle_locked = _timed_out_cycle
@@ -642,6 +645,20 @@ async def test_poll_timeout_keeps_manual_lifecycle_blocked_until_confirmed_stop(
     await f.on_disable()
     assert f._cycle_in_flight is True
     assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+    assert (retained / "train.jsonl").exists()
+
+    # This is a same-process stop failure, so an operator-looking string cannot
+    # bypass the adapter-specific stop proof or remove corpus a child may read.
+    refused = await f.parametric_self_recover_shutdown(
+        confirmed_process_absent=True,
+        evidence="ps check at 2026-07-31 showed no prior trainer process",
+    )
+    assert refused.status == ToolResultStatus.ERROR
+    assert "only for an incomplete shutdown restored" in (refused.error or "")
+    assert f._training_shutdown_incomplete is not None
+    assert f._cycle_in_flight is True
+    assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+    assert (retained / "train.jsonl").exists()
 
 
 async def test_disable_cancels_owned_nightly_task_not_sleep_owner():

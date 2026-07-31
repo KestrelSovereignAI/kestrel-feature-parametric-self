@@ -1182,6 +1182,13 @@ class ParametricSelfFeature(Feature):
             return gate
         if self._training_shutdown_incomplete is None:
             return ToolResult.failed("No parametric-self incomplete-shutdown recovery is pending.")
+        if not self._shutdown_recovery_requires_external_confirmation:
+            return ToolResult.failed(
+                "This recovery command is only for an incomplete shutdown restored "
+                "after process restart. This feature instance still has adapter-owned "
+                "shutdown provenance; retry disable so the adapter can affirmatively "
+                "confirm the trainer stopped."
+            )
         if not _as_bool(confirmed_process_absent):
             return ToolResult.failed(
                 "Recovery is blocked. First verify every prior trainer process is absent, "
