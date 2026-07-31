@@ -53,6 +53,14 @@ class _Job:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class CancelAllResult:
+    """Bulk shutdown outcome kept distinct from a count of stopped children."""
+
+    cancelled: int
+    all_stopped: bool
+
+
 def _mlx_available() -> bool:
     """True only on Apple Silicon with a usable MLX runtime.
 
@@ -192,21 +200,26 @@ class LocalMLXAdapter:
             job.state = TrainingState.CANCELLED
         return stopped
 
-    async def cancel_all(self) -> int:
+    async def cancel_all(self) -> CancelAllResult:
         """Terminate every still-running training subprocess.
 
         Used on feature disable/shutdown: cancelling the asyncio polling task
         does not stop the spawned ``mlx_lm.lora`` child, which would otherwise
-        keep running GPU-heavy and writing into the adapter dir. Returns the
-        number of live jobs terminated and confirmed stopped.
+        keep running GPU-heavy and writing into the adapter dir. Returns an
+        explicit all-targets-stopped confirmation plus the count of live jobs
+        terminated. ``cancelled=0, all_stopped=True`` is the separate no-live-
+        jobs case; a count alone is never proof about a specific child.
         """
         cancelled = 0
+        all_stopped = True
         for job in self._jobs.values():
             if job.process is not None and job.process.poll() is None:
                 if await self._terminate_and_wait(job.process):
                     job.state = TrainingState.CANCELLED
                     cancelled += 1
-        return cancelled
+                else:
+                    all_stopped = False
+        return CancelAllResult(cancelled=cancelled, all_stopped=all_stopped)
 
     @staticmethod
     async def _terminate_and_wait(process) -> bool:

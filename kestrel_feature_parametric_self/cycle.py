@@ -32,7 +32,7 @@ class _TrainerProtocol(Protocol):
     async def start_training(self, agent_id: str, config: TextLoRAConfig) -> TrainingStatus: ...
     async def get_status(self, job_id: str) -> TrainingStatus: ...
     def read_training_log(self, job_id: str) -> str: ...
-    async def cancel_all(self) -> int: ...
+    async def cancel(self, job_id: str) -> bool: ...
 
 
 @dataclass
@@ -169,16 +169,19 @@ async def run_nightly_cycle(
         # and wait for the trainer before allowing finally to remove plaintext
         # corpus input; if the adapter cannot provide that confirmation, preserve
         # the corpus rather than deleting files a live child may still be reading.
-        cancel_all = getattr(adapter, "cancel_all", None)
-        if training_active and callable(cancel_all):
+        # ``cancel(job_id)`` returns an explicit confirmation for THIS cycle's
+        # child. A bulk count (including zero) cannot prove that this particular
+        # process stopped, so it is deliberately not accepted as deletion proof.
+        cancel = getattr(adapter, "cancel", None)
+        if training_active and callable(cancel):
             try:
-                await cancel_all()
+                stopped = await cancel(status.job_id)
             except Exception:
                 # F377 safety boundary: a failed termination attempt means the
                 # corpus remains available to a potentially live child.
                 pass
             else:
-                training_active = False
+                training_active = not bool(stopped)
         raise
     finally:
         # The corpus is transient training INPUT derived from user-authored

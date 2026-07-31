@@ -300,7 +300,7 @@ async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_pa
         async def get_status(self, job_id):
             await asyncio.Event().wait()
 
-        async def cancel_all(self):
+        async def cancel(self, job_id):
             assert self.corpus is not None
             assert (self.corpus / "train.jsonl").exists()
             self.stopped = True
@@ -334,8 +334,8 @@ async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_pa
     assert not (corpus / "train.jsonl").exists()
 
 
-async def test_cycle_cancellation_keeps_corpus_without_stop_confirmation(tmp_path):
-    """A cancellation without a child-stop capability retains the live input."""
+async def test_cycle_cancellation_keeps_corpus_when_live_child_wont_confirm_stop(tmp_path):
+    """A failed child-stop confirmation retains the live input."""
     db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
     work = tmp_path / "work"
 
@@ -350,6 +350,9 @@ async def test_cycle_cancellation_keeps_corpus_without_stop_confirmation(tmp_pat
 
         async def get_status(self, job_id):
             await asyncio.Event().wait()
+
+        async def cancel(self, job_id):
+            return False
 
     adapter = _UnstoppableChild()
     task = asyncio.create_task(run_nightly_cycle(
