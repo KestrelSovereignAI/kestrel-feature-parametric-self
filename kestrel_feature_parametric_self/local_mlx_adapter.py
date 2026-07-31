@@ -20,6 +20,7 @@ MLX is imported lazily and only used on Apple Silicon; on any other platform
 
 from __future__ import annotations
 
+import asyncio
 import platform
 import sys
 import time
@@ -186,10 +187,10 @@ class LocalMLXAdapter:
         job = self._jobs.get(job_id)
         if job is None or job.process is None:
             return False
-        if job.process.poll() is None:
-            job.process.terminate()
-        job.state = TrainingState.CANCELLED
-        return True
+        stopped = await self._terminate_and_wait(job.process)
+        if stopped:
+            job.state = TrainingState.CANCELLED
+        return stopped
 
     async def cancel_all(self) -> int:
         """Terminate every still-running training subprocess.
@@ -197,15 +198,34 @@ class LocalMLXAdapter:
         Used on feature disable/shutdown: cancelling the asyncio polling task
         does not stop the spawned ``mlx_lm.lora`` child, which would otherwise
         keep running GPU-heavy and writing into the adapter dir. Returns the
-        number of live jobs terminated.
+        number of live jobs terminated and confirmed stopped.
         """
         cancelled = 0
         for job in self._jobs.values():
             if job.process is not None and job.process.poll() is None:
-                job.process.terminate()
-                job.state = TrainingState.CANCELLED
-                cancelled += 1
+                if await self._terminate_and_wait(job.process):
+                    job.state = TrainingState.CANCELLED
+                    cancelled += 1
         return cancelled
+
+    @staticmethod
+    async def _terminate_and_wait(process) -> bool:
+        """Terminate a child and confirm it exited before callers drop inputs."""
+        if process.poll() is not None:
+            return True
+        try:
+            process.terminate()
+            await asyncio.to_thread(process.wait, 5)
+        except Exception:
+            # A stubborn child gets one escalation.  If it still cannot be
+            # confirmed dead, callers retain its corpus instead of racing it.
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    await asyncio.to_thread(process.wait, 5)
+            except Exception:
+                return False
+        return process.poll() is not None
 
     async def cleanup(self, job_id: str) -> None:
         self._jobs.pop(job_id, None)

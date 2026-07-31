@@ -87,14 +87,14 @@ def test_is_available_never_raises(monkeypatch):
     assert isinstance(adapter.is_available(), bool)
 
 
-async def test_cancel_all_terminates_live_jobs():
-    """cancel_all terminates running subprocesses and skips already-exited ones."""
+async def test_cancel_all_terminates_and_confirms_live_jobs():
+    """cancel_all confirms a child exited before callers may delete its inputs."""
     from unittest.mock import MagicMock
     from kestrel_feature_parametric_self.local_mlx_adapter import _Job
     from kestrel_sovereign.features.training.types import TrainingState
 
     adapter = LocalMLXAdapter()
-    live = MagicMock(); live.poll.return_value = None        # still running
+    live = MagicMock(); live.poll.side_effect = [None, None, 0]
     done = MagicMock(); done.poll.return_value = 0           # already exited
     adapter._jobs = {
         "a": _Job("a", "agent", TextLoRAConfig(), TrainingState.TRAINING, 0.0, process=live),

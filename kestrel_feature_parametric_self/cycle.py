@@ -32,6 +32,7 @@ class _TrainerProtocol(Protocol):
     async def start_training(self, agent_id: str, config: TextLoRAConfig) -> TrainingStatus: ...
     async def get_status(self, job_id: str) -> TrainingStatus: ...
     def read_training_log(self, job_id: str) -> str: ...
+    async def cancel_all(self) -> int: ...
 
 
 @dataclass
@@ -164,10 +165,20 @@ async def run_nightly_cycle(
             assertion_lineage=stats.assertion_lineage,
         )
     except asyncio.CancelledError:
-        # Cancellation (on_disable / shutdown) tears the trainer subprocess down
-        # via ``cancel_all``, so the corpus is no longer needed — allow the
-        # finally to remove it rather than leaving plaintext behind (codex P2).
-        training_active = False
+        # A task cancellation alone does NOT stop the child process.  Terminate
+        # and wait for the trainer before allowing finally to remove plaintext
+        # corpus input; if the adapter cannot provide that confirmation, preserve
+        # the corpus rather than deleting files a live child may still be reading.
+        cancel_all = getattr(adapter, "cancel_all", None)
+        if training_active and callable(cancel_all):
+            try:
+                await cancel_all()
+            except Exception:
+                # F377 safety boundary: a failed termination attempt means the
+                # corpus remains available to a potentially live child.
+                pass
+            else:
+                training_active = False
         raise
     finally:
         # The corpus is transient training INPUT derived from user-authored
@@ -188,4 +199,3 @@ def _delete_corpus(corpus_dir: str) -> None:
             (corpus / name).unlink(missing_ok=True)
         except OSError:
             pass
-

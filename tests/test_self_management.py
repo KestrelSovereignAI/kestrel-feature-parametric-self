@@ -327,6 +327,124 @@ async def test_on_disable_clears_guard_when_cancel_precedes_runner():
     assert runs[-1]["state"] == "interrupted"
 
 
+async def test_train_now_cancellation_during_history_reservation_recovers():
+    """Cancelling the command while its run record is awaited releases all state."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    entered = asyncio.Event()
+    never = asyncio.Event()
+    original_append = f._append_run_history
+
+    async def _blocked_append(entry):
+        entered.set()
+        await never.wait()
+
+    f._append_run_history = _blocked_append
+    command = asyncio.create_task(f.parametric_self_train_now())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    command.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await command
+
+    assert f._cycle_in_flight is False
+    assert f._training_task is None
+    assert f._active_run is None
+    progress = await f.parametric_self_progress()
+    assert progress.data == {"active_run": None}
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+
+    f._append_run_history = original_append
+
+    async def _fast_cycle(*, trigger):
+        return {"trained": False, "promoted": False, "reason": "test skip"}
+
+    f._run_training_cycle_locked = _fast_cycle
+    recovered = await f.parametric_self_train_now()
+    assert recovered.status == ToolResultStatus.OK
+    await f._training_task
+    runs = await f._load_run_history()
+    assert [run["state"] for run in runs] == ["interrupted", "skipped"]
+
+
+async def test_cancelled_detached_manual_run_is_terminal_and_recoverable():
+    """External task cancellation cannot strand progress/history as in-progress."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        started.set()
+        await asyncio.Event().wait()
+
+    f._run_training_cycle_locked = _slow_cycle
+    result = await f.parametric_self_train_now()
+    assert result.status == ToolResultStatus.OK
+    task = f._training_task
+    await asyncio.wait_for(started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert f._cycle_in_flight is False
+    assert f._training_task is None
+    assert f._active_run is None
+    progress = await f.parametric_self_progress()
+    assert progress.data == {"active_run": None}
+    runs = await f._load_run_history()
+    assert len(runs) == 1
+    assert runs[0]["state"] == "interrupted"
+    assert runs[0]["reason"] == "run cancelled"
+
+    async def _fast_cycle(*, trigger):
+        return {"trained": False, "promoted": False, "reason": "test skip"}
+
+    f._run_training_cycle_locked = _fast_cycle
+    recovered = await f.parametric_self_train_now()
+    assert recovered.status == ToolResultStatus.OK
+    await f._training_task
+    runs = await f._load_run_history()
+    assert [run["state"] for run in runs] == ["interrupted", "skipped"]
+
+
+async def test_disable_during_manual_record_creation_prevents_runner_launch():
+    """Disable invalidates a suspended train_now command before it can detach."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cycle_calls = []
+
+    async def _blocked_append(entry):
+        entered.set()
+        await release.wait()
+
+    async def _should_not_run(*, trigger):
+        cycle_calls.append(trigger)
+        return {"trained": True, "promoted": False}
+
+    f._append_run_history = _blocked_append
+    f._run_training_cycle_locked = _should_not_run
+    command = asyncio.create_task(f.parametric_self_train_now())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    disable = asyncio.create_task(f.on_disable())
+    await asyncio.sleep(0)
+    release.set()
+
+    result = await command
+    await disable
+    assert result.status == ToolResultStatus.ERROR
+    assert "did not start" in (result.error or "")
+    assert cycle_calls == []
+    assert f._training_task is None
+    assert f._cycle_in_flight is False
+    assert f._active_run is None
+    progress = await f.parametric_self_progress()
+    assert progress.data == {"active_run": None}
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+
+
 async def test_rollback_default_to_previous_promoted(tmp_path):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"

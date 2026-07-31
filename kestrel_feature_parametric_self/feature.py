@@ -118,6 +118,13 @@ class ParametricSelfFeature(Feature):
         # In-flight manual training run (train_now). Detached so the tool call
         # returns immediately; guarded so only one cycle runs at a time.
         self._training_task: Optional[asyncio.Task] = None
+        # Serializes the short reservation -> run-record -> task-publication
+        # transition.  ``on_disable`` advances the generation before waiting on
+        # this lock, so a command that was suspended while creating its durable
+        # record can never publish a trainer after disable has begun.
+        self._manual_run_lock = asyncio.Lock()
+        self._manual_run_generation = 0
+        self._manual_runs_enabled = True
         # The currently-running cycle's durable record (run_id, adapter_id,
         # trigger, started_at, state, adapter_path), or None when idle. Set when
         # a cycle begins so the introspection tools can distinguish "no run",
@@ -950,64 +957,101 @@ class ParametricSelfFeature(Feature):
             )
         if not self._adapter.is_available():
             return ToolResult.failed("Trainer unavailable on this host (MLX/Apple Silicon required).")
-        if self._cycle_in_flight or (self._training_task is not None and not self._training_task.done()):
-            return ToolResult.failed("A parametric-self training run is already in progress.")
-
         db_path, work_dir = self._resolve_paths()
         if not work_dir:
             return ToolResult.failed("Could not resolve parametric-self work directory.")
 
-        # Reserve the cross-trigger guard HERE, synchronously, before detaching:
-        # otherwise the nightly hook could fire in the same event-loop turn,
-        # acquire the guard first, and the detached manual run would skip as
-        # "already in progress" — contradicting the "started" we report. There is
-        # no await between the busy-check above and this set, so it is atomic.
-        self._cycle_in_flight = True
-        active_run = await self._begin_active_run(trigger="manual", work_dir=work_dir)
+        # Keep the reservation, durable record creation, and task publication
+        # together.  ``on_disable`` invalidates the captured generation before
+        # it waits for this lock, closing the otherwise possible race where a
+        # command resumes from the record-store await and launches after disable.
+        async with self._manual_run_lock:
+            if not self._manual_runs_enabled:
+                return ToolResult.failed("Parametric-self training is unavailable while this feature is disabled.")
+            if self._cycle_in_flight or (
+                self._training_task is not None and not self._training_task.done()
+            ):
+                return ToolResult.failed("A parametric-self training run is already in progress.")
 
-        # Run detached: a full cycle is ~24 min; the tool returns immediately and
-        # the run record already exists by the time started=True is returned. The
-        # runner calls the LOCKED body (the guard is already held) and clears it
-        # in finally. Errors are logged, not surfaced (poll history/progress for
-        # the outcome).
-        async def _runner() -> None:
+            launch_generation = self._manual_run_generation
+            # Reserve the cross-trigger guard HERE, synchronously, before
+            # detaching: otherwise the nightly hook could fire in the same
+            # event-loop turn and acquire it first.
+            self._cycle_in_flight = True
+            active_run: Optional[Dict[str, Any]] = None
             try:
-                outcome = await self._run_training_cycle_locked(trigger="manual")
-                # The locked body owns normal full-cycle finalization.  It can
-                # also return before it creates a run (for example, when the
-                # governed corpus policy is absent or semantic maintenance has
-                # not produced a usable snapshot).  A detached manual cycle
-                # already has a durable in-progress record at this point, so
-                # finish that specific record for every such normal no-op.
-                # Matching the captured run id prevents a future lifecycle
-                # change from accidentally finalizing another run.
-                active = getattr(self, "_active_run", None)
-                if active is not None and active.get("run_id") == active_run["run_id"]:
-                    trained = bool(outcome.get("trained", False))
-                    await self._update_run_history(active_run["run_id"], {
-                        "state": "completed" if trained else "skipped",
-                        "timestamp": _utc_now_iso(),
-                        "trained": trained,
-                        "promoted": bool(outcome.get("promoted", False)),
-                        "reason": outcome.get("reason", "training completed"),
-                    })
-                    self._active_run = None
+                active_run = await self._begin_active_run(trigger="manual", work_dir=work_dir)
             except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                active = getattr(self, "_active_run", None)
-                if active is not None and active.get("run_id") == active_run["run_id"]:
-                    await self._update_run_history(active_run["run_id"], {
-                        "state": "failed",
-                        "timestamp": _utc_now_iso(),
-                        "reason": f"training error: {exc}",
-                    })
-                    self._active_run = None
-                logger.warning("parametric-self manual training run failed: %s", exc)
-            finally:
+                await self._interrupt_active_run(
+                    reason="run cancelled before manual training started",
+                )
                 self._cycle_in_flight = False
+                raise
 
-        self._training_task = asyncio.create_task(_runner())
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                await self._interrupt_active_run(
+                    run_id=active_run["run_id"],
+                    reason="run cancelled (feature disabled before launch)",
+                )
+                self._cycle_in_flight = False
+                return ToolResult.failed(
+                    "Parametric-self training did not start because the feature was disabled."
+                )
+
+            # Run detached: a full cycle is ~24 min; the tool returns immediately
+            # and the run record already exists by the time started=True is
+            # returned. The runner calls the LOCKED body (the guard is already
+            # held) and clears it in finally. Errors are logged, not surfaced
+            # (poll history/progress for the outcome).
+            async def _runner() -> None:
+                try:
+                    outcome = await self._run_training_cycle_locked(trigger="manual")
+                    # The locked body owns normal full-cycle finalization.  It can
+                    # also return before it creates a run (for example, when the
+                    # governed corpus policy is absent or semantic maintenance has
+                    # not produced a usable snapshot).  A detached manual cycle
+                    # already has a durable in-progress record at this point, so
+                    # finish that specific record for every such normal no-op.
+                    # Matching the captured run id prevents a future lifecycle
+                    # change from accidentally finalizing another run.
+                    active = getattr(self, "_active_run", None)
+                    if active is not None and active.get("run_id") == active_run["run_id"]:
+                        trained = bool(outcome.get("trained", False))
+                        await self._update_run_history(active_run["run_id"], {
+                            "state": "completed" if trained else "skipped",
+                            "timestamp": _utc_now_iso(),
+                            "trained": trained,
+                            "promoted": bool(outcome.get("promoted", False)),
+                            "reason": outcome.get("reason", "training completed"),
+                        })
+                        self._active_run = None
+                except asyncio.CancelledError:
+                    # ``run_nightly_cycle`` terminates and confirms any child
+                    # trainer before this handler runs, so it is now safe to
+                    # finalize the durable record and expose no active run.
+                    await self._interrupt_active_run(
+                        run_id=active_run["run_id"], reason="run cancelled",
+                    )
+                    if self._training_task is asyncio.current_task():
+                        self._training_task = None
+                    raise
+                except Exception as exc:
+                    active = getattr(self, "_active_run", None)
+                    if active is not None and active.get("run_id") == active_run["run_id"]:
+                        await self._update_run_history(active_run["run_id"], {
+                            "state": "failed",
+                            "timestamp": _utc_now_iso(),
+                            "reason": f"training error: {exc}",
+                        })
+                        self._active_run = None
+                    logger.warning("parametric-self manual training run failed: %s", exc)
+                finally:
+                    self._cycle_in_flight = False
+
+            self._training_task = asyncio.create_task(_runner())
         return ToolResult.ok(
             confirmation=(
                 "Parametric-self training run started in the background. "
@@ -1476,6 +1520,31 @@ class ParametricSelfFeature(Feature):
         })
         return dict(active_run)
 
+    async def _interrupt_active_run(
+        self, *, reason: str, run_id: Optional[str] = None,
+    ) -> None:
+        """Terminalize the matching active record after cancellation/disable.
+
+        The matching id makes this safe when cancellation and teardown race: the
+        first caller clears the record, and every later caller becomes a no-op.
+        ``_update_run_history`` is already best effort, but clearing the local
+        active state remains essential so the operator never sees a phantom run.
+        """
+        active_run = getattr(self, "_active_run", None)
+        if active_run is None or (run_id is not None and active_run.get("run_id") != run_id):
+            return
+        try:
+            await self._update_run_history(active_run["run_id"], {
+                "state": "interrupted",
+                "timestamp": _utc_now_iso(),
+                "reason": reason,
+            })
+        except Exception as exc:  # cancellation cleanup must not mask cancellation
+            logger.warning("Failed to mark parametric-self run interrupted: %s", exc)
+        finally:
+            if self._active_run is active_run:
+                self._active_run = None
+
     # ------------------------------------------------------------------
     # Run-history store (append-only, capped) — lets the agent introspect
     # its own training lifecycle (feedback_agent_must_introspect_lifecycle).
@@ -1600,6 +1669,8 @@ class ParametricSelfFeature(Feature):
         """
         from .sleep_hook import create_parametric_self_sleep_hook
 
+        self._manual_runs_enabled = True
+
         await self._restore_persisted_config()
         # A restored pointer is never trusted just because it was persisted.
         # Verify/quarantine it before this feature registers any serving-adjacent
@@ -1637,34 +1708,39 @@ class ParametricSelfFeature(Feature):
         ``mlx_lm.lora`` subprocess(es) via the adapter — otherwise an orphaned
         GPU-heavy job keeps running and writing into the adapter dir.
         """
-        task = getattr(self, "_training_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-        self._training_task = None
-        # Force-clear the cross-trigger guard: if the cancel landed before
-        # _runner started, its finally never ran and the guard would stay stuck,
-        # permanently refusing later train/rollback on a re-enabled instance.
-        self._cycle_in_flight = False
-        # Durably mark a cancelled in-flight run interrupted from here (a normal
-        # async context), since the cancelled cycle body cannot await storage.
-        active_run = getattr(self, "_active_run", None)
-        if active_run is not None:
-            try:
-                await self._update_run_history(active_run["run_id"], {
-                    "state": "interrupted",
-                    "timestamp": _utc_now_iso(),
-                    "reason": "run cancelled (feature disabled)",
-                })
-            except Exception as e:  # teardown must never raise
-                logger.warning("Failed to mark parametric-self run interrupted: %s", e)
-            self._active_run = None
+        # Invalidate an in-progress command BEFORE awaiting the transition lock.
+        # A command that is blocked on durable history creation will see this
+        # generation mismatch and refuse to publish a detached trainer.
+        self._manual_runs_enabled = False
+        self._manual_run_generation += 1
+        async with self._manual_run_lock:
+            task = getattr(self, "_training_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # teardown must never raise
+                    logger.warning("Manual training task failed during disable: %s", exc)
+            self._training_task = None
 
-        adapter = getattr(self, "_adapter", None)
-        if adapter is not None and hasattr(adapter, "cancel_all"):
-            try:
-                await adapter.cancel_all()
-            except Exception as e:  # teardown must never raise
-                logger.warning("Failed to cancel parametric-self training subprocess(es): %s", e)
+            # The task-level cancellation path tears down a live child before it
+            # finalizes history.  Call the adapter here as well for a task that
+            # was cancelled before its runner began, and do it BEFORE state or
+            # history cleanup so corpus cleanup can never race a live trainer.
+            adapter = getattr(self, "_adapter", None)
+            if adapter is not None and hasattr(adapter, "cancel_all"):
+                try:
+                    await adapter.cancel_all()
+                except Exception as exc:  # teardown must never raise
+                    logger.warning("Failed to cancel parametric-self training subprocess(es): %s", exc)
+
+            # Force-clear the cross-trigger guard: if the cancel landed before
+            # _runner started, its finally never ran and the guard would stay
+            # stuck, permanently refusing later train/rollback on re-enable.
+            self._cycle_in_flight = False
+            await self._interrupt_active_run(reason="run cancelled (feature disabled)")
 
         hook = getattr(self, "_sleep_hook", None)
         hooks = getattr(self.agent, "sleep_hooks", None)

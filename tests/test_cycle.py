@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -277,22 +279,88 @@ async def test_cycle_keeps_corpus_when_training_still_running(tmp_path):
 
 
 
-async def test_cycle_deletes_corpus_on_cancellation(tmp_path):
-    """codex P2: on cancellation (on_disable tears down the trainer), the
-    transient corpus must be cleaned up, not left as durable plaintext."""
-    import asyncio as _asyncio
+async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_path, monkeypatch):
+    """Arbitrary task cancellation cannot delete input under a live trainer."""
+    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
+    work = tmp_path / "work"
+    events = []
+
+    class _LiveChild(_FakeAdapter):
+        def __init__(self):
+            super().__init__(state=TrainingState.TRAINING)
+            self.started = asyncio.Event()
+            self.corpus = None
+            self.stopped = False
+
+        async def start_training(self, agent_id, config):
+            self.corpus = Path(config.data_dir)
+            self.started.set()
+            return await super().start_training(agent_id, config)
+
+        async def get_status(self, job_id):
+            await asyncio.Event().wait()
+
+        async def cancel_all(self):
+            assert self.corpus is not None
+            assert (self.corpus / "train.jsonl").exists()
+            self.stopped = True
+            events.append("child-stopped")
+            return 1
+
+    adapter = _LiveChild()
+    corpus = work / "corpus" / "cancelrun"
+    import kestrel_feature_parametric_self.cycle as cycle_module
+
+    original_delete = cycle_module._delete_corpus
+
+    def _ordered_delete(path):
+        if path == str(corpus) and (corpus / "train.jsonl").exists():
+            assert adapter.stopped
+            events.append("corpus-deleted")
+        original_delete(path)
+
+    monkeypatch.setattr(cycle_module, "_delete_corpus", _ordered_delete)
+    task = asyncio.create_task(run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work), adapter=adapter,
+        gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+        max_polls=5, adapter_id="cancelrun",
+    ))
+    await asyncio.wait_for(adapter.started.wait(), timeout=2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == ["child-stopped", "corpus-deleted"]
+    assert not (corpus / "train.jsonl").exists()
+
+
+async def test_cycle_cancellation_keeps_corpus_without_stop_confirmation(tmp_path):
+    """A cancellation without a child-stop capability retains the live input."""
     db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
     work = tmp_path / "work"
 
-    class _CancelMidPoll(_FakeAdapter):
-        async def get_status(self, job_id):
-            raise _asyncio.CancelledError()
+    class _UnstoppableChild(_FakeAdapter):
+        def __init__(self):
+            super().__init__(state=TrainingState.TRAINING)
+            self.started = asyncio.Event()
 
-    with pytest.raises(_asyncio.CancelledError):
-        await run_nightly_cycle(
-            agent_id="emma", db_path=db, work_dir=str(work),
-            adapter=_CancelMidPoll(state=TrainingState.TRAINING), gate=FidelityGate(),
-            config=TextLoRAConfig(), poll_interval=0, max_polls=5, adapter_id="cancelrun",
-        )
-    corpus = work / "corpus" / "cancelrun"
-    assert not (corpus / "train.jsonl").exists()  # cleaned up on shutdown
+        async def start_training(self, agent_id, config):
+            self.started.set()
+            return await super().start_training(agent_id, config)
+
+        async def get_status(self, job_id):
+            await asyncio.Event().wait()
+
+    adapter = _UnstoppableChild()
+    task = asyncio.create_task(run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(work), adapter=adapter,
+        gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+        max_polls=5, adapter_id="retainrun",
+    ))
+    await asyncio.wait_for(adapter.started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    corpus = work / "corpus" / "retainrun"
+    assert (corpus / "train.jsonl").exists()
