@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -217,7 +218,9 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert feature._active_adapter_path is None
     assert feature._adapter_lineage
     assert {lineage["state"] for lineage in feature._adapter_lineage.values()} == {"invalid"}
-    assert not (tmp_path / "fresh-drill" / "corpus").exists()
+    assert not (tmp_path / "fresh-drill").exists()
+    assert len(envelope.run_nonce) == 64
+    assert len(envelope.freshness_receipt) == 64
 
     policy = TrustedExecutionPolicy((identity.trusted_key(("external_ci",)),))
     evidence = apply_evidence_records(
@@ -248,7 +251,7 @@ async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_
             feature, scratch_dir=tmp_path / "fresh-drill", erase=no_op_erase
         )
     assert feature._active_adapter_path is not None
-    assert not (tmp_path / "fresh-drill" / "corpus").exists()
+    assert not (tmp_path / "fresh-drill").exists()
 
 
 async def test_external_evidence_refuses_non_external_signer(tmp_path):
@@ -262,3 +265,106 @@ async def test_external_evidence_refuses_non_external_signer(tmp_path):
     with pytest.raises(ExternalReleaseEvidenceError, match="external_ci"):
         ParametricSelfExternalEvidenceRunner(wrong_identity)
     assert feature._active_adapter_path is None
+
+
+async def test_external_evidence_binds_unique_freshness_to_every_signed_record(tmp_path):
+    first_storage = _CoreBackedErasureStorage(_snapshot())
+    second_storage = _CoreBackedErasureStorage(_snapshot())
+    first = await _feature(first_storage, tmp_path / "one")
+    second = await _feature(second_storage, tmp_path / "two")
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+
+    async def erase_first():
+        first_storage.erased = True
+
+    async def erase_second():
+        second_storage.erased = True
+
+    left = await runner.run(first, scratch_dir=tmp_path / "drill-one", erase=erase_first)
+    right = await runner.run(second, scratch_dir=tmp_path / "drill-two", erase=erase_second)
+    assert left.run_nonce != right.run_nonce
+    assert left.freshness_receipt != right.freshness_receipt
+    assert {record.artifact.artifact_digest for record in left.records}.isdisjoint(
+        {record.artifact.artifact_digest for record in right.records}
+    )
+
+
+async def test_external_evidence_rejects_a_core_install_with_wrong_vcs_revision(tmp_path, monkeypatch):
+    import kestrel_feature_parametric_self.release_evidence as evidence_module
+
+    dist = tmp_path / "wrong-core.dist-info"
+    dist.mkdir()
+    (dist / "direct_url.json").write_text(
+        json.dumps({"vcs_info": {"commit_id": "f" * 40}})
+    )
+    monkeypatch.setattr(evidence_module, "distribution", lambda _name: SimpleNamespace(_path=dist))
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    with pytest.raises(ExternalReleaseEvidenceError, match="installed core revision"):
+        await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature, scratch_dir=tmp_path / "fresh-drill", erase=lambda: None
+        )
+    assert not (tmp_path / "fresh-drill").exists()
+
+
+async def test_external_evidence_default_path_uses_real_core_storage_privacy_and_erasure(tmp_path):
+    """No fake corpus/delta: core creates the fact and its physical tombstone."""
+    from kestrel_sovereign.knowledge import InferenceProfile
+    from kestrel_sovereign.storage.async_assertion_store import _issue_assertion_tenant_capability
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    from kestrel_sovereign.privacy import PrivacyMode
+
+    tenant = "did:kestrel:release-evidence:e2e"
+    raw = AsyncStorage(
+        str(tmp_path / "state.db"),
+        agent_id=tenant,
+        _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
+    )
+    await raw.initialize()
+    try:
+        governed = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        saved = await governed.save_explicit_fact(
+            subject="user", predicate="preferred_deploy_region", value="private e2e value",
+            confidence=0.9, invocation_id="release-evidence-e2e",
+        )
+        assert saved.saved
+        profile = InferenceProfile(
+            OntologyRef(
+                "http://www.w3.org/2000/01/rdf-schema#", "1.0.0",
+                "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                "semantic-kb-v1",
+            ), "1.0.0",
+        )
+        await raw.run_semantic_maintenance(profile)
+        assertion = (await raw.assertion_inference_inputs())[0]
+        capabilities = await raw.semantic_maintenance_capability_versions(profile)
+        policy = GovernedCorpusPolicy(
+            policy_id="release-evidence-e2e", policy_version="1",
+            accepted_epistemic_states=(EpistemicState.REPORTED,),
+            accepted_visibility=(Visibility.PRIVATE,),
+            accepted_privacy_classifications=("normal",),
+            accepted_consent_references=("policy:privacy:normal-v1",),
+            accepted_grounding_classes=("explicit-tool-invocation",),
+            accepted_source_kinds=("agent_tool_invocation",),
+            accepted_ontology_pins=(assertion.ontology_version,),
+            accepted_semantic_capability_versions=tuple(capabilities.items()),
+        )
+        agent = SimpleNamespace(
+            storage=raw, storage_path=None, parametric_self_work_dir=str(tmp_path / "work"),
+            parametric_self_governed_corpus_policy=policy, semantic_inference_profile=profile,
+            is_test_instance=False, agent_id=tenant, sleep_hooks=[],
+        )
+        feature = ParametricSelfFeature(agent=agent)
+        await feature.initialize()
+        feature._governed_corpus_policy = policy
+        envelope = await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature, scratch_dir=tmp_path / "fresh-real-drill"
+        )
+        assert all(record.passed for record in envelope.records)
+        terminal = await raw.get_assertion(saved.assertion_id, include_inactive=True)
+        assert terminal is not None and terminal.status.value == "deleted"
+        assert feature._active_adapter_path is None
+        assert not (tmp_path / "fresh-real-drill").exists()
+    finally:
+        await raw.close()

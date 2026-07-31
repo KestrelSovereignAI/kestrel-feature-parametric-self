@@ -17,6 +17,8 @@ import hashlib
 import inspect
 import json
 import shutil
+import secrets
+from importlib.metadata import PackageNotFoundError, distribution
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +59,7 @@ EXTERNAL_GATE_IDS = (
     "external_served_eligibility_rejected",
 )
 _CAPABILITY_ID = "parametric_self_governed_corpus"
+_FRESHNESS_NONCE_BYTES = 32
 
 
 class ExternalReleaseEvidenceError(ValueError):
@@ -93,6 +96,29 @@ def _external_specs() -> dict[str, GateSpec]:
     return result
 
 
+def _verify_pinned_core_install() -> None:
+    """Refuse an installed core other than the exact reviewed Git revision.
+
+    The catalog shape is not a substitute for its source revision: a later
+    local edit can preserve the shape while changing what the signed gates
+    mean.  Pip records VCS provenance in ``direct_url.json`` for this direct
+    requirement, so require its full commit ID at the execution boundary.
+    """
+    try:
+        info = distribution("kestrel-sovereign")
+        payload = json.loads(
+            (Path(info._path) / "direct_url.json").read_text("utf-8")
+        )
+        commit = payload["vcs_info"]["commit_id"]
+    except (PackageNotFoundError, OSError, ValueError, KeyError, TypeError) as error:
+        raise ExternalReleaseEvidenceError("pinned core revision provenance is unavailable") from error
+    if not isinstance(commit, str) or (
+        commit != CORE_RELEASE_EVIDENCE_COMMIT
+        and not commit.startswith(CORE_RELEASE_EVIDENCE_COMMIT)
+    ):
+        raise ExternalReleaseEvidenceError("installed core revision does not match #2753 catalog commit")
+
+
 @dataclass(frozen=True, slots=True)
 class ExternalReleaseEvidenceEnvelope:
     """Content-free, independently signed external-CI submission for core.
@@ -104,6 +130,8 @@ class ExternalReleaseEvidenceEnvelope:
     core_release_evidence_commit: str
     repository: str
     source_revision: str
+    run_nonce: str
+    freshness_receipt: str
     records: tuple[EvidenceRecord, ...]
     report: ExternalCapabilityReport
 
@@ -114,6 +142,21 @@ class ExternalReleaseEvidenceEnvelope:
             raise ExternalReleaseEvidenceError("external evidence repository does not match core contract")
         if self.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION:
             raise ExternalReleaseEvidenceError("external evidence revision does not match core contract")
+        if len(self.run_nonce) != _FRESHNESS_NONCE_BYTES * 2 or any(
+            character not in "0123456789abcdef" for character in self.run_nonce
+        ):
+            raise ExternalReleaseEvidenceError("external evidence requires a fresh nonce")
+        expected_receipt = _digest(
+            {
+                "core_release_evidence_commit": self.core_release_evidence_commit,
+                "repository": self.repository,
+                "source_revision": self.source_revision,
+                "run_nonce": self.run_nonce,
+                "record_digests": [record.run_digest for record in self.records],
+            }
+        )
+        if self.freshness_receipt != expected_receipt:
+            raise ExternalReleaseEvidenceError("external evidence freshness receipt is invalid")
         specs = _external_specs()
         by_gate = {record.gate_id: record for record in self.records}
         if set(by_gate) != set(specs) or len(by_gate) != len(self.records):
@@ -159,6 +202,8 @@ class ExternalReleaseEvidenceEnvelope:
             "core_release_evidence_commit": self.core_release_evidence_commit,
             "repository": self.repository,
             "source_revision": self.source_revision,
+            "run_nonce": self.run_nonce,
+            "freshness_receipt": self.freshness_receipt,
             "trust_status": self.trust_status,
             "records": [record.to_mapping() for record in self.records],
             "report": self.report.to_mapping(),
@@ -189,13 +234,14 @@ class ParametricSelfExternalEvidenceRunner:
         ):
             raise ExternalReleaseEvidenceError("external evidence requires an external_ci signing identity")
         self._identity = signing_identity
+        self._issued_freshness_receipts: set[str] = set()
 
     async def run(
         self,
         feature: "ParametricSelfFeature",
         *,
         scratch_dir: Path,
-        erase: ErasureAction,
+        erase: ErasureAction | None = None,
     ) -> ExternalReleaseEvidenceEnvelope:
         """Run one fresh, correlated drill and return its signed envelope.
 
@@ -204,8 +250,9 @@ class ParametricSelfExternalEvidenceRunner:
         drill.  A no-op, unrelated deletion, stale snapshot, untracked
         candidate, or still-served adapter all fail closed.
         """
-        if not callable(erase):
+        if erase is not None and not callable(erase):
             raise ExternalReleaseEvidenceError("external erasure action must be callable")
+        _verify_pinned_core_install()
         specs = _external_specs()
         scratch_dir = Path(scratch_dir)
         if scratch_dir.exists():
@@ -221,6 +268,7 @@ class ParametricSelfExternalEvidenceRunner:
 
         candidate = scratch_dir / "candidate"
         corpus_dir = scratch_dir / "corpus"
+        run_nonce = secrets.token_hex(_FRESHNESS_NONCE_BYTES)
         try:
             stats = build_corpus(
                 None,
@@ -240,7 +288,16 @@ class ParametricSelfExternalEvidenceRunner:
             feature._active_adapter_path = candidate_path
             feature._live_corpus_snapshot = snapshot
 
-            result = erase()
+            # The default path is a real, scoped core deletion for the exact
+            # assertion that produced this snapshot.  ``erase`` remains only
+            # for an operator-owned erasure coordinator with a wider physical
+            # surface (vectors/exports): it must still produce this core
+            # tombstone or the lineage verifier below rejects the run.
+            result = (
+                self._erase_snapshot_assertion(feature, snapshot, run_nonce)
+                if erase is None
+                else erase()
+            )
             if inspect.isawaitable(result):
                 result = await result
             if result is not None:
@@ -262,7 +319,7 @@ class ParametricSelfExternalEvidenceRunner:
                 "external_served_eligibility_rejected": {"erased_count": 1, "remaining_count": 0},
             }
             records = tuple(
-                self._record(specs[gate_id], observations[gate_id])
+                self._record(specs[gate_id], observations[gate_id], run_nonce)
                 for gate_id in EXTERNAL_GATE_IDS
             )
             attestations: list[ExternalGateAttestation] = []
@@ -286,21 +343,61 @@ class ParametricSelfExternalEvidenceRunner:
                 source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
                 attestations=tuple(attestations),
             )
+            receipt = _digest(
+                {
+                    "core_release_evidence_commit": CORE_RELEASE_EVIDENCE_COMMIT,
+                    "repository": PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                    "source_revision": PARAMETRIC_SELF_EVIDENCE_REVISION,
+                    "run_nonce": run_nonce,
+                    "record_digests": [record.run_digest for record in records],
+                }
+            )
+            if receipt in self._issued_freshness_receipts:
+                raise ExternalReleaseEvidenceError("external evidence freshness receipt was already issued")
+            self._issued_freshness_receipts.add(receipt)
             return ExternalReleaseEvidenceEnvelope(
                 core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
                 source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                run_nonce=run_nonce,
+                freshness_receipt=receipt,
                 records=records,
                 report=report,
             )
         finally:
-            # ``train.jsonl`` / ``valid.jsonl`` contain governed plaintext.
-            # This exact fresh scratch child exists solely for the drill, so
-            # delete it on success and every failure path.
-            if corpus_dir.is_dir():
-                shutil.rmtree(corpus_dir)
+            # The candidate manifest is lineage-sensitive too.  This exact
+            # fresh tree exists solely for the drill, so delete *all* of it on
+            # success, exceptions, and task cancellation.
+            if scratch_dir.exists():
+                shutil.rmtree(scratch_dir)
 
-    def _record(self, spec: GateSpec, observation: Mapping[str, object]) -> EvidenceRecord:
+    @staticmethod
+    async def _erase_snapshot_assertion(
+        feature: "ParametricSelfFeature",
+        snapshot: GovernedCorpusSnapshot,
+        run_nonce: str,
+    ) -> None:
+        storage = getattr(getattr(feature, "agent", None), "storage", None)
+        delete = getattr(storage, "delete_assertion", None)
+        example = snapshot.examples[0] if snapshot.examples else None
+        assertion = getattr(example, "assertion", None)
+        if not callable(delete) or assertion is None:
+            raise ExternalReleaseEvidenceError("core physical erasure capability is unavailable")
+        try:
+            await delete(
+                assertion.assertion_id,
+                assertion.revision_id,
+                operation_id=f"parametric-self-release-erasure:{run_nonce}",
+            )
+        except Exception as error:
+            raise ExternalReleaseEvidenceError("core physical erasure action failed") from error
+
+    def _record(
+        self,
+        spec: GateSpec,
+        observation: Mapping[str, object],
+        run_nonce: str,
+    ) -> EvidenceRecord:
         # The artifact is a digest of only catalog-bound aggregate fields; it
         # cannot be used to smuggle an assertion, tenant, filesystem path, or
         # caller-controlled log into core's release report.
@@ -310,6 +407,7 @@ class ParametricSelfExternalEvidenceRunner:
                 "gate_id": spec.gate_id,
                 "gate_spec_digest": spec.digest,
                 "observation": dict(observation),
+                "run_nonce": run_nonce,
             }
         )
         artifact = ArtifactReference(f"ci://sha256/{artifact_digest}", artifact_digest)
