@@ -409,6 +409,27 @@ async def test_confirmed_bulk_shutdown_resolves_prior_incomplete_run():
     assert "bulk trainer stop confirmed" in runs[-1]["reason"]
 
 
+async def test_shutdown_without_bulk_confirmation_keeps_prior_incomplete_block():
+    """A missing bulk cancellation capability is unknown, never clean shutdown."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._active_run = {
+        "run_id": "unresolved", "adapter_id": "adapter", "trigger": "manual",
+        "state": "shutdown_incomplete", "adapter_path": "/tmp/adapter",
+    }
+    await f._append_run_history({
+        "run_id": "unresolved", "trigger": "manual", "state": "shutdown_incomplete",
+        "reason": "training shutdown incomplete: prior stop was unconfirmed",
+    })
+    f._training_shutdown_incomplete = "training shutdown incomplete: prior stop was unconfirmed"
+    f._adapter.cancel_all = None
+
+    await f.on_disable()
+    assert f._training_shutdown_incomplete is not None
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert (await f._load_run_history())[-1]["state"] == "shutdown_incomplete"
+
+
 async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
     """Nightly cancellation enters the same durable safety state as train_now."""
     from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
@@ -442,6 +463,49 @@ async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
     assert restarted._training_shutdown_incomplete is not None
     assert restarted._cycle_in_flight is True
     assert (await restarted.parametric_self_status()).data["training_shutdown_incomplete"]
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    restarted._adapter.cancel_all = _confirmed_cancel_all
+    await restarted.on_disable()
+    assert restarted._training_shutdown_incomplete is None
+    assert restarted._cycle_in_flight is False
+    resolved_runs = await restarted._load_run_history()
+    assert resolved_runs[-1]["state"] == "interrupted"
+
+    final = ParametricSelfFeature(agent=f.agent)
+    await final.initialize()
+    final.agent.get_feature = MagicMock(return_value=final)
+    await final.post_all_features_loaded(final.agent)
+    assert final._training_shutdown_incomplete is None
+    assert final._cycle_in_flight is False
+
+
+async def test_disable_fences_sleep_cycle_waiting_to_launch():
+    """A sleep dispatch already queued on the lifecycle lock cannot start post-disable."""
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    launches = []
+
+    async def _should_not_launch(*, trigger):
+        launches.append(trigger)
+        return {"trained": True, "promoted": False}
+
+    f._run_training_cycle_locked = _should_not_launch
+    await f._manual_run_lock.acquire()
+    nightly = asyncio.create_task(f._run_training_cycle(trigger="nightly"))
+    await asyncio.sleep(0)
+    disable = asyncio.create_task(f.on_disable())
+    await asyncio.sleep(0)
+    f._manual_run_lock.release()
+
+    outcome = await nightly
+    await disable
+    assert outcome["trained"] is False
+    assert outcome["reason"] == "parametric-self feature is disabled"
+    assert launches == []
+    assert f._cycle_in_flight is False
 
 
 async def test_train_now_cancellation_during_history_reservation_recovers():

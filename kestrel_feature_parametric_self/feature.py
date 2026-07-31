@@ -91,6 +91,15 @@ class ParametricSelfFeature(Feature):
             "on-demand oracle alongside the frontier model"
         )
 
+    def _ensure_training_lifecycle_state(self) -> None:
+        """Backfill lifecycle state for direct/unit-level calls before initialize."""
+        if not hasattr(self, "_manual_run_lock"):
+            self._manual_run_lock = asyncio.Lock()
+            self._manual_run_generation = 0
+            self._manual_runs_enabled = True
+            self._training_shutdown_incomplete = None
+            self._cycle_task = None
+
     async def initialize(self) -> None:
         """Initialize the parametric-self feature (training off by default)."""
         self._adapter = LocalMLXAdapter()           # lazy MLX; inert off Apple Silicon
@@ -118,6 +127,10 @@ class ParametricSelfFeature(Feature):
         # In-flight manual training run (train_now). Detached so the tool call
         # returns immediately; guarded so only one cycle runs at a time.
         self._training_task: Optional[asyncio.Task] = None
+        # A sleep-triggered cycle is not detached like ``_training_task`` but it
+        # can still be live while disable runs. Track it so teardown can cancel
+        # every trigger, not only the manual command path.
+        self._cycle_task: Optional[asyncio.Task] = None
         # Serializes the short reservation -> run-record -> task-publication
         # transition.  ``on_disable`` advances the generation before waiting on
         # this lock, so a command that was suspended while creating its durable
@@ -949,6 +962,7 @@ class ParametricSelfFeature(Feature):
     )
     async def parametric_self_train_now(self) -> ToolResult:
         """Kick off a training cycle detached; do not block for the full run."""
+        self._ensure_training_lifecycle_state()
         gate = self._require_sovereign_class()
         if gate is not None:
             return gate
@@ -1351,6 +1365,7 @@ class ParametricSelfFeature(Feature):
         self-modifies, even if ``enable_nightly_training`` was set in persisted
         or externally-supplied config.
         """
+        self._ensure_training_lifecycle_state()
         if not self._is_sovereign_class():
             return {"trained": False, "promoted": False,
                     "reason": "self-modification reserved for sovereign-class agents (Incubator Principle)"}
@@ -1361,11 +1376,30 @@ class ParametricSelfFeature(Feature):
             # selectively forgotten — so skip the whole cycle (F377).
             return {"trained": False, "promoted": False,
                     "reason": "training skipped: privacy mode hides persisted user content"}
-        if self._cycle_in_flight:
-            return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
-        self._cycle_in_flight = True
+        # All triggers share the same lifecycle fence as manual launch. Disable
+        # invalidates the generation before it waits on this lock, so a pending
+        # sleep dispatch cannot begin a child after disable starts.
+        async with self._manual_run_lock:
+            if not self._manual_runs_enabled:
+                return {"trained": False, "promoted": False, "reason": "parametric-self feature is disabled"}
+            if self._training_shutdown_incomplete:
+                return {
+                    "trained": False,
+                    "promoted": False,
+                    "reason": self._training_shutdown_incomplete,
+                }
+            if self._cycle_in_flight:
+                return {"trained": False, "promoted": False, "reason": "another training run already in progress"}
+            launch_generation = self._manual_run_generation
+            self._cycle_in_flight = True
+            self._cycle_task = asyncio.current_task()
         keep_guard_held = False
         try:
+            if (
+                not self._manual_runs_enabled
+                or launch_generation != self._manual_run_generation
+            ):
+                return {"trained": False, "promoted": False, "reason": "parametric-self feature is disabled"}
             return await self._run_training_cycle_locked(trigger=trigger)
         except TrainingShutdownIncomplete as exc:
             active_run = getattr(self, "_active_run", None)
@@ -1378,6 +1412,8 @@ class ParametricSelfFeature(Feature):
         finally:
             if not keep_guard_held:
                 self._cycle_in_flight = False
+            if self._cycle_task is asyncio.current_task():
+                self._cycle_task = None
 
     async def _run_training_cycle_locked(self, *, trigger: str) -> Dict[str, Any]:
         """Body of one cycle; only ever called with the in-flight guard held."""
@@ -1600,12 +1636,22 @@ class ParametricSelfFeature(Feature):
 
     async def _resolve_training_shutdown_incomplete(self) -> None:
         """Clear a prior incomplete-shutdown block after bulk stop confirmation."""
+        reason = "run cancelled (feature disabled; bulk trainer stop confirmed)"
         active_run = getattr(self, "_active_run", None)
+        run_ids = set()
         if active_run is not None and active_run.get("state") == "shutdown_incomplete":
-            await self._interrupt_active_run(
-                run_id=active_run["run_id"],
-                reason="run cancelled (feature disabled; bulk trainer stop confirmed)",
-            )
+            run_ids.add(active_run["run_id"])
+        for entry in await self._load_run_history():
+            if entry.get("state") == "shutdown_incomplete" and entry.get("run_id"):
+                run_ids.add(entry["run_id"])
+        for run_id in run_ids:
+            await self._update_run_history(run_id, {
+                "state": "interrupted",
+                "timestamp": _utc_now_iso(),
+                "reason": reason,
+            })
+        if active_run is not None and active_run.get("run_id") in run_ids:
+            self._active_run = None
         self._training_shutdown_incomplete = None
 
     # ------------------------------------------------------------------
@@ -1780,29 +1826,41 @@ class ParametricSelfFeature(Feature):
         ``mlx_lm.lora`` subprocess(es) via the adapter — otherwise an orphaned
         GPU-heavy job keeps running and writing into the adapter dir.
         """
+        self._ensure_training_lifecycle_state()
         # Invalidate an in-progress command BEFORE awaiting the transition lock.
         # A command that is blocked on durable history creation will see this
         # generation mismatch and refuse to publish a detached trainer.
         self._manual_runs_enabled = False
         self._manual_run_generation += 1
         async with self._manual_run_lock:
-            task = getattr(self, "_training_task", None)
-            if task is not None and not task.done():
+            tasks = {
+                task for task in (
+                    getattr(self, "_training_task", None),
+                    getattr(self, "_cycle_task", None),
+                )
+                if task is not None and not task.done() and task is not asyncio.current_task()
+            }
+            for task in tasks:
                 task.cancel()
+            for task in tasks:
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
                 except Exception as exc:  # teardown must never raise
-                    logger.warning("Manual training task failed during disable: %s", exc)
+                    logger.warning("Parametric-self training task failed during disable: %s", exc)
             self._training_task = None
+            self._cycle_task = None
 
             # The task-level cancellation path tears down a live child before it
             # finalizes history.  Call the adapter here as well for a task that
             # was cancelled before its runner began, and do it BEFORE state or
             # history cleanup so corpus cleanup can never race a live trainer.
             adapter = getattr(self, "_adapter", None)
-            shutdown_confirmed = True
+            may_have_live_child = (
+                self._active_run is not None or self._training_shutdown_incomplete is not None
+            )
+            shutdown_confirmed = not may_have_live_child
             if adapter is not None and hasattr(adapter, "cancel_all"):
                 try:
                     shutdown = await adapter.cancel_all()
