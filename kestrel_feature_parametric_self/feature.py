@@ -121,8 +121,8 @@ class ParametricSelfFeature(Feature):
         # The currently-running cycle's durable record (run_id, adapter_id,
         # trigger, started_at, state, adapter_path), or None when idle. Set when
         # a cycle begins so the introspection tools can distinguish "no run",
-        # "run in progress", and "run completed/failed" instead of treating an
-        # intermediate Val-loss snapshot as terminal (issue #17).
+        # "run in progress", and "run completed/skipped/failed" instead of
+        # treating an intermediate Val-loss snapshot as terminal (issue #17).
         self._active_run: Optional[Dict[str, Any]] = None
         # Cross-trigger serialization: nightly (on_post_consolidation) and manual
         # (train_now) cycles share the same corpus/work dir and the served-adapter
@@ -972,13 +972,32 @@ class ParametricSelfFeature(Feature):
         # the outcome).
         async def _runner() -> None:
             try:
-                await self._run_training_cycle_locked(trigger="manual")
+                outcome = await self._run_training_cycle_locked(trigger="manual")
+                # The locked body owns normal full-cycle finalization.  It can
+                # also return before it creates a run (for example, when the
+                # governed corpus policy is absent or semantic maintenance has
+                # not produced a usable snapshot).  A detached manual cycle
+                # already has a durable in-progress record at this point, so
+                # finish that specific record for every such normal no-op.
+                # Matching the captured run id prevents a future lifecycle
+                # change from accidentally finalizing another run.
+                active = getattr(self, "_active_run", None)
+                if active is not None and active.get("run_id") == active_run["run_id"]:
+                    trained = bool(outcome.get("trained", False))
+                    await self._update_run_history(active_run["run_id"], {
+                        "state": "completed" if trained else "skipped",
+                        "timestamp": _utc_now_iso(),
+                        "trained": trained,
+                        "promoted": bool(outcome.get("promoted", False)),
+                        "reason": outcome.get("reason", "training completed"),
+                    })
+                    self._active_run = None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 active = getattr(self, "_active_run", None)
-                if active is not None:
-                    await self._update_run_history(active["run_id"], {
+                if active is not None and active.get("run_id") == active_run["run_id"]:
+                    await self._update_run_history(active_run["run_id"], {
                         "state": "failed",
                         "timestamp": _utc_now_iso(),
                         "reason": f"training error: {exc}",
@@ -1488,9 +1507,10 @@ class ParametricSelfFeature(Feature):
     async def _update_run_history(self, run_id: str, updates: Dict[str, Any]) -> None:
         """Merge ``updates`` into the most recent history entry with ``run_id``.
 
-        Lets a run's record transition in place (``in_progress`` -> ``completed``/
-        ``failed``/``interrupted``) instead of appending a second entry, so an
-        in-flight run is one durable record an agent can poll to completion.
+        Lets a run's record transition in place (``in_progress`` ->
+        ``completed``/``skipped``/``failed``/``interrupted``) instead of
+        appending a second entry, so an in-flight run is one durable record an
+        agent can poll to completion.
         No-ops if the entry is gone (capped out) — falls back to appending so the
         outcome is never silently lost.
         """

@@ -98,6 +98,49 @@ async def test_unavailable_or_incomplete_host_capability_is_a_visible_skip(tmp_p
     }
 
 
+async def test_manual_train_now_finalizes_missing_policy_skips(tmp_path):
+    """A detached manual no-op cannot leave a phantom in-progress run behind."""
+    feature = await _feature(_Host(_snapshot()), tmp_path)
+    feature._adapter.is_available = lambda: True
+    feature.agent.parametric_self_governed_corpus_policy = None
+    feature._governed_corpus_policy = None
+
+    for _ in range(2):
+        started = await feature.parametric_self_train_now()
+        assert started.data["started"] is True
+        await feature._training_task
+        progress = await feature.parametric_self_progress()
+        assert progress.data == {"active_run": None}
+        assert feature._active_run is None
+
+    runs = await feature._load_run_history()
+    assert len(runs) == 2
+    assert all(run["state"] == "skipped" for run in runs)
+    assert all(run["reason"] == "governed corpus policy is not configured" for run in runs)
+
+
+async def test_manual_train_now_finalizes_semantic_incomplete_skips(tmp_path):
+    """A failed governed snapshot is terminal and permits the next manual run."""
+    feature = await _feature(_Host(_snapshot(), fail_snapshot=True), tmp_path)
+    feature._adapter.is_available = lambda: True
+
+    for _ in range(2):
+        started = await feature.parametric_self_train_now()
+        assert started.data["started"] is True
+        await feature._training_task
+        progress = await feature.parametric_self_progress()
+        assert progress.data == {"active_run": None}
+        assert feature._active_run is None
+
+    runs = await feature._load_run_history()
+    assert len(runs) == 2
+    assert all(run["state"] == "skipped" for run in runs)
+    assert all(
+        run["reason"] == "governed corpus unavailable or semantic maintenance incomplete"
+        for run in runs
+    )
+
+
 def test_training_hook_declares_successful_semantic_maintenance_prerequisite():
     contract = ParametricSelfSleepHook.sleep_hook_contract
     assert contract.hook_id == "kestrel_feature_parametric_self.training"
