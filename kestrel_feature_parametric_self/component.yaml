@@ -44,6 +44,9 @@ tools:
   - name: parametric-self-set-enabled
     description: Enable/disable nightly training for this agent (durable)
     command: "!parametric-self-enable"
+  - name: parametric-self-recover-shutdown
+    description: Sovereign-only explicit recovery after verifying a prior trainer process is absent
+    command: "!parametric-self-recover-shutdown"
   - name: parametric-self-rollback
     description: Roll the served adapter back to a prior candidate
     command: "!parametric-self-rollback"

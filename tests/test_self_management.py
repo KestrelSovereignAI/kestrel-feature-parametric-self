@@ -157,6 +157,10 @@ async def test_mutation_tools_refused_for_governed_agent():
     for result in (
         await f.parametric_self_train_now(),
         await f.parametric_self_set_enabled(True),
+        await f.parametric_self_recover_shutdown(
+            confirmed_process_absent=True,
+            evidence="checked process table; no trainer remains",
+        ),
         await f.parametric_self_rollback(),
     ):
         assert result.status == ToolResultStatus.ERROR
@@ -532,6 +536,54 @@ async def test_nightly_unconfirmed_shutdown_blocks_like_manual(tmp_path):
     await final.post_all_features_loaded(final.agent)
     assert final._training_shutdown_incomplete is not None
     assert final._cycle_in_flight is True
+
+
+async def test_restored_shutdown_requires_explicit_sovereign_recovery_evidence(tmp_path):
+    """A restart block has one explicit, auditable recovery path—not a silent ack."""
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    retained = tmp_path / "parametric_self" / "corpus" / "old-run"
+    retained.mkdir(parents=True)
+    (retained / "train.jsonl").write_text('{"text":"private"}\n')
+    await f._append_run_history({
+        "run_id": "old-run", "trigger": "nightly", "state": "shutdown_incomplete",
+        "reason": "training shutdown incomplete: old process was not confirmed stopped",
+        "retained_corpus_path": str(retained),
+    })
+
+    restarted = ParametricSelfFeature(agent=f.agent)
+    await restarted.initialize()
+    restarted.agent.get_feature = MagicMock(return_value=restarted)
+    await restarted.post_all_features_loaded(restarted.agent)
+    status = await restarted.parametric_self_status()
+    assert status.data["shutdown_recovery_requires_external_confirmation"] is True
+    assert "!parametric-self-recover-shutdown" in status.confirmation
+
+    refused = await restarted.parametric_self_recover_shutdown()
+    assert refused.status == ToolResultStatus.ERROR
+    assert "confirmed_process_absent=true" in (refused.error or "")
+    assert restarted._training_shutdown_incomplete is not None
+    assert (retained / "train.jsonl").exists()
+
+    recovered = await restarted.parametric_self_recover_shutdown(
+        confirmed_process_absent=True,
+        evidence="ps check at 2026-07-31 confirmed no prior mlx_lm.lora process",
+    )
+    assert recovered.status == ToolResultStatus.OK
+    assert restarted._training_shutdown_incomplete is None
+    assert restarted._shutdown_recovery_requires_external_confirmation is False
+    assert restarted._cycle_in_flight is False
+    assert not (retained / "train.jsonl").exists()
+    runs = await restarted._load_run_history()
+    assert runs[-1]["state"] == "interrupted"
+    assert "sovereign operator verified" in runs[-1]["reason"]
+
+    final = ParametricSelfFeature(agent=f.agent)
+    await final.initialize()
+    final.agent.get_feature = MagicMock(return_value=final)
+    await final.post_all_features_loaded(final.agent)
+    assert final._training_shutdown_incomplete is None
+    assert final._shutdown_recovery_requires_external_confirmation is False
+    assert final._cycle_in_flight is False
 
 
 async def test_disable_fences_sleep_cycle_waiting_to_launch():

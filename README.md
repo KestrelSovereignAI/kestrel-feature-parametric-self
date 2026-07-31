@@ -49,6 +49,23 @@ revision, missing manifest, or unverifiable host capability quarantines the
 affected candidate or served adapter until it is rebuilt. This is intentionally
 a visible no-op rather than a fallback to ungoverned factual training.
 
+## Incomplete-shutdown recovery
+
+If status reports a shutdown restored from a prior process, training remains
+blocked and any retained per-run corpus stays in place. A new adapter's empty
+job list cannot prove that an old trainer exited. After a sovereign operator
+checks that every prior trainer process is absent, they must record that fresh
+evidence explicitly:
+
+```text
+!parametric-self-recover-shutdown confirmed_process_absent=true evidence="ps check found no prior mlx_lm.lora process"
+```
+
+The command is sovereign-class gated. It refuses an omitted/false confirmation,
+missing evidence, or a still-live feature-owned task; on success it
+terminalizes the durable run record and removes only its recorded per-run
+corpus files.
+
 ## Development
 
 ```bash

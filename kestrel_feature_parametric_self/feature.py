@@ -391,6 +391,14 @@ class ParametricSelfFeature(Feature):
             )
         if self._training_shutdown_incomplete:
             confirmation += f" WARNING: {self._training_shutdown_incomplete}."
+        if self._shutdown_recovery_requires_external_confirmation:
+            confirmation += (
+                " The prior process is not provably owned by this instance; after "
+                "verifying every prior trainer process is absent, a sovereign operator "
+                "must explicitly acknowledge that evidence with "
+                "`!parametric-self-recover-shutdown confirmed_process_absent=true "
+                "evidence=\"<process check>\"`."
+            )
         if legacy_cleanup_needed:
             confirmation += " WARNING: legacy corpus plaintext retained; verified cleanup is required."
         if recoverable:
@@ -1145,6 +1153,71 @@ class ParametricSelfFeature(Feature):
         )
 
     @tool(
+        name="parametric-self-recover-shutdown",
+        description=(
+            "Clear a persisted parametric-self incomplete-shutdown block after a "
+            "sovereign operator verifies every prior trainer process is absent; "
+            "requires explicit confirmation plus evidence"
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!parametric-self-recover-shutdown",
+    )
+    async def parametric_self_recover_shutdown(
+        self,
+        confirmed_process_absent: bool = False,
+        evidence: str = "",
+    ) -> ToolResult:
+        """Record an explicit, sovereign recovery proof for an old process.
+
+        A replacement feature instance cannot inspect a child process started by
+        its predecessor. This tool intentionally does not infer that safety from
+        an empty adapter job list: the operator must freshly verify the old
+        trainer is absent, then supply both an affirmative boolean and concise
+        evidence of that verification. Only then may retained corpus plaintext
+        be removed and the durable lifecycle block be terminalized.
+        """
+        self._ensure_training_lifecycle_state()
+        gate = self._require_sovereign_class()
+        if gate is not None:
+            return gate
+        if self._training_shutdown_incomplete is None:
+            return ToolResult.failed("No parametric-self incomplete-shutdown recovery is pending.")
+        if not _as_bool(confirmed_process_absent):
+            return ToolResult.failed(
+                "Recovery is blocked. First verify every prior trainer process is absent, "
+                "then set confirmed_process_absent=true and provide the check as evidence."
+            )
+        evidence = str(evidence).strip()
+        if len(evidence) < 12:
+            return ToolResult.failed(
+                "Recovery requires non-empty, specific process-absence evidence "
+                "(for example, the command/check and its result)."
+            )
+        active_tasks = (
+            task for task in (self._training_task, self._cycle_task)
+            if task is not None and not task.done() and task is not asyncio.current_task()
+        )
+        if any(active_tasks):
+            return ToolResult.failed(
+                "Recovery is blocked while this feature still owns a live training task."
+            )
+
+        await self._resolve_training_shutdown_incomplete(
+            reason=(
+                "run interrupted after sovereign operator verified prior trainer "
+                f"process absent: {evidence}"
+            ),
+        )
+        self._cycle_in_flight = False
+        return ToolResult.ok(
+            confirmation=(
+                "Incomplete-shutdown recovery recorded after explicit process-absence "
+                "verification; retained per-run corpus input was removed where recorded."
+            ),
+            data={"recovered": True, "evidence": evidence},
+        )
+
+    @tool(
         name="parametric-self-rollback",
         description="Roll the served parametric-self adapter back to a prior candidate (sovereign-class only); default = the previously-served promoted adapter",
         category=ToolCategory.SYSTEM,
@@ -1747,9 +1820,12 @@ class ParametricSelfFeature(Feature):
         except Exception as exc:  # preserve the local safety marker regardless
             logger.warning("Failed to mark parametric-self shutdown incomplete: %s", exc)
 
-    async def _resolve_training_shutdown_incomplete(self) -> None:
+    async def _resolve_training_shutdown_incomplete(
+        self,
+        *,
+        reason: str = "run cancelled (feature disabled; bulk trainer stop confirmed)",
+    ) -> None:
         """Clear a prior incomplete-shutdown block after bulk stop confirmation."""
-        reason = "run cancelled (feature disabled; bulk trainer stop confirmed)"
         active_run = getattr(self, "_active_run", None)
         run_ids = set()
         retained_paths = set()

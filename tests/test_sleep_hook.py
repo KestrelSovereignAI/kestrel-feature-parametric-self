@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -12,6 +14,7 @@ from kestrel_feature_parametric_self import (
     ParametricSelfSleepHook,
     create_parametric_self_sleep_hook,
 )
+from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
 
 
 async def test_wrapper_delegates_to_feature():
@@ -107,6 +110,73 @@ async def test_enabled_supported_trainer_without_policy_remains_a_sleep_failure(
     out = await ParametricSelfSleepHook(feature).on_post_consolidation(agent, {})
 
     assert out["reason"] == "governed corpus policy is not configured"
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
+
+
+async def test_actual_hook_marks_feature_disable_interruption_as_skipped():
+    """The expected feature-disable path must not fail the core sleep cycle."""
+    agent = MagicMock()
+    agent.is_test_instance = False
+    agent.storage = None
+    agent.storage_path = None
+    feature = ParametricSelfFeature(agent=agent)
+    await feature.initialize()
+    feature._training_enabled = True
+    feature._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _slow_cycle(*, trigger):
+        started.set()
+        await asyncio.Event().wait()
+
+    async def _confirmed_cancel_all():
+        return SimpleNamespace(all_stopped=True)
+
+    feature._run_training_cycle_locked = _slow_cycle
+    feature._adapter.cancel_all = _confirmed_cancel_all
+    hook_task = asyncio.create_task(
+        ParametricSelfSleepHook(feature).on_post_consolidation(agent, {})
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await feature.on_disable()
+    out = await hook_task
+    assert out["success"] is True
+    assert out["skipped"] is True
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.SKIPPED
+
+
+async def test_actual_hook_keeps_unconfirmed_trainer_shutdown_failed():
+    """Unsafe trainer shutdown remains a visible failed sleep dependency."""
+    agent = MagicMock()
+    agent.is_test_instance = False
+    agent.storage = None
+    agent.storage_path = None
+    feature = ParametricSelfFeature(agent=agent)
+    await feature.initialize()
+    feature._training_enabled = True
+    feature._adapter.is_available = lambda: True
+    started = asyncio.Event()
+
+    async def _unconfirmed_cycle(*, trigger):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise TrainingShutdownIncomplete("trainer stop could not be confirmed")
+
+    async def _unconfirmed_cancel_all():
+        return SimpleNamespace(all_stopped=False)
+
+    feature._run_training_cycle_locked = _unconfirmed_cycle
+    feature._adapter.cancel_all = _unconfirmed_cancel_all
+    hook_task = asyncio.create_task(
+        ParametricSelfSleepHook(feature).on_post_consolidation(agent, {})
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await feature.on_disable()
+    out = await hook_task
+    assert out["success"] is False
+    assert out["skipped"] is False
     assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
 
 
