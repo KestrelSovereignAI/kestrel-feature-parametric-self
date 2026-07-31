@@ -286,7 +286,7 @@ async def test_on_disable_cancels_in_flight_training_task():
 
     async def _cancel_all():
         cancel_all_called.set()
-        return 0
+        return SimpleNamespace(all_stopped=True)
 
     f._adapter.cancel_all = _cancel_all
 
@@ -298,6 +298,9 @@ async def test_on_disable_cancels_in_flight_training_task():
     await f.on_disable()
     assert f._training_task is None
     assert cancel_all_called.is_set()  # subprocess termination requested
+    assert f._training_shutdown_incomplete is None
+    assert f._cycle_in_flight is False
+    assert (await f.parametric_self_status()).data["training_shutdown_incomplete"] is None
     with pytest.raises(asyncio.CancelledError):
         await task
 
@@ -325,6 +328,47 @@ async def test_on_disable_clears_guard_when_cancel_precedes_runner():
     assert f._training_task is None
     runs = await f._load_run_history()
     assert runs[-1]["state"] == "interrupted"
+
+
+async def test_on_disable_surfaces_unconfirmed_trainer_shutdown():
+    """Disable must not claim a live child stopped when bulk confirmation fails."""
+    from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
+
+    f = await _feature(_FakeStorage(), storage_path="/x/kestrel_prime.db")
+    f._adapter.is_available = lambda: True
+    f.agent.sleep_hooks = []
+    started = asyncio.Event()
+
+    async def _unconfirmed_cycle(*, trigger):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise TrainingShutdownIncomplete("trainer stop could not be confirmed; corpus retained")
+
+    async def _unconfirmed_cancel_all():
+        return SimpleNamespace(all_stopped=False)
+
+    f._run_training_cycle_locked = _unconfirmed_cycle
+    f._adapter.cancel_all = _unconfirmed_cancel_all
+    result = await f.parametric_self_train_now()
+    assert result.status == ToolResultStatus.OK
+    task = f._training_task
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await f.on_disable()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert f._training_task is None
+    assert f._cycle_in_flight is True
+    assert f._active_run is not None
+    assert f._active_run["state"] == "shutdown_incomplete"
+    status = await f.parametric_self_status()
+    assert "shutdown incomplete" in status.confirmation
+    assert "shutdown incomplete" in status.data["training_shutdown_incomplete"]
+    assert status.data["active_run"]["state"] == "shutdown_incomplete"
+    runs = await f._load_run_history()
+    assert runs[-1]["state"] == "shutdown_incomplete"
 
 
 async def test_train_now_cancellation_during_history_reservation_recovers():

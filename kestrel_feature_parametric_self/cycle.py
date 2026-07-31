@@ -25,6 +25,10 @@ from .fidelity import FidelityGate, parse_final_val_loss
 from .text_types import TextLoRAConfig
 
 
+class TrainingShutdownIncomplete(asyncio.CancelledError):
+    """Cancellation where the trainer child could not be confirmed stopped."""
+
+
 class _TrainerProtocol(Protocol):
     """The slice of LocalMLXAdapter the cycle needs (so fakes can stand in)."""
 
@@ -182,6 +186,10 @@ async def run_nightly_cycle(
                 pass
             else:
                 training_active = not bool(stopped)
+        if training_active:
+            raise TrainingShutdownIncomplete(
+                "trainer stop could not be confirmed; corpus retained"
+            )
         raise
     finally:
         # The corpus is transient training INPUT derived from user-authored

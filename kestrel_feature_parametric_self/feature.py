@@ -30,7 +30,7 @@ from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from .cycle import run_nightly_cycle
+from .cycle import TrainingShutdownIncomplete, run_nightly_cycle
 from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
 from .local_mlx_adapter import LocalMLXAdapter
 from .text_types import TextLoRAConfig
@@ -125,6 +125,10 @@ class ParametricSelfFeature(Feature):
         self._manual_run_lock = asyncio.Lock()
         self._manual_run_generation = 0
         self._manual_runs_enabled = True
+        # Set only when cancellation cannot confirm the spawned child stopped.
+        # It deliberately blocks new mutations until a clean lifecycle boundary
+        # (normally process restart) rather than pretending a live child is gone.
+        self._training_shutdown_incomplete: Optional[str] = None
         # The currently-running cycle's durable record (run_id, adapter_id,
         # trigger, started_at, state, adapter_path), or None when idle. Set when
         # a cycle begins so the introspection tools can distinguish "no run",
@@ -342,6 +346,7 @@ class ParametricSelfFeature(Feature):
             "served_val_loss": self._last_val_loss,
             "recoverable_adapters": recoverable,
             "active_run": active_run,
+            "training_shutdown_incomplete": self._training_shutdown_incomplete,
         }
         confirmation = (
             "Parametric-self "
@@ -354,6 +359,8 @@ class ParametricSelfFeature(Feature):
                 f" (run {active_run['run_id']}, iter {active_run.get('last_seen_iter')},"
                 f" latest val_loss {active_run.get('latest_val_loss')})."
             )
+        if self._training_shutdown_incomplete:
+            confirmation += f" WARNING: {self._training_shutdown_incomplete}."
         if recoverable:
             confirmation += (
                 f" No adapter served; {len(recoverable)} valid candidate(s) recoverable via "
@@ -968,6 +975,11 @@ class ParametricSelfFeature(Feature):
         async with self._manual_run_lock:
             if not self._manual_runs_enabled:
                 return ToolResult.failed("Parametric-self training is unavailable while this feature is disabled.")
+            if self._training_shutdown_incomplete:
+                return ToolResult.failed(
+                    "Parametric-self training is blocked: "
+                    f"{self._training_shutdown_incomplete}."
+                )
             if self._cycle_in_flight or (
                 self._training_task is not None and not self._training_task.done()
             ):
@@ -1028,15 +1040,25 @@ class ParametricSelfFeature(Feature):
                             "reason": outcome.get("reason", "training completed"),
                         })
                         self._active_run = None
-                except asyncio.CancelledError:
-                    # ``run_nightly_cycle`` terminates and confirms any child
-                    # trainer before this handler runs, so it is now safe to
-                    # finalize the durable record and expose no active run.
-                    await self._interrupt_active_run(
-                        run_id=active_run["run_id"], reason="run cancelled",
-                    )
+                except asyncio.CancelledError as exc:
+                    # A normal cycle cancellation confirms the child before
+                    # this handler finalizes its run. An explicit incomplete
+                    # shutdown instead keeps an observable nonterminal record.
+                    incomplete = isinstance(exc, TrainingShutdownIncomplete)
+                    if incomplete:
+                        await self._mark_training_shutdown_incomplete(
+                            run_id=active_run["run_id"], reason=str(exc),
+                        )
+                    else:
+                        await self._interrupt_active_run(
+                            run_id=active_run["run_id"], reason="run cancelled",
+                        )
                     if self._training_task is asyncio.current_task():
                         self._training_task = None
+                    if incomplete:
+                        # Do not release the shared mutation guard while the
+                        # child may still be alive and writing its adapter.
+                        self._cycle_in_flight = True
                     raise
                 except Exception as exc:
                     active = getattr(self, "_active_run", None)
@@ -1049,7 +1071,8 @@ class ParametricSelfFeature(Feature):
                         self._active_run = None
                     logger.warning("parametric-self manual training run failed: %s", exc)
                 finally:
-                    self._cycle_in_flight = False
+                    if self._training_shutdown_incomplete is None:
+                        self._cycle_in_flight = False
 
             self._training_task = asyncio.create_task(_runner())
         return ToolResult.ok(
@@ -1545,6 +1568,25 @@ class ParametricSelfFeature(Feature):
             if self._active_run is active_run:
                 self._active_run = None
 
+    async def _mark_training_shutdown_incomplete(
+        self, *, run_id: str, reason: str,
+    ) -> None:
+        """Expose an unconfirmed child shutdown without claiming it is terminal."""
+        diagnostic = f"training shutdown incomplete: {reason}"
+        self._training_shutdown_incomplete = diagnostic
+        active_run = getattr(self, "_active_run", None)
+        if active_run is None or active_run.get("run_id") != run_id:
+            return
+        active_run["state"] = "shutdown_incomplete"
+        try:
+            await self._update_run_history(run_id, {
+                "state": "shutdown_incomplete",
+                "timestamp": _utc_now_iso(),
+                "reason": diagnostic,
+            })
+        except Exception as exc:  # preserve the local safety marker regardless
+            logger.warning("Failed to mark parametric-self shutdown incomplete: %s", exc)
+
     # ------------------------------------------------------------------
     # Run-history store (append-only, capped) — lets the agent introspect
     # its own training lifecycle (feedback_agent_must_introspect_lifecycle).
@@ -1577,9 +1619,9 @@ class ParametricSelfFeature(Feature):
         """Merge ``updates`` into the most recent history entry with ``run_id``.
 
         Lets a run's record transition in place (``in_progress`` ->
-        ``completed``/``skipped``/``failed``/``interrupted``) instead of
-        appending a second entry, so an in-flight run is one durable record an
-        agent can poll to completion.
+        ``completed``/``skipped``/``failed``/``interrupted`` or an observable
+        ``shutdown_incomplete`` state) instead of appending a second entry, so
+        an in-flight run is one durable record an agent can poll to completion.
         No-ops if the entry is gone (capped out) — falls back to appending so the
         outcome is never silently lost.
         """
@@ -1627,6 +1669,15 @@ class ParametricSelfFeature(Feature):
                     entry["state"] = "interrupted"
                     entry["reason"] = "run interrupted (process restarted before completion)"
                     changed = True
+                elif entry.get("state") == "shutdown_incomplete":
+                    # A replacement feature instance cannot prove the old
+                    # process's child exited. Preserve the safety block and its
+                    # durable diagnostic rather than silently admitting a new
+                    # training mutation alongside a possible survivor.
+                    self._training_shutdown_incomplete = str(
+                        entry.get("reason", "training shutdown incomplete")
+                    )
+                    self._cycle_in_flight = True
             if changed:
                 await storage.add_node(GraphNode(
                     node_id=self._history_node_id(),
@@ -1730,17 +1781,37 @@ class ParametricSelfFeature(Feature):
             # was cancelled before its runner began, and do it BEFORE state or
             # history cleanup so corpus cleanup can never race a live trainer.
             adapter = getattr(self, "_adapter", None)
+            shutdown_confirmed = True
             if adapter is not None and hasattr(adapter, "cancel_all"):
                 try:
-                    await adapter.cancel_all()
+                    shutdown = await adapter.cancel_all()
+                    shutdown_confirmed = getattr(shutdown, "all_stopped", None) is True
+                    if not shutdown_confirmed:
+                        logger.critical(
+                            "Parametric-self shutdown incomplete: bulk trainer stop did not confirm all children stopped"
+                        )
                 except Exception as exc:  # teardown must never raise
+                    shutdown_confirmed = False
                     logger.warning("Failed to cancel parametric-self training subprocess(es): %s", exc)
 
-            # Force-clear the cross-trigger guard: if the cancel landed before
-            # _runner started, its finally never ran and the guard would stay
-            # stuck, permanently refusing later train/rollback on re-enable.
-            self._cycle_in_flight = False
-            await self._interrupt_active_run(reason="run cancelled (feature disabled)")
+            if not shutdown_confirmed:
+                active_run = getattr(self, "_active_run", None)
+                if active_run is not None:
+                    await self._mark_training_shutdown_incomplete(
+                        run_id=active_run["run_id"],
+                        reason="bulk trainer stop did not confirm all children stopped",
+                    )
+                else:
+                    self._training_shutdown_incomplete = (
+                        "training shutdown incomplete: bulk trainer stop did not confirm all children stopped"
+                    )
+                self._cycle_in_flight = True
+            else:
+                # Force-clear the cross-trigger guard: if the cancel landed before
+                # _runner started, its finally never ran and the guard would stay
+                # stuck, permanently refusing later train/rollback on re-enable.
+                self._cycle_in_flight = False
+                await self._interrupt_active_run(reason="run cancelled (feature disabled)")
 
         hook = getattr(self, "_sleep_hook", None)
         hooks = getattr(self.agent, "sleep_hooks", None)
