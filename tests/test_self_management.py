@@ -709,6 +709,8 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
 async def test_cycle_marks_failed_on_exception(tmp_path):
     db = _db_path_with_corpus(tmp_path)
     f = await _feature(_FakeStorage(), storage_path=db)
+    # Reach the patched training exception path on Linux CI as well as macOS.
+    f._adapter.is_available = lambda: True
     import kestrel_feature_parametric_self.feature as feat_mod
 
     async def _boom(**kwargs):

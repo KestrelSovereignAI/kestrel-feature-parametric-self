@@ -89,6 +89,8 @@ def _stamp(feature, candidate) -> None:
 
 async def test_unavailable_or_incomplete_host_capability_is_a_visible_skip(tmp_path):
     feature = await _feature(_Host(_snapshot(), fail_snapshot=True), tmp_path)
+    # This test exercises the governed-capability seam, not local MLX support.
+    feature._adapter.is_available = lambda: True
     outcome = await feature._run_training_cycle_locked(trigger="nightly")
     assert outcome == {
         "trained": False, "promoted": False,
