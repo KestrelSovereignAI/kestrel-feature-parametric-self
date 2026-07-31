@@ -8,6 +8,9 @@ gate: governed/test instances must be refused, sovereign-class agents allowed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +18,40 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_feature_parametric_self import ParametricSelfFeature
+
+
+def _snapshot():
+    assertion = SimpleNamespace(
+        assertion_id="assertion:test", revision_id="revision:test",
+        subject=SimpleNamespace(value="https://example.test/agent"),
+        predicate=SimpleNamespace(value="https://example.test/lesson"),
+        object=SimpleNamespace(lexical_form="lesson"),
+    )
+    return SimpleNamespace(
+        verified=True, examples=(SimpleNamespace(
+            assertion=assertion, content_hash="sha256:test", source_occurrences=(),
+            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+        ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
+        checkpoint=SimpleNamespace(generation=1, latest_event_id="event:1"),
+        capability_versions={"semantic_maintenance": "1"},
+    )
+
+
+def _write_governed_manifest(candidate):
+    raw = {
+        "schema_version": 1, "corpus_policy_version": "parametric-self-corpus-v1",
+        "policy_digest": "sha256:policy", "snapshot_hash": "sha256:snapshot",
+        "semantic_checkpoint": {"generation": 1, "event_id": "event:1"},
+        "capability_versions": {"semantic_maintenance": "1"},
+        "counts": {"total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1},
+        "examples": [{"example_id": "example:1", "source": "governed_assertion", "split": "train", "lineage": {
+            "assertion_id": "assertion:test", "revision_id": "revision:test", "content_hash": "sha256:test",
+            "source_occurrence_ids": [], "eligibility": "included",
+        }}],
+    }
+    encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    raw["manifest_hash"] = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+    (candidate / "corpus_manifest.json").write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
 
 
 class _FakeStorage:
@@ -28,6 +65,12 @@ class _FakeStorage:
 
     async def get_node(self, node_id):
         return self.nodes.get(node_id)
+
+    async def governed_assertion_corpus_snapshot(self, **_kwargs):
+        return _snapshot()
+
+    async def governed_assertion_corpus_changes_since(self, _snapshot_value, **_kwargs):
+        return SimpleNamespace(tombstones=())
 
 
 def _agent(storage=None, *, is_test_instance=False, storage_path=None):
@@ -47,6 +90,7 @@ async def _feature(storage=None, *, is_test_instance=False, storage_path=None):
         storage, is_test_instance=is_test_instance, storage_path=storage_path,
     ))
     await f.initialize()
+    f._governed_corpus_policy = SimpleNamespace(digest="sha256:policy")
     return f
 
 
@@ -282,6 +326,7 @@ async def test_rollback_default_to_previous_promoted(tmp_path):
     for d, loss in ((old, "2.900"), (new, "2.600")):
         d.mkdir(parents=True)
         (d / "train.log").write_text(f"Val loss {loss}\n")
+        _write_governed_manifest(d)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     # History records both promotions; new is currently served.
@@ -305,6 +350,7 @@ async def test_rollback_explicit_adapter_id(tmp_path, arg):
     target = cands / "pick99"
     target.mkdir(parents=True)
     (target / "train.log").write_text("Val loss 2.750\n")
+    _write_governed_manifest(target)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     f._active_adapter_path = "/some/other/served"
@@ -388,6 +434,7 @@ async def test_adapters_marks_recoverable_when_unserved(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     # No served adapter (the legacy/interrupted-run state).
     assert f._active_adapter_path is None
@@ -404,6 +451,7 @@ async def test_status_exposes_recoverable_candidates(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
 
     result = await f.parametric_self_status()
@@ -416,6 +464,7 @@ async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_governed_manifest(cands)
     storage = _FakeStorage()
     f = await _feature(storage, storage_path=str(tmp_path / "kestrel_prime.db"))
 
@@ -434,6 +483,7 @@ async def test_adopt_accepts_leaked_key_value_token(tmp_path, arg):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Val loss 2.688\n")
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     result = await f.parametric_self_adopt(adapter_id=arg)
     assert result.status == ToolResultStatus.OK
@@ -489,6 +539,7 @@ async def test_adopt_rejects_candidate_failing_fidelity_gate(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "toobad"
     cands.mkdir(parents=True)
     (cands / "train.log").write_text("Val loss 3.500\n")  # > max_val_loss (3.0)
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     result = await f.parametric_self_adopt(adapter_id="toobad")
     assert result.status == ToolResultStatus.ERROR
@@ -606,11 +657,14 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
         return CycleResult(
             trained=True, promoted=True, reason="ok", val_loss=1.2,
             promoted_adapter_path=kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"],
-            corpus_train=5,
+            corpus_train=5, corpus_manifest_hash="sha256:fake",
         )
 
     orig = feat_mod.run_nightly_cycle
     feat_mod.run_nightly_cycle = _fake_run_cycle
+    async def _valid_lineage(*_args, **_kwargs):
+        return None
+    f._verify_adapter_lineage = _valid_lineage
     try:
         outcome = await real_run(trigger="manual")
     finally:

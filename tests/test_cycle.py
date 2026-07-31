@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 
-from kestrel_feature_parametric_self import FidelityGate, TextLoRAConfig, run_nightly_cycle
+from kestrel_feature_parametric_self import FidelityGate, TextLoRAConfig, run_nightly_cycle as _run_nightly_cycle
+
+
+def _snapshot():
+    assertion = SimpleNamespace(
+        assertion_id="assertion:cycle", revision_id="revision:cycle",
+        subject=SimpleNamespace(value="https://example.test/agent"),
+        predicate=SimpleNamespace(value="https://example.test/lesson"),
+        object=SimpleNamespace(lexical_form="governed lesson"),
+    )
+    return SimpleNamespace(
+        verified=True, examples=(SimpleNamespace(
+            assertion=assertion, content_hash="sha256:cycle", source_occurrences=(),
+            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+        ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
+        checkpoint=SimpleNamespace(generation=1, latest_event_id="event:1"),
+        capability_versions={"semantic_maintenance": "1"},
+    )
+
+
+SNAPSHOT = _snapshot()
+
+
+async def run_nightly_cycle(**kwargs):
+    """Every direct cycle test still supplies the public host snapshot."""
+    kwargs.setdefault("governed_snapshot", SNAPSHOT)
+    return await _run_nightly_cycle(**kwargs)
 
 
 def _db_with(tmp_path, rows, fact=True) -> str:
@@ -19,15 +46,10 @@ def _db_with(tmp_path, rows, fact=True) -> str:
         "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT NOT NULL, "
         "description TEXT, suggested_action TEXT)"
     )
-    con.execute("CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT, label TEXT, properties TEXT)")
     con.executemany(
         "INSERT INTO reflection_insights (id,type,title,description,suggested_action) VALUES (?,?,?,?,?)",
         rows,
     )
-    if fact:
-        con.execute(
-            "INSERT INTO graph_nodes (node_id,node_type,label,properties) VALUES ('n','learned_fact','f','{}')"
-        )
     con.commit()
     con.close()
     return db
@@ -91,6 +113,12 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
     db = _db_with(tmp_path, [("1", "anomaly", "Musing", "A stray thought.", "")], fact=False)
     result = await run_nightly_cycle(
         agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        governed_snapshot=SimpleNamespace(
+            verified=True, examples=(), snapshot_hash="sha256:empty",
+            policy=SimpleNamespace(digest="sha256:policy"),
+            checkpoint=SimpleNamespace(generation=1, latest_event_id="event:1"),
+            capability_versions={"semantic_maintenance": "1"},
+        ),
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )

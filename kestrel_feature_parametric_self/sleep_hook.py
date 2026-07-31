@@ -16,11 +16,22 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+from kestrel_sovereign.agent.sleep import SleepHookContract, SleepHookPhase
+
 logger = logging.getLogger(__name__)
 
 
 class ParametricSelfSleepHook:
     """Integrates parametric-self nightly training into the sleep cycle."""
+
+    # The core scheduler turns this declarative edge into a hard-success
+    # prerequisite: training cannot consume a corpus after partial/failed
+    # semantic maintenance, even if a hook was registered earlier.
+    sleep_hook_contract = SleepHookContract(
+        hook_id="kestrel_feature_parametric_self.training",
+        phase=SleepHookPhase.TRAINING,
+        after=("kestrel_sovereign.semantic_maintenance",),
+    )
 
     def __init__(self, feature) -> None:
         self.feature = feature

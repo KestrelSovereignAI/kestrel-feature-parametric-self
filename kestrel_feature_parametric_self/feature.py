@@ -98,6 +98,18 @@ class ParametricSelfFeature(Feature):
         self._base_config = TextLoRAConfig()        # base hyperparameters
         self._active_adapter_path: Optional[str] = None   # currently served adapter
         self._last_val_loss: Optional[float] = None        # served adapter's fidelity
+        # The feature never infers a permissive training policy.  An operator or
+        # host must supply this explicit governed-corpus release policy.
+        self._governed_corpus_policy = None
+        self._governed_inference_profile = None
+        # A live snapshot permits incremental tombstone checks during this
+        # process.  It is intentionally not treated as restart-durable proof.
+        self._live_corpus_snapshot = None
+        # Durable metadata is content-free: hashes, checkpoint pins, and exact
+        # assertion/revision lineage only.  Adapter state lives separately from
+        # the immutable candidate-side manifest.
+        self._adapter_lineage: Dict[str, Dict[str, Any]] = {}
+        self._quarantined_adapters: Dict[str, str] = {}
         # Optional overrides (tests / non-standard layouts); else resolved from agent.
         self._db_path: Optional[str] = None
         self._work_dir: Optional[str] = None
@@ -138,6 +150,7 @@ class ParametricSelfFeature(Feature):
             "enable_nightly_training": self._training_enabled,
             "base_model": self._base_config.base_model,
             "active_adapter_path": self._active_adapter_path,
+            "governed_corpus_policy": self._policy_mapping(),
         }
 
     async def set_config(self, config: Dict[str, Any]) -> None:
@@ -145,8 +158,58 @@ class ParametricSelfFeature(Feature):
             self._training_enabled = bool(config["enable_nightly_training"])
         if config.get("base_model"):
             self._base_config.base_model = str(config["base_model"])
+        if "governed_corpus_policy" in config:
+            self._governed_corpus_policy = self._coerce_policy(
+                config["governed_corpus_policy"]
+            )
+        if "governed_inference_profile" in config:
+            self._governed_inference_profile = config["governed_inference_profile"]
         # Persist so the enablement survives restarts (durable per-agent gate).
         await self._persist_config()
+
+    def _policy_mapping(self) -> Optional[Dict[str, Any]]:
+        policy = self._governed_corpus_policy
+        serializer = getattr(policy, "to_mapping", None)
+        if callable(serializer):
+            try:
+                value = serializer()
+                return value if isinstance(value, dict) else None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_policy(value: Any):
+        """Accept only the public policy value or its canonical mapping.
+
+        Imports are deliberately runtime-only: non-MLX Linux hosts can still
+        install/import this feature, and an older host is reported as a visible
+        unavailable capability rather than failing package import.
+        """
+        if value is None or hasattr(value, "digest"):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("governed_corpus_policy must be a public policy or mapping")
+        from kestrel_sovereign.knowledge import GovernedCorpusPolicy, OntologyRef
+
+        pins = tuple(OntologyRef.from_mapping(item) for item in value["accepted_ontology_pins"])
+        capabilities = tuple(
+            (str(item["name"]), str(item["version"]))
+            for item in value["accepted_semantic_capability_versions"]
+        )
+        return GovernedCorpusPolicy(
+            policy_id=value["policy_id"], policy_version=value["policy_version"],
+            accepted_epistemic_states=tuple(value["accepted_epistemic_states"]),
+            accepted_visibility=tuple(value["accepted_visibility"]),
+            accepted_privacy_classifications=tuple(value["accepted_privacy_classifications"]),
+            accepted_consent_references=tuple(value["accepted_consent_references"]),
+            accepted_grounding_classes=tuple(value["accepted_grounding_classes"]),
+            accepted_source_kinds=tuple(value["accepted_source_kinds"]),
+            accepted_ontology_pins=pins,
+            accepted_semantic_capability_versions=capabilities,
+            allow_inferred=bool(value.get("allow_inferred", False)),
+            accepted_derivation_profiles=tuple(value.get("accepted_derivation_profiles", ())),
+        )
 
     # ------------------------------------------------------------------
     # Per-agent config persistence (graph node, mirrors the sovereign base)
@@ -169,6 +232,9 @@ class ParametricSelfFeature(Feature):
             # as its anti-regression baseline (it's lost across restarts otherwise).
             "active_adapter_path": self._active_adapter_path,
             "last_val_loss": self._last_val_loss,
+            "governed_corpus_policy": self._policy_mapping(),
+            "adapter_lineage": self._adapter_lineage,
+            "quarantined_adapters": self._quarantined_adapters,
         }
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -208,6 +274,17 @@ class ParametricSelfFeature(Feature):
                 self._active_adapter_path = str(cfg["active_adapter_path"])
             if cfg.get("last_val_loss") is not None:
                 self._last_val_loss = float(cfg["last_val_loss"])
+            if "governed_corpus_policy" in cfg:
+                self._governed_corpus_policy = self._coerce_policy(
+                    cfg.get("governed_corpus_policy")
+                )
+            if isinstance(cfg.get("adapter_lineage"), dict):
+                self._adapter_lineage = dict(cfg["adapter_lineage"])
+            if isinstance(cfg.get("quarantined_adapters"), dict):
+                self._quarantined_adapters = {
+                    str(path): str(reason)
+                    for path, reason in cfg["quarantined_adapters"].items()
+                }
         except Exception as e:
             logger.warning("Failed to restore parametric-self config (ignored): %s", e)
 
@@ -225,6 +302,8 @@ class ParametricSelfFeature(Feature):
     )
     async def parametric_self_status(self) -> ToolResult:
         """Report current state."""
+        if self._active_adapter_path:
+            await self._verify_adapter_lineage(self._active_adapter_path)
         # Surface the recovery state: a completed run can leave a valid candidate
         # on disk with no served pointer; expose those so the operator knows they
         # are adoptable via `!parametric-self-adopt` rather than appearing lost.
@@ -320,6 +399,136 @@ class ParametricSelfFeature(Feature):
             )
         except Exception:  # noqa: BLE001 - older host without the helper
             return False
+
+    def _resolved_governed_policy(self):
+        for candidate in (
+            self._governed_corpus_policy,
+            getattr(self.agent, "parametric_self_governed_corpus_policy", None),
+        ):
+            if isinstance(getattr(candidate, "digest", None), str):
+                return candidate
+        return None
+
+    def _resolved_inference_profile(self):
+        if self._governed_inference_profile is not None:
+            return self._governed_inference_profile
+        return getattr(self.agent, "semantic_inference_profile", None)
+
+    async def _request_governed_snapshot(self):
+        """Read only through the host's policy-gated, checkpointed capability."""
+        storage = getattr(self.agent, "storage", None)
+        policy = self._resolved_governed_policy()
+        reader = getattr(storage, "governed_assertion_corpus_snapshot", None)
+        if policy is None:
+            return None, "governed corpus policy is not configured"
+        if not callable(reader):
+            return None, "governed corpus capability unavailable on this host"
+        try:
+            snapshot = await reader(
+                policy=policy,
+                inference_profile=self._resolved_inference_profile(),
+            )
+        except Exception:
+            # Corpus failures may carry provider/tenant/source details.  Keep
+            # this operator-facing skip deliberately content-free.
+            return None, "governed corpus unavailable or semantic maintenance incomplete"
+        if not bool(getattr(snapshot, "verified", False)):
+            return None, "governed corpus returned unverified snapshot"
+        self._live_corpus_snapshot = snapshot
+        return snapshot, None
+
+    @staticmethod
+    def _manifest_lineage(path: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            raw = json.loads((Path(path) / "corpus_manifest.json").read_text())
+            expected = raw.pop("manifest_hash")
+            if not isinstance(expected, str):
+                return None, "candidate manifest hash missing"
+            encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            import hashlib
+            actual = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if actual != expected:
+                return None, "candidate manifest hash mismatch"
+            return raw, None
+        except Exception:
+            return None, "candidate manifest unavailable"
+
+    async def _quarantine_adapter(self, path: str, reason: str) -> None:
+        self._quarantined_adapters[path] = reason
+        if self._active_adapter_path == path:
+            self._active_adapter_path = None
+            self._last_val_loss = None
+        lineage = self._adapter_lineage.setdefault(path, {})
+        lineage["state"] = "invalid"
+        lineage["invalidation_reason"] = reason
+        await self._persist_config()
+
+    @staticmethod
+    def _manifest_assertion_pairs(manifest: Dict[str, Any]) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for example in manifest.get("examples", ()):
+            lineage = example.get("lineage", {}) if isinstance(example, dict) else {}
+            assertion_id, revision_id = lineage.get("assertion_id"), lineage.get("revision_id")
+            if isinstance(assertion_id, str) and isinstance(revision_id, str):
+                pairs.add((assertion_id, revision_id))
+        return pairs
+
+    async def _verify_adapter_lineage(self, path: str, *, before_promotion: bool = False) -> Optional[str]:
+        """Quarantine an adapter when its exact governed inputs no longer hold."""
+        manifest, manifest_error = self._manifest_lineage(path)
+        if manifest_error:
+            await self._quarantine_adapter(path, manifest_error)
+            return manifest_error
+        pairs = self._manifest_assertion_pairs(manifest or {})
+        snapshot = self._live_corpus_snapshot
+        storage = getattr(self.agent, "storage", None)
+        policy = self._resolved_governed_policy()
+        changes = getattr(storage, "governed_assertion_corpus_changes_since", None)
+        if snapshot is not None and callable(changes) and policy is not None:
+            try:
+                delta = await changes(
+                    snapshot, policy=policy,
+                    inference_profile=self._resolved_inference_profile(),
+                )
+            except Exception:
+                reason = "governed corpus delta unavailable; adapter cannot be verified"
+                await self._quarantine_adapter(path, reason)
+                return reason
+            tombstoned = {
+                (item.assertion_id, item.revision_id)
+                for item in getattr(delta, "tombstones", ())
+                if isinstance(getattr(item, "assertion_id", None), str)
+                and isinstance(getattr(item, "revision_id", None), str)
+            }
+            removed_ids = {
+                item.assertion_id for item in getattr(delta, "tombstones", ())
+                if isinstance(getattr(item, "assertion_id", None), str)
+            }
+            if tombstoned.intersection(pairs) or any(aid in removed_ids for aid, _ in pairs):
+                reason = "governed assertion lineage invalidated; rebuild required"
+                await self._quarantine_adapter(path, reason)
+                return reason
+            self._live_corpus_snapshot = None  # a delta is evidence only for its base snapshot
+            return None
+
+        # A process restart cannot reuse an in-memory snapshot as durable proof.
+        # Rebuild a fresh approved snapshot and compare exact revisions.
+        fresh, reason = await self._request_governed_snapshot()
+        if fresh is None:
+            await self._quarantine_adapter(path, reason or "governed corpus unavailable")
+            return reason
+        current = {
+            (item.assertion.assertion_id, item.assertion.revision_id)
+            for item in getattr(fresh, "examples", ())
+        }
+        if not pairs.issubset(current):
+            reason = "governed assertion lineage no longer current; rebuild required"
+            await self._quarantine_adapter(path, reason)
+            return reason
+        if before_promotion:
+            # The fresh snapshot is now the correct base for a subsequent delta.
+            self._live_corpus_snapshot = fresh
+        return None
         try:
             return bool(hides_persisted_user_content(self.agent))
         except Exception:  # noqa: BLE001 - never let a probe break the cycle
@@ -379,13 +588,23 @@ class ParametricSelfFeature(Feature):
                     except Exception:
                         val_loss = None
                 in_progress = active_id is not None and d.name == active_id
+                manifest, manifest_problem = self._manifest_lineage(str(d))
+                lineage_state = self._adapter_lineage.get(str(d), {}).get(
+                    "state", "candidate" if manifest is not None else "untracked"
+                )
+                quarantined_reason = self._quarantined_adapters.get(str(d))
                 adapters.append({
                     "adapter_id": d.name,
                     "path": str(d),
                     "val_loss": val_loss,
                     "served": str(d) == str(served) if served else False,
                     "in_progress": in_progress,
-                    "recoverable": served is None and val_loss is not None and not in_progress,
+                    "recoverable": (
+                        served is None and val_loss is not None and not in_progress
+                        and manifest is not None and not quarantined_reason
+                    ),
+                    "lineage_state": lineage_state,
+                    "quarantined_reason": quarantined_reason or manifest_problem,
                 })
         return adapters
 
@@ -526,8 +745,8 @@ class ParametricSelfFeature(Feature):
             return ToolResult.failed("A parametric-self training run is already in progress.")
 
         db_path, work_dir = self._resolve_paths()
-        if not db_path or not work_dir:
-            return ToolResult.failed("Could not resolve agent storage_path for parametric-self training.")
+        if not work_dir:
+            return ToolResult.failed("Could not resolve parametric-self work directory.")
 
         # Reserve the cross-trigger guard HERE, synchronously, before detaching:
         # otherwise the nightly hook could fire in the same event-loop turn,
@@ -663,6 +882,12 @@ class ParametricSelfFeature(Feature):
                     "(incomplete/failed run); refusing to serve it."
                 )
 
+            lineage_problem = await self._verify_adapter_lineage(target_path)
+            if lineage_problem:
+                return ToolResult.failed(
+                    f"Adapter '{Path(target_path).name}' is quarantined: {lineage_problem}."
+                )
+
             self._active_adapter_path = target_path
             self._last_val_loss = val_loss
             await self._persist_config()
@@ -745,6 +970,12 @@ class ParametricSelfFeature(Feature):
                     "(incomplete/failed run); refusing to serve it."
                 )
 
+            lineage_problem = await self._verify_adapter_lineage(target_path)
+            if lineage_problem:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' is quarantined: {lineage_problem}."
+                )
+
             # Same fidelity gate as a nightly promotion, against the current
             # baseline (``prior_val_loss`` is None in the first-adoption case).
             decision = self._gate.evaluate(val_loss, prior_val_loss=self._last_val_loss)
@@ -774,19 +1005,23 @@ class ParametricSelfFeature(Feature):
             self._cycle_in_flight = False
 
     def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve (cognition_db_path, work_dir) for this agent.
+        """Resolve optional reflection DB and required adapter working directory.
 
-        The agent exposes its cognition DB as ``storage_path`` (the SQLite file
-        holding reflection_insights + graph_nodes); the data dir is its parent.
+        The agent may expose a SQLite ``storage_path`` for the optional
+        reflection source; factual training data never comes from that file.
         There is no ``data_dir`` attribute on the agent.
         """
         if self._db_path and self._work_dir:
             return self._db_path, self._work_dir
+        configured_work = getattr(self.agent, "parametric_self_work_dir", None)
+        explicit_work = self._work_dir or (
+            configured_work if isinstance(configured_work, (str, Path)) and str(configured_work) else None
+        )
         storage_path = getattr(self.agent, "storage_path", None)
         if not storage_path:
-            return self._db_path, self._work_dir
+            return self._db_path, str(explicit_work) if explicit_work else None
         db = self._db_path or str(storage_path)
-        work = self._work_dir or str(Path(storage_path).parent / "parametric_self")
+        work = explicit_work or str(Path(storage_path).parent / "parametric_self")
         return db, work
 
     async def on_post_consolidation(
@@ -844,8 +1079,12 @@ class ParametricSelfFeature(Feature):
     async def _run_training_cycle_locked(self, *, trigger: str) -> Dict[str, Any]:
         """Body of one cycle; only ever called with the in-flight guard held."""
         db_path, work_dir = self._resolve_paths()
-        if not db_path or not work_dir:
-            return {"trained": False, "promoted": False, "reason": "could not resolve agent storage_path"}
+        if not work_dir:
+            return {"trained": False, "promoted": False, "reason": "could not resolve parametric-self work directory"}
+
+        governed_snapshot, corpus_reason = await self._request_governed_snapshot()
+        if governed_snapshot is None:
+            return {"trained": False, "promoted": False, "reason": corpus_reason}
 
         agent_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "name", "agent")
         config = TextLoRAConfig.from_dict(self._base_config.to_dict())
@@ -869,6 +1108,7 @@ class ParametricSelfFeature(Feature):
                 agent_id=str(agent_id),
                 db_path=db_path,
                 work_dir=work_dir,
+                governed_snapshot=governed_snapshot,
                 adapter=self._adapter,
                 gate=self._gate,
                 config=config,
@@ -889,11 +1129,45 @@ class ParametricSelfFeature(Feature):
             self._active_run = None
             raise
 
+        candidate_lineage = {
+            "manifest_hash": result.corpus_manifest_hash,
+            "manifest_path": result.corpus_manifest_path,
+            "snapshot_hash": result.corpus_snapshot_hash,
+            "policy_digest": result.corpus_policy_digest,
+            "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
+            "semantic_checkpoint_id": result.semantic_checkpoint_id,
+            "assertion_lineage": [list(pair) for pair in result.assertion_lineage],
+            "state": "candidate",
+        }
+        if result.corpus_manifest_hash:
+            self._adapter_lineage[adapter_path] = candidate_lineage
+
+        if result.promoted and not result.corpus_manifest_hash:
+            # A promoted adapter without the immutable corpus receipt is never
+            # a valid served artifact, even if a trainer reports success.
+            result.promoted = False
+            result.promoted_adapter_path = None
+            result.reason = "candidate missing governed corpus manifest"
+
+        if result.promoted and result.promoted_adapter_path:
+            lifecycle_problem = await self._verify_adapter_lineage(
+                result.promoted_adapter_path, before_promotion=True
+            )
+            if lifecycle_problem:
+                result.promoted = False
+                result.promoted_adapter_path = None
+                result.reason = f"candidate quarantined: {lifecycle_problem}"
+
         if result.promoted and result.promoted_adapter_path:
             self._active_adapter_path = result.promoted_adapter_path
             self._last_val_loss = result.val_loss
+            self._adapter_lineage[result.promoted_adapter_path]["state"] = "served"
             # Persist the new served adapter + its val loss so the pointer and
             # the regression baseline survive a restart.
+            await self._persist_config()
+        elif result.corpus_manifest_hash:
+            # Candidate lineage is durable even when fidelity rejects it; an
+            # operator can inspect exactly why it must not silently be served.
             await self._persist_config()
 
         logger.info(
@@ -906,6 +1180,9 @@ class ParametricSelfFeature(Feature):
             "val_loss": result.val_loss,
             "reason": result.reason,
             "corpus_train": result.corpus_train,
+            "corpus_valid": result.corpus_valid,
+            "corpus_manifest_hash": result.corpus_manifest_hash,
+            "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
         }
         await self._update_run_history(run_id, {
             "state": "completed",
@@ -918,6 +1195,11 @@ class ParametricSelfFeature(Feature):
             # Record the served path only on promotion (matches the prior
             # contract); otherwise keep the candidate path for traceability.
             "adapter_path": result.promoted_adapter_path or adapter_path,
+            "corpus_manifest_hash": result.corpus_manifest_hash,
+            "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
+            "semantic_checkpoint_id": result.semantic_checkpoint_id,
+            "corpus_snapshot_hash": result.corpus_snapshot_hash,
+            "corpus_policy_digest": result.corpus_policy_digest,
         })
         self._active_run = None
         return outcome

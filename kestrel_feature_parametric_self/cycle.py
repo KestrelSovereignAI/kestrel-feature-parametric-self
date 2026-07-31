@@ -16,7 +16,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 
@@ -45,13 +45,21 @@ class CycleResult:
     promoted_adapter_path: Optional[str] = None
     corpus_train: int = 0
     corpus_valid: int = 0
+    corpus_manifest_path: Optional[str] = None
+    corpus_manifest_hash: Optional[str] = None
+    semantic_checkpoint_generation: Optional[int] = None
+    semantic_checkpoint_id: Optional[str] = None
+    corpus_snapshot_hash: Optional[str] = None
+    corpus_policy_digest: Optional[str] = None
+    assertion_lineage: tuple[tuple[str, str], ...] = ()
 
 
 async def run_nightly_cycle(
     *,
     agent_id: str,
-    db_path: str,
+    db_path: str | None,
     work_dir: str,
+    governed_snapshot: Any,
     adapter: _TrainerProtocol,
     gate: FidelityGate,
     config: TextLoRAConfig,
@@ -93,11 +101,23 @@ async def run_nightly_cycle(
     # still reading it. True while a started job hasn't reached a terminal state.
     training_active = False
     try:
-        stats = build_corpus(db_path, corpus_dir)
+        stats = build_corpus(
+            db_path,
+            corpus_dir,
+            governed_snapshot=governed_snapshot,
+            manifest_dir=adapter_dir,
+        )
         if stats.train == 0:
             return CycleResult(
                 False, reason="empty corpus — no grounded reflections to train on",
                 corpus_train=0, corpus_valid=stats.valid,
+                corpus_manifest_path=stats.manifest_path,
+                corpus_manifest_hash=stats.manifest_hash,
+                semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
+                semantic_checkpoint_id=stats.semantic_checkpoint_id,
+                corpus_snapshot_hash=stats.snapshot_hash,
+                corpus_policy_digest=stats.policy_digest,
+                assertion_lineage=stats.assertion_lineage,
             )
 
         config.data_dir = corpus_dir
@@ -135,6 +155,13 @@ async def run_nightly_cycle(
             promoted_adapter_path=adapter_dir if decision.promote else None,
             corpus_train=stats.train,
             corpus_valid=stats.valid,
+            corpus_manifest_path=stats.manifest_path,
+            corpus_manifest_hash=stats.manifest_hash,
+            semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
+            semantic_checkpoint_id=stats.semantic_checkpoint_id,
+            corpus_snapshot_hash=stats.snapshot_hash,
+            corpus_policy_digest=stats.policy_digest,
+            assertion_lineage=stats.assertion_lineage,
         )
     except asyncio.CancelledError:
         # Cancellation (on_disable / shutdown) tears the trainer subprocess down
@@ -161,5 +188,4 @@ def _delete_corpus(corpus_dir: str) -> None:
             (corpus / name).unlink(missing_ok=True)
         except OSError:
             pass
-
 

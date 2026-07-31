@@ -28,6 +28,21 @@ uv pip install kestrel-feature-parametric-self
 The package registers `ParametricSelfFeature` through the
 `kestrel_sovereign.features` entry point group.
 
+## Governed training corpus
+
+Nightly training remains disabled by default and requires an explicit
+`GovernedCorpusPolicy` from the host/operator before it can use factual
+examples. The feature asks the agent's storage capability for a checkpointed,
+policy-pinned governed assertion snapshot after successful semantic
+maintenance; it never reads factual graph rows or a local database directly.
+Reflection insights remain a distinct source.
+
+Each candidate retains an immutable, content-free manifest of its accepted
+assertion/revision lineage and semantic checkpoint. A tombstone, stale
+revision, missing manifest, or unverifiable host capability quarantines the
+affected candidate or served adapter until it is rebuilt. This is intentionally
+a visible no-op rather than a fallback to ungoverned factual training.
+
 ## Development
 
 ```bash
