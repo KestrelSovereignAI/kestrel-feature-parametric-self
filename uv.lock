@@ -1475,7 +1475,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "kestrel-sovereign", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=5932735a7db02228877985f66b9f1eb56d564f27" },
+    { name = "kestrel-sovereign", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=bedd7c746b55545d4aca782ecae53ae7722b3c59" },
     { name = "kestrel-sovereign-sdk", specifier = ">=0.14.1,<1" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
@@ -1594,7 +1594,7 @@ all = [
 [[package]]
 name = "kestrel-sovereign"
 version = "0.49.5"
-source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=5932735a7db02228877985f66b9f1eb56d564f27#5932735a7db02228877985f66b9f1eb56d564f27" }
+source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=bedd7c746b55545d4aca782ecae53ae7722b3c59#bedd7c746b55545d4aca782ecae53ae7722b3c59" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },

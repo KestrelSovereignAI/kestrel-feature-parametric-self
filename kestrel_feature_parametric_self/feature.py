@@ -127,6 +127,10 @@ class ParametricSelfFeature(Feature):
         # A live snapshot permits incremental tombstone checks during this
         # process.  It is intentionally not treated as restart-durable proof.
         self._live_corpus_snapshot = None
+        # Optional lifecycle identity for host-registered corpus/future-corpus
+        # artifacts. External evidence injects its independently-held signing
+        # identity; normal training may supply the same mapping on the agent.
+        self._governed_artifact_consumer = None
         # Durable metadata is content-free: hashes, checkpoint pins, and exact
         # assertion/revision lineage only.  Adapter state lives separately from
         # the immutable candidate-side manifest.
@@ -486,7 +490,32 @@ class ParametricSelfFeature(Feature):
             return self._governed_inference_profile
         return getattr(self.agent, "semantic_inference_profile", None)
 
-    async def _request_governed_snapshot(self):
+    def _artifact_producer_kwargs(self, consumer: Any = None) -> Dict[str, Any]:
+        """Build one fresh core artifact registration from a bound consumer."""
+        candidate = consumer
+        if candidate is None:
+            candidate = self._governed_artifact_consumer
+        if candidate is None:
+            candidate = getattr(
+                self.agent, "parametric_self_governed_artifact_consumer", None
+            )
+        if not isinstance(candidate, Mapping):
+            return {}
+        required = ("consumer_id", "consumer_key_id", "consumer_public_key")
+        if any(not isinstance(candidate.get(field), str) for field in required):
+            return {}
+        retention = candidate.get("retention_seconds", 300.0)
+        if not isinstance(retention, (int, float)) or isinstance(retention, bool):
+            return {}
+        normalized = {
+            field: str(candidate[field])
+            for field in required
+        }
+        normalized["retention_seconds"] = float(retention)
+        self._governed_artifact_consumer = dict(normalized)
+        return {"artifact_id": str(uuid.uuid4()), **normalized}
+
+    async def _request_governed_snapshot(self, *, artifact_consumer: Any = None):
         """Read only through the host's policy-gated, checkpointed capability."""
         storage = getattr(self.agent, "storage", None)
         policy = self._resolved_governed_policy()
@@ -495,10 +524,12 @@ class ParametricSelfFeature(Feature):
             return None, "governed corpus policy is not configured"
         if not callable(reader):
             return None, "governed corpus capability unavailable on this host"
+        producer_kwargs = self._artifact_producer_kwargs(artifact_consumer)
         try:
             snapshot = await reader(
                 policy=policy,
                 inference_profile=self._resolved_inference_profile(),
+                **producer_kwargs,
             )
         except Exception:
             # Corpus failures may carry provider/tenant/source details.  Keep
@@ -709,7 +740,13 @@ class ParametricSelfFeature(Feature):
             return "governed corpus delta evidence mismatch; adapter cannot be verified"
         return None
 
-    async def _verify_adapter_lineage(self, path: str, *, before_promotion: bool = False) -> Optional[str]:
+    async def _verify_adapter_lineage(
+        self,
+        path: str,
+        *,
+        before_promotion: bool = False,
+        artifact_consumer: Any = None,
+    ) -> Optional[str]:
         """Quarantine an adapter when its exact governed inputs no longer hold."""
         manifest, manifest_error = self._manifest_lineage(path)
         if manifest_error:
@@ -735,6 +772,7 @@ class ParametricSelfFeature(Feature):
                 delta = await changes(
                     snapshot, policy=policy,
                     inference_profile=self._resolved_inference_profile(),
+                    **self._artifact_producer_kwargs(artifact_consumer),
                 )
             except Exception:
                 reason = "governed corpus delta unavailable; adapter cannot be verified"
@@ -763,7 +801,9 @@ class ParametricSelfFeature(Feature):
 
         # A process restart cannot reuse an in-memory snapshot as durable proof.
         # Rebuild a fresh approved snapshot and compare exact revisions.
-        fresh, reason = await self._request_governed_snapshot()
+        fresh, reason = await self._request_governed_snapshot(
+            artifact_consumer=artifact_consumer
+        )
         if fresh is None:
             await self._quarantine_adapter(path, reason or "governed corpus unavailable")
             return reason
