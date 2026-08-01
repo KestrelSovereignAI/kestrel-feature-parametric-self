@@ -18,9 +18,9 @@ dependencies = [
     # released core version containing #2817 during the coordinated release.
     # This is a hard safety contract: older hosts must not fall back to direct
     # factual reads.
-    # #2753 supplies the immutable external-adapter gate catalog, signed
-    # execution envelope, and correlated erasure drill contract used below.
-    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@bedd7c746b55545d4aca782ecae53ae7722b3c59",
+    # #2834 supplies the immutable dual-backend served-adapter envelope,
+    # signed execution contract, and correlated erasure drill used below.
+    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@797c0f8ba8c84a30f4762b943ac508c0e485d1c0",
     "kestrel-sovereign-sdk>=0.14.1,<1",
     # The MLX LoRA trainer is Apple-Silicon only and imported lazily, so it is
     # platform-gated: it installs on arm64 macOS and is simply absent elsewhere

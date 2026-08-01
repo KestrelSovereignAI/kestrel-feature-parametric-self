@@ -30,7 +30,7 @@ The package registers `ParametricSelfFeature` through the
 
 The governed-corpus host surface is currently under development in core. Until
 the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
-this package source-pins the reviewed capability commit (`bedd7c746b55545d4aca782ecae53ae7722b3c59`) rather
+this package source-pins the reviewed capability commit (`797c0f8ba8c84a30f4762b943ac508c0e485d1c0`) rather
 than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
 must replace that pin with the published capability-bearing version.
 
@@ -86,19 +86,21 @@ eligibility are physically removed, while core retains only its blinded,
 identity-free erasure audit/tombstone shell for operation replay protection.
 
 The source and lockfile pin the published core evidence commit
-`bedd7c746b55545d4aca782ecae53ae7722b3c59`, so a normal clean `uv sync` can
+`797c0f8ba8c84a30f4762b943ac508c0e485d1c0`, so a normal clean `uv sync` can
 install the exact contract implementation. Do not advance that pin to a local
 or otherwise unreachable Git SHA.
 
-For Kite, use the explicit two-phase `ParametricSelfKiteErasureHook`: `prepare`
-creates a candidate and proves both candidate and served eligibility against one
-server-owned governed snapshot; the isolated server then performs
-`erase_prepared_assertion`; only `observe` may sign the post-erasure evidence.
-The standalone `parametric-self-release-evidence` command follows that same
-order and accepts only a fully-qualified factory that returns an isolated
-`is_test_instance=True` feature, a verifier-issued nonce, an owner-private CI
-signing seed, and private scratch/output paths. It never accepts an assertion
-ID or a caller-supplied success result.
+For Kite, the runner executes the explicit two-phase drill independently on
+isolated SQLite and a core-created disposable PostgreSQL database: `prepare`
+creates a candidate and proves candidate/served eligibility, core performs
+`erase_prepared_assertion`, and `observe` proves invalidation. Only after both
+observations agree and both backends are cleaned up does it sign the four
+ordered envelope records; the capability report attests the three external
+capability records. The standalone `parametric-self-release-evidence` command
+accepts a one-argument factory for the runner-owned backend capability, a
+verifier-issued nonce, an owner-private CI signing seed, and private
+scratch/output paths. It never accepts an assertion ID, caller DSN, or
+caller-supplied success result.
 
 ## Incomplete-shutdown recovery
 

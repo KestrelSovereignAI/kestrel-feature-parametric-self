@@ -1,9 +1,10 @@
 """External-CI evidence for the parametric-self erasure release gates.
 
 This module is deliberately an *executor*, not a generic JSON formatter.  It
-drives an isolated :class:`ParametricSelfFeature` through the governed-corpus
-and adapter-lineage paths, waits for a caller-supplied real erasure action, and
-only then signs the three external gate records declared by Kestrel core.
+drives isolated SQLite and core-created disposable PostgreSQL
+:class:`ParametricSelfFeature` instances through the governed-corpus and
+adapter-lineage paths. It signs the four declared external records only after
+both independent physical-erasure observations and cleanup complete.
 
 The resulting envelope contains aggregates, immutable catalog bindings, and
 opaque digests only.  It contains no assertion text, tenant ID, filesystem
@@ -16,7 +17,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import importlib
 import inspect
 import json
 import os
@@ -24,10 +24,11 @@ import secrets
 import shutil
 import stat
 import subprocess
-from collections.abc import Awaitable, Callable, Mapping
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING
 
 from kestrel_sovereign.knowledge.corpus import GovernedCorpusSnapshot
@@ -39,6 +40,9 @@ from kestrel_sovereign.knowledge.release_evidence import (
 )
 from kestrel_sovereign.knowledge.release_evidence_execution import (
     CatalogSigningIdentity,
+)
+from kestrel_sovereign.knowledge.release_evidence_postgres import (
+    DisposablePostgresDatabase,
 )
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ArtifactReference,
@@ -58,20 +62,58 @@ if TYPE_CHECKING:
 
 
 EXTERNAL_GATE_IDS = (
+    "erasure_served_adapter_eligibility",
     "external_corpus_consumed",
     "external_candidate_invalidated",
     "external_served_eligibility_rejected",
 )
+_EXTERNAL_CAPABILITY_GATE_IDS = EXTERNAL_GATE_IDS[1:]
 _CAPABILITY_ID = "parametric_self_governed_corpus"
 _FRESHNESS_NONCE_BYTES = 32
 _FULL_COMMIT_LENGTH = 40
+_CLI_EXECUTION_REFUSAL = "external evidence execution is unavailable"
 
 
 class ExternalReleaseEvidenceError(ValueError):
     """The isolated external erasure drill did not establish a required fact."""
 
 
-ErasureAction = Callable[[], None | Awaitable[None]]
+class _ExternalCleanupFailure(ExternalReleaseEvidenceError):
+    """Internal aggregate that preserves every failed cleanup attempt."""
+
+    def __init__(self, failures: list[BaseException]) -> None:
+        super().__init__("external evidence cleanup failed")
+        self.failures = tuple(failures)
+
+
+def _raise_execution_or_cleanup_failure(
+    execution: BaseException | None, cleanup_failures: list[BaseException]
+) -> None:
+    """Raise all failures while retaining cancellation/interrupt semantics."""
+    if cleanup_failures:
+        non_exception_failures = [
+            failure for failure in cleanup_failures if not isinstance(failure, Exception)
+        ]
+        ordinary_cleanup_failures = [
+            failure for failure in cleanup_failures if isinstance(failure, Exception)
+        ]
+        if execution is not None:
+            group_members: list[BaseException] = [execution, *non_exception_failures]
+            if ordinary_cleanup_failures:
+                group_members.append(_ExternalCleanupFailure(ordinary_cleanup_failures))
+            if len(group_members) == 1:
+                raise execution
+            raise BaseExceptionGroup("external evidence execution and cleanup failed", group_members)
+        if non_exception_failures:
+            if len(non_exception_failures) == 1 and not ordinary_cleanup_failures:
+                raise non_exception_failures[0]
+            group_members: list[BaseException] = [*non_exception_failures]
+            if ordinary_cleanup_failures:
+                group_members.append(_ExternalCleanupFailure(ordinary_cleanup_failures))
+            raise BaseExceptionGroup("external evidence cleanup failed", group_members)
+        raise _ExternalCleanupFailure(ordinary_cleanup_failures)
+    if execution is not None:
+        raise execution
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +142,201 @@ class _PreparedKiteDrill:
     artifact_consumer: Mapping[str, object]
     run_nonce: str
     evidence_runner_revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BackendDrillObservation:
+    """Private result from one independently owned physical erasure drill."""
+
+    backend: str
+    observation: Mapping[str, object]
+    identity_digest: str
+    drill_digest: str
+    run_nonce: str
+    evidence_runner_revision: str
+
+
+@dataclass(slots=True)
+class KiteErasureBackend:
+    """One runner-owned storage authority for an isolated evidence backend.
+
+    The runner constructs its own feature from this typed capability rather
+    than accepting a factory, database path, or DSN from a caller. It can open
+    exactly one storage instance for the generated test identity.
+    """
+
+    backend: str
+    trusted_scratch_root: Path
+    scratch_dir: Path
+    disposable_postgres: DisposablePostgresDatabase | None = None
+    _storage: object | None = None
+    _sqlite_state_path: Path | None = None
+    _sqlite_state_identities: Mapping[Path, tuple[int, int]] | None = None
+    _closed: bool = False
+
+    def __post_init__(self) -> None:
+        try:
+            self.trusted_scratch_root = Path(self.trusted_scratch_root).resolve(strict=True)
+            self.scratch_dir = Path(self.scratch_dir).resolve(strict=False)
+        except OSError as error:
+            raise ExternalReleaseEvidenceError(
+                "external evidence backend scratch root is unavailable"
+            ) from error
+        if self.backend == "sqlite" and self.disposable_postgres is None:
+            return
+        if self.backend == "postgres" and isinstance(
+            self.disposable_postgres, DisposablePostgresDatabase
+        ):
+            return
+        raise ExternalReleaseEvidenceError(
+            "external evidence backend must be isolated SQLite or core-created PostgreSQL"
+        )
+
+    @property
+    def agent_id(self) -> str:
+        """The generated test identity the sealed runner uses for this backend."""
+        return f"did:kestrel:parametric-self-release:{self.backend}:{_digest(str(self.scratch_dir))[:24]}"
+
+    async def open_storage(self) -> object:
+        """Create the only storage instance accepted for this backend drill."""
+        if self._closed or self._storage is not None:
+            raise ExternalReleaseEvidenceError("external evidence backend storage is unavailable")
+        from kestrel_sovereign.storage.async_assertion_store import (
+            _issue_assertion_tenant_capability,
+        )
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+        assertion_capability = _issue_assertion_tenant_capability(self.agent_id)
+
+        if self.backend == "sqlite":
+            root_identity = _lstat_private_directory(self.trusted_scratch_root)
+            state_dir = self.trusted_scratch_root / (
+                f".parametric-self-release-{secrets.token_hex(16)}"
+            )
+            try:
+                os.mkdir(state_dir, 0o700)
+                os.chmod(state_dir, 0o700)
+            except OSError as error:
+                raise ExternalReleaseEvidenceError(
+                    "external evidence SQLite state directory could not be created"
+                ) from error
+            state_identities = {
+                self.trusted_scratch_root: root_identity,
+                state_dir: _lstat_private_directory(state_dir),
+            }
+            _lstat_private_directory(
+                self.trusted_scratch_root, expected_identity=root_identity
+            )
+            state_path = state_dir / "state.sqlite"
+            self._sqlite_state_path = state_path
+            self._sqlite_state_identities = state_identities
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(state_path, flags, 0o600)
+                os.close(descriptor)
+                metadata = state_path.lstat()
+            except OSError as error:
+                try:
+                    _cleanup_private_scratch_tree(state_dir, state_identities)
+                except ExternalReleaseEvidenceError as cleanup_error:
+                    raise cleanup_error from error
+                raise ExternalReleaseEvidenceError(
+                    "external evidence SQLite state could not be created"
+                ) from error
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                _cleanup_private_scratch_tree(state_dir, state_identities)
+                raise ExternalReleaseEvidenceError("external evidence SQLite state is not private")
+            storage = AsyncStorage(
+                db_path=str(state_path),
+                backend="sqlite",
+                agent_id=self.agent_id,
+                _assertion_tenant_capability=assertion_capability,
+            )
+        else:
+            assert self.disposable_postgres is not None
+            storage = AsyncStorage(
+                backend="postgres",
+                dsn=self.disposable_postgres.dsn,
+                agent_id=self.agent_id,
+                _assertion_tenant_capability=assertion_capability,
+            )
+        self._storage = storage
+        try:
+            await storage.initialize()
+        except BaseException as error:
+            cleanup_failures: list[BaseException] = []
+            try:
+                await self.close()
+            except BaseException as cleanup_error:
+                cleanup_failures.append(cleanup_error)
+            _raise_execution_or_cleanup_failure(error, cleanup_failures)
+        return storage
+
+    def validate_feature(self, feature: ParametricSelfFeature) -> None:
+        storage = getattr(getattr(feature, "agent", None), "storage", None)
+        if self._storage is None or storage is not self._storage:
+            raise ExternalReleaseEvidenceError(
+                "external evidence feature did not use the runner-owned backend"
+            )
+        if getattr(storage, "backend_type", None) != self.backend:
+            raise ExternalReleaseEvidenceError(
+                "external evidence feature backend does not match its isolated drill"
+            )
+        if getattr(feature.agent, "agent_id", None) != self.agent_id:
+            raise ExternalReleaseEvidenceError(
+                "external evidence feature identity does not match its isolated drill"
+            )
+        if getattr(feature.agent, "is_test_instance", False) is not True:
+            raise ExternalReleaseEvidenceError(
+                "external evidence requires an isolated Kite ParametricSelfFeature"
+            )
+
+    async def close(self) -> None:
+        """Close the owned storage and remove the exact SQLite state file."""
+        if self._closed:
+            # A prior close may have released the storage but refused to
+            # remove a replaced/unverifiable state directory. Retry only that
+            # exact pinned cleanup when an outer failure path gets another
+            # chance; never reopen or reuse the storage authority.
+            identities = self._sqlite_state_identities
+            if identities is not None:
+                state_dir = next(
+                    path for path in identities if path != self.trusted_scratch_root
+                )
+                try:
+                    _cleanup_private_scratch_tree(state_dir, identities)
+                except BaseException as error:
+                    _raise_execution_or_cleanup_failure(None, [error])
+                self._sqlite_state_identities = None
+            return
+        self._closed = True
+        storage, self._storage = self._storage, None
+        close = getattr(storage, "close", None)
+        failures: list[BaseException] = []
+        try:
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except BaseException as error:
+            failures.append(error)
+        identities = self._sqlite_state_identities
+        if identities is not None:
+            state_dir = next(
+                path for path in identities if path != self.trusted_scratch_root
+            )
+            try:
+                _cleanup_private_scratch_tree(state_dir, identities)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self._sqlite_state_identities = None
+        _raise_execution_or_cleanup_failure(None, failures)
 
 
 def _canonical_json(value: object) -> str:
@@ -190,6 +427,7 @@ def _prepare_private_scratch_tree(
         raise ExternalReleaseEvidenceError("external evidence scratch path is not trusted")
     try:
         root = trusted_scratch_root.resolve(strict=True)
+        scratch_dir = scratch_dir.resolve(strict=False)
         relative = scratch_dir.relative_to(root)
     except (OSError, ValueError) as error:
         raise ExternalReleaseEvidenceError("external evidence scratch path is not trusted") from error
@@ -251,31 +489,71 @@ def _cleanup_private_scratch_tree(
     """Remove only the exact tree this invocation created.
 
     If an identity check fails, leave it for the verifier/operator rather than
-    risking deletion through a replacement path.
+    risking deletion through a replacement path. Cleanup is evidence-critical:
+    a failure is reported to the runner, which must refuse to seal or sign.
     """
+    scratch_dir = Path(scratch_dir)
+    if scratch_dir not in identities or scratch_dir.parent not in identities:
+        raise ExternalReleaseEvidenceError("external evidence scratch cleanup identity is unavailable")
+    _verify_private_scratch_tree(scratch_dir, identities)
+    parent_identity = identities[scratch_dir.parent]
+    directory_identity = identities[scratch_dir]
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd: int | None = None
     try:
-        _verify_private_scratch_tree(scratch_dir, identities)
+        parent_fd = os.open(scratch_dir.parent, parent_flags)
+        parent_metadata = os.fstat(parent_fd)
+        if (parent_metadata.st_dev, parent_metadata.st_ino) != parent_identity:
+            raise ExternalReleaseEvidenceError("external evidence scratch parent changed before cleanup")
+        metadata = os.stat(scratch_dir.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != directory_identity
+        ):
+            raise ExternalReleaseEvidenceError("external evidence scratch tree changed before cleanup")
+        # Python's fd-relative rmtree is symlink-attack resistant. The pinned
+        # parent fd and pre-delete inode check prevent deletion of a replaced
+        # path even if its textual name is raced.
+        shutil.rmtree(scratch_dir.name, dir_fd=parent_fd)
+        try:
+            os.stat(scratch_dir.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise ExternalReleaseEvidenceError("external evidence scratch cleanup could not be verified")
     except ExternalReleaseEvidenceError:
-        return
-    shutil.rmtree(scratch_dir)
+        raise
+    except OSError as error:
+        raise ExternalReleaseEvidenceError("external evidence scratch cleanup failed") from error
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _external_specs() -> dict[str, GateSpec]:
-    specs = {spec.gate_id: spec for spec in release_gate_specs()}
-    selected = {gate_id: specs.get(gate_id) for gate_id in EXTERNAL_GATE_IDS}
-    if set(selected) != set(EXTERNAL_GATE_IDS) or any(
-        spec is None for spec in selected.values()
-    ):
+    selected = tuple(
+        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+    )
+    if tuple(spec.gate_id for spec in selected) != EXTERNAL_GATE_IDS:
         raise ExternalReleaseEvidenceError("core external release gate catalog is incomplete")
-    result = {gate_id: spec for gate_id, spec in selected.items() if spec is not None}
+    result = {spec.gate_id: spec for spec in selected}
     if any(
         spec.category != "external_adapter"
         or spec.runner.runner_id != "external_ci"
         or spec.owner != "parametric_self"
         or spec.correlation is None
+        or spec.environment.backend != "dual_backend"
+        or spec.environment.mode != "external_adapter"
         for spec in result.values()
     ):
         raise ExternalReleaseEvidenceError("core external release gate catalog does not match the adapter contract")
+    correlations = {
+        (spec.correlation.drill_id, spec.correlation.drill_digest)
+        for spec in result.values()
+        if spec.correlation is not None
+    }
+    if len(correlations) != 1:
+        raise ExternalReleaseEvidenceError("core external gates do not share one erasure drill")
     return result
 
 
@@ -309,9 +587,15 @@ class ExternalReleaseEvidenceEnvelope:
         ):
             raise ExternalReleaseEvidenceError("external evidence requires a fresh nonce")
         specs = _external_specs()
+        if tuple(record.gate_id for record in self.records) != EXTERNAL_GATE_IDS:
+            raise ExternalReleaseEvidenceError(
+                "external evidence must contain each declared adapter gate once in order"
+            )
         by_gate = {record.gate_id: record for record in self.records}
-        if set(by_gate) != set(specs) or len(by_gate) != len(self.records):
+        if len(by_gate) != len(self.records):
             raise ExternalReleaseEvidenceError("external evidence must contain each declared adapter gate once")
+        artifacts: set[tuple[str, str]] = set()
+        correlations: set[tuple[str, str]] = set()
         for gate_id, record in by_gate.items():
             spec = specs[gate_id]
             try:
@@ -328,6 +612,15 @@ class ExternalReleaseEvidenceEnvelope:
                 raise ExternalReleaseEvidenceError(
                     "external evidence records must be externally signed passes bound to the verifier nonce"
                 )
+            if record.artifact is None:
+                raise ExternalReleaseEvidenceError("external record is missing its signed artifact")
+            artifacts.add((record.artifact.artifact_ref, record.artifact.artifact_digest))
+            assert spec.correlation is not None
+            correlations.add((spec.correlation.drill_id, spec.correlation.drill_digest))
+        if len(artifacts) != len(self.records):
+            raise ExternalReleaseEvidenceError("external evidence records must retain distinct signed artifacts")
+        if len(correlations) != 1:
+            raise ExternalReleaseEvidenceError("external evidence records must share one erasure drill")
         if (
             self.report.capability_id != _CAPABILITY_ID
             or self.report.repository != self.repository
@@ -338,10 +631,15 @@ class ExternalReleaseEvidenceEnvelope:
             or self.report.run_nonce != self.run_nonce
         ):
             raise ExternalReleaseEvidenceError("external report identity does not match its envelope")
+        if tuple(item.gate_id for item in self.report.attestations) != _EXTERNAL_CAPABILITY_GATE_IDS:
+            raise ExternalReleaseEvidenceError(
+                "external report must attest exactly the three external capability stages in order"
+            )
         report_by_gate = {item.gate_id: item for item in self.report.attestations}
-        if set(report_by_gate) != set(by_gate):
-            raise ExternalReleaseEvidenceError("external report must contain each signed adapter gate once")
-        for gate_id, record in by_gate.items():
+        if len(report_by_gate) != len(self.report.attestations):
+            raise ExternalReleaseEvidenceError("external report must contain each capability gate once")
+        for gate_id in _EXTERNAL_CAPABILITY_GATE_IDS:
+            record = by_gate[gate_id]
             item = report_by_gate.get(gate_id)
             if (
                 item is None
@@ -369,12 +667,13 @@ class ExternalReleaseEvidenceEnvelope:
         }
 
     def write(self, output: Path, *, overwrite: bool = False) -> None:
-        """Write one aggregate-only artifact without replacing another run."""
-        if output.exists() and not overwrite:
-            raise ExternalReleaseEvidenceError("refusing to replace existing external evidence envelope")
-        if not output.parent.is_dir():
-            raise ExternalReleaseEvidenceError("external evidence output parent does not exist")
-        output.write_text(_canonical_json(self.to_mapping()) + "\n", encoding="utf-8")
+        """Atomically publish one complete envelope to a fresh private path."""
+        if overwrite:
+            raise ExternalReleaseEvidenceError(
+                "external evidence envelopes are immutable and cannot be replaced"
+            )
+        target, parent_identity = _validate_cli_output(Path(output))
+        _write_cli_envelope_atomic(self, target, parent_identity)
 
 
 class ParametricSelfKiteErasureHook:
@@ -493,16 +792,23 @@ class ParametricSelfKiteErasureHook:
                 evidence_runner_revision=runner_revision,
             )
             return KiteErasurePreparation(drill_id, run_nonce, runner_revision)
-        except BaseException:
+        except BaseException as error:
+            cleanup_failures: list[BaseException] = []
             if candidate_path is not None:
                 # A failed pre-erase eligibility check must not leave an
                 # active pointer to a candidate whose private manifest is
                 # about to be removed.
-                await feature._quarantine_adapter(
-                    candidate_path, "external erasure drill preparation failed"
-                )
-            _cleanup_private_scratch_tree(scratch, identities)
-            raise
+                try:
+                    await feature._quarantine_adapter(
+                        candidate_path, "external erasure drill preparation failed"
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_failures.append(cleanup_error)
+            try:
+                _cleanup_private_scratch_tree(scratch, identities)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(cleanup_error)
+            _raise_execution_or_cleanup_failure(error, cleanup_failures)
 
     def _state(self, preparation: KiteErasurePreparation) -> _PreparedKiteDrill:
         if not isinstance(preparation, KiteErasurePreparation):
@@ -524,11 +830,40 @@ class ParametricSelfKiteErasureHook:
         )
 
     async def observe(
-        self, preparation: KiteErasurePreparation
-    ) -> ExternalReleaseEvidenceEnvelope:
-        """Verify post-erasure invalidation and sign the fixed external gates."""
+        self, preparation: KiteErasurePreparation, *, backend: str
+    ) -> _BackendDrillObservation:
+        """Verify one backend's post-erasure state without signing anything.
+
+        The runner deliberately withholds signatures until it has independently
+        observed this same drill on both required storage engines and verified
+        their cleanup.  A single backend can therefore never become an
+        externally consumable release claim.
+        """
         state = self._state(preparation)
         try:
+            target = state.snapshot.examples[0].assertion if state.snapshot.examples else None
+            storage = getattr(getattr(state.feature, "agent", None), "storage", None)
+            get_assertion = getattr(storage, "get_assertion", None)
+            if target is None or not callable(get_assertion):
+                raise ExternalReleaseEvidenceError(
+                    "external evidence cannot verify physical erasure of the prepared assertion"
+                )
+            try:
+                remaining_target = await get_assertion(
+                    target.assertion_id, include_inactive=True
+                )
+            except Exception as error:
+                raise ExternalReleaseEvidenceError(
+                    "external evidence cannot verify physical erasure of the prepared assertion"
+                ) from error
+            if remaining_target is not None:
+                await state.feature._quarantine_adapter(
+                    state.candidate_path,
+                    "external erasure observation retained the prepared assertion",
+                )
+                raise ExternalReleaseEvidenceError(
+                    "erasure did not remove the prepared assertion"
+                )
             # Re-establish the exact pre-erase base held by the hook, rather
             # than accepting a caller-mutated feature cache or a later fresh
             # snapshot as the observation's lineage source.
@@ -551,76 +886,70 @@ class ParametricSelfKiteErasureHook:
                     "erasure did not reject served adapter eligibility"
                 )
             specs = _external_specs()
-            observations: Mapping[str, Mapping[str, object]] = {
-                "external_corpus_consumed": {"erased_count": 1, "remaining_count": 0},
-                "external_candidate_invalidated": {"erased_count": 1, "remaining_count": 0},
-                "external_served_eligibility_rejected": {"erased_count": 1, "remaining_count": 0},
-            }
-            records = tuple(
-                self._runner._record(
-                    specs[gate_id], observations[gate_id], state.run_nonce,
-                    state.evidence_runner_revision,
-                )
-                for gate_id in EXTERNAL_GATE_IDS
+            common_drill = next(iter(specs.values())).correlation
+            if common_drill is None:
+                raise ExternalReleaseEvidenceError("core external erasure drill is unavailable")
+            observation: Mapping[str, object] = MappingProxyType(
+                {"erased_count": 1, "remaining_count": 0}
             )
-            attestations: list[ExternalGateAttestation] = []
-            for record in records:
-                artifact = record.artifact
-                drill = specs[record.gate_id].correlation
-                if record.run_digest is None or artifact is None or drill is None:
-                    raise ExternalReleaseEvidenceError(
-                        "signed external record is missing a core binding"
-                    )
-                attestations.append(
-                    ExternalGateAttestation(
-                        gate_id=record.gate_id,
-                        gate_spec_digest=specs[record.gate_id].digest,
-                        result_digest=record.run_digest,
-                        artifact=artifact,
-                        drill=drill,
-                    )
-                )
-            report = ExternalCapabilityReport.attest(
-                capability_id=_CAPABILITY_ID,
-                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
-                evidence_runner_revision=state.evidence_runner_revision,
-                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-                attestations=tuple(attestations),
+            return _BackendDrillObservation(
+                backend=backend,
+                observation=observation,
+                identity_digest=_digest(
+                    {
+                        "capability_id": _CAPABILITY_ID,
+                        "repository": PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                        "capability_source_revision": PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+                        "core_release_evidence_contract_digest": CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+                    }
+                ),
+                drill_digest=_digest(
+                    {
+                        "drill_id": common_drill.drill_id,
+                        "drill_digest": common_drill.drill_digest,
+                        "schema": tuple(observation),
+                    }
+                ),
                 run_nonce=state.run_nonce,
-            )
-            return ExternalReleaseEvidenceEnvelope(
-                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
                 evidence_runner_revision=state.evidence_runner_revision,
-                run_nonce=state.run_nonce,
-                records=records,
-                report=report,
             )
         finally:
             self._prepared.pop(preparation._drill_id, None)
-            _cleanup_private_scratch_tree(state.scratch_dir, state.scratch_identities)
+            active_error = sys.exception()
+            try:
+                _cleanup_private_scratch_tree(state.scratch_dir, state.scratch_identities)
+            except BaseException as cleanup_error:
+                _raise_execution_or_cleanup_failure(active_error, [cleanup_error])
 
     async def abort(self, preparation: KiteErasurePreparation) -> None:
         """Fail closed and clear a prepared drill that will not be observed."""
         state = self._state(preparation)
         self._prepared.pop(preparation._drill_id, None)
+        execution: BaseException | None = None
+        cleanup_failures: list[BaseException] = []
         try:
             await state.feature._quarantine_adapter(
                 state.candidate_path, "external erasure drill aborted before observation"
             )
-        finally:
+        except BaseException as error:
+            execution = error
+        try:
             _cleanup_private_scratch_tree(state.scratch_dir, state.scratch_identities)
+        except BaseException as cleanup_error:
+            cleanup_failures.append(cleanup_error)
+        _raise_execution_or_cleanup_failure(execution, cleanup_failures)
 
 
 class ParametricSelfExternalEvidenceRunner:
-    """Execute the real external corpus → invalidation → serving drill.
+    """Execute one real erasure drill on each required isolated backend.
 
-    ``erase`` is the isolated environment's actual administrative deletion
-    operation.  This runner does not accept a caller-supplied observation,
-    status, gate ID, artifact reference, or record: it derives every release
-    value from core's fixed catalog and the feature's post-erasure state.
+    The runner creates its own feature from a runner-owned
+    :class:`KiteErasureBackend`; no caller selects executable feature code,
+    storage, erase callback, or lineage implementation. PostgreSQL arrives
+    from core's disposable-database authority, never from a caller DSN. No
+    record is signed until SQLite and PostgreSQL each complete prepare →
+    physical erase → observe, their observations agree, and both database
+    lifecycles have been cleaned up.
     """
 
     def __init__(self, signing_identity: CatalogSigningIdentity) -> None:
@@ -633,43 +962,296 @@ class ParametricSelfExternalEvidenceRunner:
 
     async def run(
         self,
-        feature: ParametricSelfFeature,
         *,
         scratch_dir: Path,
         trusted_scratch_root: Path,
         run_nonce: str,
-        erase: ErasureAction | None = None,
     ) -> ExternalReleaseEvidenceEnvelope:
-        """Compatibility wrapper over the real two-phase Kite hook.
+        """Run the sealed dual-backend drill and produce its one envelope."""
+        if (
+            not isinstance(run_nonce, str)
+            or len(run_nonce) != _FRESHNESS_NONCE_BYTES * 2
+            or any(character not in "0123456789abcdef" for character in run_nonce)
+        ):
+            raise ExternalReleaseEvidenceError("external evidence requires a verifier-issued nonce")
+        try:
+            trusted_scratch_root = Path(trusted_scratch_root).resolve(strict=True)
+            scratch_dir = Path(scratch_dir).resolve(strict=False)
+        except OSError as error:
+            raise ExternalReleaseEvidenceError(
+                "external evidence dual-backend scratch directory is unavailable"
+            ) from error
+        if scratch_dir.parent != trusted_scratch_root:
+            raise ExternalReleaseEvidenceError(
+                "external evidence dual-backend scratch directory must be directly inside its trusted root"
+            )
+        # Fail before the SQLite feature can create any governed material if
+        # the core PostgreSQL authority is unavailable or refuses to create a
+        # fresh disposable database.
+        sqlite_backend: KiteErasureBackend | None = None
+        postgres_backend: KiteErasureBackend | None = None
+        sqlite: _BackendDrillObservation | None = None
+        postgres: _BackendDrillObservation | None = None
+        execution: BaseException | None = None
+        cleanup_failures: list[BaseException] = []
+        try:
+            async with await DisposablePostgresDatabase.create() as database:
+                sqlite_backend = KiteErasureBackend(
+                    "sqlite",
+                    trusted_scratch_root,
+                    scratch_dir.with_name(f"{scratch_dir.name}-sqlite"),
+                )
+                postgres_backend = KiteErasureBackend(
+                    "postgres",
+                    trusted_scratch_root,
+                    scratch_dir.with_name(f"{scratch_dir.name}-postgres"),
+                    database,
+                )
+                sqlite = await self._run_backend(sqlite_backend, run_nonce=run_nonce)
+                postgres = await self._run_backend(postgres_backend, run_nonce=run_nonce)
+        except BaseException as error:
+            execution = error
+        finally:
+            # ``_run_backend`` closes its own storage. The explicit calls are
+            # idempotent and cover feature construction that fails before a
+            # hook. Attempt every close and retain every failure for the
+            # caller's fixed-detail refusal boundary.
+            for backend in (sqlite_backend, postgres_backend):
+                if backend is None:
+                    continue
+                try:
+                    await backend.close()
+                except BaseException as error:
+                    cleanup_failures.append(error)
+        _raise_execution_or_cleanup_failure(execution, cleanup_failures)
+        assert sqlite is not None and postgres is not None
+        observation, drill_semantics_digest, runner_revision = self._agree_backends(
+            sqlite, postgres, run_nonce=run_nonce
+        )
+        return self._seal_envelope(
+            observation,
+            run_nonce=run_nonce,
+            evidence_runner_revision=runner_revision,
+            drill_semantics_digest=drill_semantics_digest,
+        )
 
-        New live-agent callers should retain the preparation and call
-        :meth:`ParametricSelfKiteErasureHook.observe` only after the server has
-        physically erased the prepared assertion.  Keeping this wrapper avoids
-        silently weakening existing external CI callers while preserving the
-        same prepare → erase → observe ordering.
-        """
-        if erase is not None and not callable(erase):
-            raise ExternalReleaseEvidenceError("external erasure action must be callable")
+    async def _run_backend(
+        self,
+        backend: KiteErasureBackend,
+        *,
+        run_nonce: str,
+    ) -> _BackendDrillObservation:
+        """Drive one typed backend through the only permitted phase ordering."""
         hook = ParametricSelfKiteErasureHook(self)
-        preparation = await hook.prepare(
-            feature,
-            scratch_dir=scratch_dir,
-            trusted_scratch_root=trusted_scratch_root,
+        preparation: KiteErasurePreparation | None = None
+        observation: _BackendDrillObservation | None = None
+        execution: BaseException | None = None
+        cleanup_failures: list[BaseException] = []
+        try:
+            feature = await self._build_isolated_feature(backend)
+            backend.validate_feature(feature)
+            preparation = await hook.prepare(
+                feature,
+                scratch_dir=backend.scratch_dir,
+                trusted_scratch_root=backend.trusted_scratch_root,
+                run_nonce=run_nonce,
+            )
+            await hook.erase_prepared_assertion(preparation)
+            observation = await hook.observe(preparation, backend=backend.backend)
+        except BaseException as error:
+            execution = error
+            if preparation is not None and preparation._drill_id in hook._prepared:
+                try:
+                    await hook.abort(preparation)
+                except BaseException as cleanup_error:
+                    cleanup_failures.append(cleanup_error)
+        finally:
+            try:
+                await backend.close()
+            except BaseException as cleanup_error:
+                cleanup_failures.append(cleanup_error)
+        _raise_execution_or_cleanup_failure(execution, cleanup_failures)
+        assert observation is not None
+        return observation
+
+    async def _build_isolated_feature(
+        self, backend: KiteErasureBackend
+    ) -> ParametricSelfFeature:
+        """Create the sealed drill fixture from runner-owned storage only.
+
+        This is deliberately not configurable. The fixed, synthetic teaching
+        fact is the only governed corpus input and is physically erased before
+        observation. It carries no caller data and the storage authority never
+        leaves this method.
+        """
+        from kestrel_sovereign.knowledge import InferenceProfile
+        from kestrel_sovereign.knowledge.assertion import EpistemicState, OntologyRef, Visibility
+        from kestrel_sovereign.knowledge.corpus import GovernedCorpusPolicy
+        from kestrel_sovereign.privacy import PrivacyMode
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+        raw = await backend.open_storage()
+        governed = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        saved = await governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="release-fixture",
+            confidence=1.0,
+            invocation_id="parametric-self-release-evidence",
+        )
+        if not saved.saved:
+            raise ExternalReleaseEvidenceError("external evidence fixture could not be governed")
+        profile = InferenceProfile(
+            OntologyRef(
+                "http://www.w3.org/2000/01/rdf-schema#",
+                "1.0.0",
+                "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                "semantic-kb-v1",
+            ),
+            "1.0.0",
+        )
+        await raw.run_semantic_maintenance(profile)
+        assertions = await raw.assertion_inference_inputs()
+        if len(assertions) != 1:
+            raise ExternalReleaseEvidenceError("external evidence fixture did not create one assertion")
+        capabilities = await raw.semantic_maintenance_capability_versions(profile)
+        policy = GovernedCorpusPolicy(
+            policy_id="parametric-self-release-evidence-fixture",
+            policy_version="1",
+            accepted_epistemic_states=(EpistemicState.REPORTED,),
+            accepted_visibility=(Visibility.PRIVATE,),
+            accepted_privacy_classifications=("normal",),
+            accepted_consent_references=("policy:privacy:normal-v1",),
+            accepted_grounding_classes=("explicit-tool-invocation",),
+            accepted_source_kinds=("agent_tool_invocation",),
+            accepted_ontology_pins=(assertions[0].ontology_version,),
+            accepted_semantic_capability_versions=tuple(capabilities.items()),
+        )
+        from .feature import ParametricSelfFeature
+
+        agent = SimpleNamespace(
+            storage=raw,
+            storage_path=None,
+            parametric_self_work_dir=str(backend.scratch_dir / "feature-work"),
+            parametric_self_governed_corpus_policy=policy,
+            semantic_inference_profile=profile,
+            is_test_instance=True,
+            agent_id=backend.agent_id,
+            sleep_hooks=[],
+        )
+        feature = ParametricSelfFeature(agent=agent)
+        await feature.initialize()
+        feature._governed_corpus_policy = policy
+        return feature
+
+    @staticmethod
+    def _agree_backends(
+        sqlite: _BackendDrillObservation,
+        postgres: _BackendDrillObservation,
+        *,
+        run_nonce: str,
+    ) -> tuple[Mapping[str, object], str, str]:
+        """Require matching semantic observations from the two named engines."""
+        observations = (sqlite, postgres)
+        if tuple(item.backend for item in observations) != ("sqlite", "postgres"):
+            raise ExternalReleaseEvidenceError(
+                "external evidence did not observe the required isolated backend identities"
+            )
+        if any(item.run_nonce != run_nonce for item in observations):
+            raise ExternalReleaseEvidenceError("external evidence backend observations use mixed nonces")
+        revisions = {item.evidence_runner_revision for item in observations}
+        if len(revisions) != 1 or not _is_full_commit(next(iter(revisions), "")):
+            raise ExternalReleaseEvidenceError(
+                "external evidence backend observations use mixed runner revisions"
+            )
+        identity_digests = {item.identity_digest for item in observations}
+        drill_digests = {item.drill_digest for item in observations}
+        schemas = {tuple(item.observation) for item in observations}
+        if len(identity_digests) != 1 or len(drill_digests) != 1 or len(schemas) != 1:
+            raise ExternalReleaseEvidenceError(
+                "external evidence backend observations disagree on identity, drill, or schema"
+            )
+        if any(
+            set(item.observation) != {"erased_count", "remaining_count"}
+            or type(item.observation["erased_count"]) is not int
+            or type(item.observation["remaining_count"]) is not int
+            or item.observation["erased_count"] <= 0
+            or item.observation["remaining_count"] != 0
+            for item in observations
+        ):
+            raise ExternalReleaseEvidenceError(
+                "external evidence backend erasure observations are not passing"
+            )
+        # Each independently observed backend has the same fixed semantic
+        # shape. The external contract sees only their safe aggregate.
+        return (
+            MappingProxyType(
+                {
+                    "erased_count": sum(item.observation["erased_count"] for item in observations),
+                    "remaining_count": 0,
+                }
+            ),
+            next(iter(drill_digests)),
+            next(iter(revisions)),
+        )
+
+    def _seal_envelope(
+        self,
+        observation: Mapping[str, object],
+        *,
+        run_nonce: str,
+        evidence_runner_revision: str,
+        drill_semantics_digest: str,
+    ) -> ExternalReleaseEvidenceEnvelope:
+        """Sign the declared contract only after both private drills succeed."""
+        specs = _external_specs()
+        records = tuple(
+            self._record(
+                specs[gate_id],
+                observation,
+                run_nonce,
+                evidence_runner_revision,
+                drill_semantics_digest,
+            )
+            for gate_id in EXTERNAL_GATE_IDS
+        )
+        by_gate = {record.gate_id: record for record in records}
+        attestations: list[ExternalGateAttestation] = []
+        for gate_id in _EXTERNAL_CAPABILITY_GATE_IDS:
+            record = by_gate[gate_id]
+            artifact = record.artifact
+            drill = specs[gate_id].correlation
+            if record.run_digest is None or artifact is None or drill is None:
+                raise ExternalReleaseEvidenceError(
+                    "signed external record is missing a core binding"
+                )
+            attestations.append(
+                ExternalGateAttestation(
+                    gate_id=gate_id,
+                    gate_spec_digest=specs[gate_id].digest,
+                    result_digest=record.run_digest,
+                    artifact=artifact,
+                    drill=drill,
+                )
+            )
+        report = ExternalCapabilityReport.attest(
+            capability_id=_CAPABILITY_ID,
+            repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+            capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+            evidence_runner_revision=evidence_runner_revision,
+            core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+            attestations=tuple(attestations),
             run_nonce=run_nonce,
         )
-        try:
-            result = hook.erase_prepared_assertion(preparation) if erase is None else erase()
-            if inspect.isawaitable(result):
-                result = await result
-            if result is not None:
-                raise ExternalReleaseEvidenceError("external erasure action must not supply a result claim")
-            return await hook.observe(preparation)
-        except BaseException:
-            try:
-                await hook.abort(preparation)
-            except ExternalReleaseEvidenceError:
-                pass
-            raise
+        return ExternalReleaseEvidenceEnvelope(
+            core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+            repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+            capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+            evidence_runner_revision=evidence_runner_revision,
+            run_nonce=run_nonce,
+            records=records,
+            report=report,
+        )
 
     @staticmethod
     async def _erase_snapshot_assertion(
@@ -697,6 +1279,7 @@ class ParametricSelfExternalEvidenceRunner:
         observation: Mapping[str, object],
         run_nonce: str,
         evidence_runner_revision: str,
+        drill_semantics_digest: str,
     ) -> EvidenceRecord:
         # The artifact is a digest of only catalog-bound aggregate fields; it
         # cannot be used to smuggle an assertion, tenant, filesystem path, or
@@ -704,10 +1287,13 @@ class ParametricSelfExternalEvidenceRunner:
         artifact_digest = _digest(
             {
                 "core_release_evidence_contract_digest": CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+                "repository": PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                "capability_source_revision": PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
                 "gate_id": spec.gate_id,
                 "gate_spec_digest": spec.digest,
                 "observation": dict(observation),
                 "run_nonce": run_nonce,
+                "drill_semantics_digest": drill_semantics_digest,
             }
         )
         artifact = ArtifactReference(f"ci://sha256/{artifact_digest}", artifact_digest)
@@ -757,34 +1343,6 @@ def _load_private_signing_key(path: Path) -> object:
         raise ExternalReleaseEvidenceError("external signing key file is invalid") from error
 
 
-async def _load_kite_feature(factory_reference: str) -> ParametricSelfFeature:
-    """Load an explicit CI factory; never infer a production agent target."""
-    module_name, separator, attribute = factory_reference.partition(":")
-    if not module_name or not separator or not attribute or "." not in module_name:
-        raise ExternalReleaseEvidenceError(
-            "Kite feature factory must be a fully-qualified module:callable reference"
-        )
-    try:
-        factory = getattr(importlib.import_module(module_name), attribute)
-    except (ImportError, AttributeError) as error:
-        raise ExternalReleaseEvidenceError("Kite feature factory is unavailable") from error
-    if not callable(factory):
-        raise ExternalReleaseEvidenceError("Kite feature factory is not callable")
-    feature = factory()
-    if inspect.isawaitable(feature):
-        feature = await feature
-    from .feature import ParametricSelfFeature
-
-    if (
-        not isinstance(feature, ParametricSelfFeature)
-        or getattr(getattr(feature, "agent", None), "is_test_instance", False) is not True
-    ):
-        raise ExternalReleaseEvidenceError(
-            "external evidence CLI requires an isolated Kite ParametricSelfFeature"
-        )
-    return feature
-
-
 def _validate_cli_output(output: Path) -> tuple[Path, tuple[int, int]]:
     """Validate the output target before the drill can erase anything."""
     output = Path(output)
@@ -828,6 +1386,7 @@ def _write_cli_envelope_atomic(
     parent_fd: int | None = None
     temp_created = False
     target_created = False
+    publication_committed = False
     try:
         parent_fd = os.open(output.parent, parent_flags)
         parent_metadata = os.fstat(parent_fd)
@@ -869,6 +1428,7 @@ def _write_cli_envelope_atomic(
         temp_created = False
         os.fsync(parent_fd)
         _lstat_private_directory(output.parent, expected_identity=parent_identity)
+        publication_committed = True
     except ExternalReleaseEvidenceError:
         raise
     except OSError as error:
@@ -877,19 +1437,15 @@ def _write_cli_envelope_atomic(
         ) from error
     finally:
         if parent_fd is not None:
-            if target_created:
+            if target_created and not publication_committed:
                 try:
-                    # Keep a successfully-published target unless the parent
-                    # path changed after publication; then it is not the path
-                    # the verifier approved.
-                    _lstat_private_directory(
-                        output.parent, expected_identity=parent_identity
-                    )
-                except ExternalReleaseEvidenceError:
-                    try:
-                        os.unlink(output.name, dir_fd=parent_fd)
-                    except OSError:
-                        pass
+                    # A link exists but durability/identity verification did
+                    # not complete. Remove it through the pinned parent fd so
+                    # a retry sees a fresh name and no unverified evidence is
+                    # ever visible at the requested path.
+                    os.unlink(output.name, dir_fd=parent_fd)
+                except OSError:
+                    pass
             if temp_created:
                 try:
                     os.unlink(temp_name, dir_fd=parent_fd)
@@ -903,11 +1459,10 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         prog="parametric-self-release-evidence",
         description=(
             "Run the isolated Kite prepare → physical erase → observe evidence drill. "
-            "The feature factory must create a test agent, never a production agent."
+            "The runner creates the sealed isolated feature itself."
         ),
         allow_abbrev=False,
     )
-    parser.add_argument("--feature-factory", required=True)
     parser.add_argument("--signing-key-file", type=Path, required=True)
     parser.add_argument("--issuer-id", required=True)
     parser.add_argument("--key-id", required=True)
@@ -918,38 +1473,67 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _redact_cli_base_exception(error: BaseException) -> BaseException:
+    """Retain interrupts while removing every ordinary failure detail.
+
+    A mixed ``BaseExceptionGroup`` must not leak an ordinary sibling's DSN,
+    path, or nested cleanup detail merely because cancellation cannot be
+    swallowed. The interrupt leaves remain the original objects so callers
+    retain their normal cancellation/interrupt semantics.
+    """
+    interrupt_leaves: list[BaseException] = []
+    saw_ordinary_failure = False
+
+    def visit(current: BaseException) -> None:
+        nonlocal saw_ordinary_failure
+        if isinstance(current, BaseExceptionGroup):
+            for child in current.exceptions:
+                visit(child)
+        elif isinstance(current, Exception):
+            saw_ordinary_failure = True
+        else:
+            interrupt_leaves.append(current)
+
+    visit(error)
+    if not interrupt_leaves:
+        return ExternalReleaseEvidenceError(_CLI_EXECUTION_REFUSAL)
+    if not saw_ordinary_failure and len(interrupt_leaves) == 1:
+        return interrupt_leaves[0]
+    members: list[BaseException] = [*interrupt_leaves]
+    if saw_ordinary_failure:
+        members.append(ExternalReleaseEvidenceError(_CLI_EXECUTION_REFUSAL))
+    return BaseExceptionGroup("external evidence execution interrupted", members)
+
+
 async def _run_cli(args: argparse.Namespace) -> ExternalReleaseEvidenceEnvelope:
     # Validate all output invariants before loading the agent, preparing a
     # candidate, or invoking the irreversible physical erasure.
     output, output_parent_identity = _validate_cli_output(args.output)
-    feature = await _load_kite_feature(args.feature_factory)
-    identity = CatalogSigningIdentity(
-        issuer_id=args.issuer_id,
-        key_id=args.key_id,
-        private_key=_load_private_signing_key(args.signing_key_file),
-        source=ExecutionSource.EXTERNAL_CI,
-    )
-    runner = ParametricSelfExternalEvidenceRunner(identity)
-    hook = ParametricSelfKiteErasureHook(runner)
-    preparation = await hook.prepare(
-        feature,
-        scratch_dir=args.scratch_dir,
-        trusted_scratch_root=args.trusted_scratch_root,
-        run_nonce=args.run_nonce,
-    )
     try:
-        # This is deliberately a distinct server-owned phase. No CLI argument
-        # can substitute an assertion ID, lifecycle state, or success claim.
-        await hook.erase_prepared_assertion(preparation)
-        envelope = await hook.observe(preparation)
-    except BaseException:
-        try:
-            await hook.abort(preparation)
-        except ExternalReleaseEvidenceError:
-            pass
-        raise
-    _write_cli_envelope_atomic(envelope, output, output_parent_identity)
-    return envelope
+        identity = CatalogSigningIdentity(
+            issuer_id=args.issuer_id,
+            key_id=args.key_id,
+            private_key=_load_private_signing_key(args.signing_key_file),
+            source=ExecutionSource.EXTERNAL_CI,
+        )
+        runner = ParametricSelfExternalEvidenceRunner(identity)
+        envelope = await runner.run(
+            scratch_dir=args.scratch_dir,
+            trusted_scratch_root=args.trusted_scratch_root,
+            run_nonce=args.run_nonce,
+        )
+        _write_cli_envelope_atomic(envelope, output, output_parent_identity)
+        return envelope
+    except BaseException as error:
+        # The external CLI is an information boundary. Core workload errors
+        # (including disposable-PostgreSQL refusal), storage setup failures,
+        # and sealed-fixture exceptions may carry DSNs or local paths. Do not
+        # disclose them to the caller or publish partial evidence. Never turn
+        # cancellation, KeyboardInterrupt, or SystemExit into a normal refusal.
+        redacted = _redact_cli_base_exception(error)
+        if redacted is error:
+            raise
+        raise redacted from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -971,6 +1555,7 @@ __all__ = [
     "EXTERNAL_GATE_IDS",
     "ExternalReleaseEvidenceEnvelope",
     "ExternalReleaseEvidenceError",
+    "KiteErasureBackend",
     "KiteErasurePreparation",
     "ParametricSelfExternalEvidenceRunner",
     "ParametricSelfKiteErasureHook",
