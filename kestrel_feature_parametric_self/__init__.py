@@ -30,7 +30,9 @@ from .release_evidence import (
     CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     ExternalReleaseEvidenceEnvelope,
     ExternalReleaseEvidenceError,
+    KiteErasurePreparation,
     ParametricSelfExternalEvidenceRunner,
+    ParametricSelfKiteErasureHook,
 )
 from .sleep_hook import ParametricSelfSleepHook, create_parametric_self_sleep_hook
 from .text_types import TextLoRAConfig
@@ -46,7 +48,9 @@ __all__ = [
     "CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST",
     "ExternalReleaseEvidenceEnvelope",
     "ExternalReleaseEvidenceError",
+    "KiteErasurePreparation",
     "ParametricSelfExternalEvidenceRunner",
+    "ParametricSelfKiteErasureHook",
     "FidelityGate",
     "GateDecision",
     "parse_final_val_loss",

@@ -42,6 +42,9 @@ test = [
 [project.entry-points."kestrel_sovereign.features"]
 ParametricSelfFeature = "kestrel_feature_parametric_self:ParametricSelfFeature"
 
+[project.scripts]
+parametric-self-release-evidence = "kestrel_feature_parametric_self.release_evidence:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

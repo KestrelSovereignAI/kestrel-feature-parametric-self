@@ -90,6 +90,16 @@ The source and lockfile pin the published core evidence commit
 install the exact contract implementation. Do not advance that pin to a local
 or otherwise unreachable Git SHA.
 
+For Kite, use the explicit two-phase `ParametricSelfKiteErasureHook`: `prepare`
+creates a candidate and proves both candidate and served eligibility against one
+server-owned governed snapshot; the isolated server then performs
+`erase_prepared_assertion`; only `observe` may sign the post-erasure evidence.
+The standalone `parametric-self-release-evidence` command follows that same
+order and accepts only a fully-qualified factory that returns an isolated
+`is_test_instance=True` feature, a verifier-issued nonce, an owner-private CI
+signing seed, and private scratch/output paths. It never accepts an assertion
+ID or a caller-supplied success result.
+
 ## Incomplete-shutdown recovery
 
 If status reports a shutdown restored from a prior process, training remains

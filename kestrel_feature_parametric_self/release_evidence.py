@@ -13,10 +13,14 @@ whether the external-CI signing key is trusted when it assembles a release.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
+import importlib
 import inspect
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -32,7 +36,9 @@ from kestrel_sovereign.knowledge.release_evidence import (
     PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
     release_gate_specs,
 )
-from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
+from kestrel_sovereign.knowledge.release_evidence_execution import (
+    CatalogSigningIdentity,
+)
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ArtifactReference,
     EvidenceRecord,
@@ -65,6 +71,33 @@ class ExternalReleaseEvidenceError(ValueError):
 
 
 ErasureAction = Callable[[], None | Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class KiteErasurePreparation:
+    """Opaque capability for one prepared Kite erasure drill.
+
+    The assertion identity, governed snapshot, candidate location, and feature
+    stay in the hook's private state. The capability only correlates the two
+    explicitly ordered phases and carries no user content or tenant identity.
+    """
+
+    _drill_id: str
+    run_nonce: str
+    evidence_runner_revision: str
+
+
+@dataclass(slots=True)
+class _PreparedKiteDrill:
+    """Private, server-owned state for a prepared external evidence drill."""
+
+    feature: ParametricSelfFeature
+    snapshot: GovernedCorpusSnapshot
+    scratch_dir: Path
+    scratch_identities: Mapping[Path, tuple[int, int]]
+    candidate_path: str
+    run_nonce: str
+    evidence_runner_revision: str
 
 
 def _canonical_json(value: object) -> str:
@@ -342,6 +375,229 @@ class ExternalReleaseEvidenceEnvelope:
         output.write_text(_canonical_json(self.to_mapping()) + "\n", encoding="utf-8")
 
 
+class ParametricSelfKiteErasureHook:
+    """Two-phase, server-owned Kite hook for the external erasure drill.
+
+    ``prepare`` creates and verifies a real governed candidate *before* any
+    deletion.  The isolated agent's server then calls
+    ``erase_prepared_assertion`` (or performs its own scoped physical erase),
+    and ``observe`` proves that exact candidate became invalid and can no
+    longer be served.  A preparation is an opaque one-shot capability; callers
+    never receive the assertion or snapshot needed to substitute a different
+    deletion.
+    """
+
+    def __init__(self, runner: ParametricSelfExternalEvidenceRunner) -> None:
+        self._runner = runner
+        self._prepared: dict[str, _PreparedKiteDrill] = {}
+
+    async def prepare(
+        self,
+        feature: ParametricSelfFeature,
+        *,
+        scratch_dir: Path,
+        trusted_scratch_root: Path,
+        run_nonce: str,
+    ) -> KiteErasurePreparation:
+        """Establish candidate and served eligibility before physical erasure."""
+        if (
+            not isinstance(run_nonce, str)
+            or len(run_nonce) != _FRESHNESS_NONCE_BYTES * 2
+            or any(character not in "0123456789abcdef" for character in run_nonce)
+        ):
+            raise ExternalReleaseEvidenceError("external evidence requires a verifier-issued nonce")
+        if getattr(feature, "_active_adapter_path", None) is not None:
+            raise ExternalReleaseEvidenceError(
+                "external drill requires an isolated feature with no served adapter"
+            )
+        runner_revision = _resolve_clean_evidence_runner_revision()
+        scratch, candidate, corpus_dir, identities = _prepare_private_scratch_tree(
+            Path(scratch_dir), Path(trusted_scratch_root)
+        )
+        candidate_path: str | None = None
+        try:
+            snapshot, problem = await feature._request_governed_snapshot()
+            if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
+                raise ExternalReleaseEvidenceError(
+                    "core governed corpus snapshot is unavailable or invalid"
+                )
+            if not snapshot.examples:
+                raise ExternalReleaseEvidenceError(
+                    "external erasure drill requires a non-empty governed corpus"
+                )
+            _verify_private_scratch_tree(scratch, identities)
+            stats = build_corpus(
+                None,
+                str(corpus_dir),
+                governed_snapshot=snapshot,
+                manifest_dir=str(candidate),
+            )
+            _verify_private_scratch_tree(scratch, identities)
+            if stats.from_facts <= 0 or not stats.assertion_lineage:
+                raise ExternalReleaseEvidenceError(
+                    "core governed corpus did not contribute an erasure-tracked example"
+                )
+            manifest, manifest_problem = feature._manifest_lineage(str(candidate))
+            receipt = feature._manifest_receipt_stamp(manifest or {}) if manifest else None
+            if manifest_problem or receipt is None:
+                raise ExternalReleaseEvidenceError("candidate lineage receipt could not be established")
+
+            candidate_path = str(candidate)
+            feature._adapter_lineage[candidate_path] = {**receipt, "state": "candidate"}
+            feature._active_adapter_path = candidate_path
+            feature._live_corpus_snapshot = snapshot
+
+            # This first verification is deliberately before the erasure. It
+            # proves that this exact candidate was both candidate-eligible and
+            # serve-eligible using the same server-owned snapshot.  The
+            # verifier consumes an in-memory delta base, so restore the exact
+            # snapshot for the post-erasure observation below.
+            eligibility_problem = await feature._verify_adapter_lineage(
+                candidate_path, before_promotion=True
+            )
+            if eligibility_problem or feature._active_adapter_path != candidate_path:
+                raise ExternalReleaseEvidenceError(
+                    "candidate was not eligible for serving before erasure"
+                )
+            feature._adapter_lineage[candidate_path].update(
+                {
+                    "state": "served",
+                    "candidate_eligibility": "accepted",
+                    "served_eligibility": "accepted",
+                }
+            )
+            feature._live_corpus_snapshot = snapshot
+            drill_id = secrets.token_hex(32)
+            self._prepared[drill_id] = _PreparedKiteDrill(
+                feature=feature,
+                snapshot=snapshot,
+                scratch_dir=scratch,
+                scratch_identities=identities,
+                candidate_path=candidate_path,
+                run_nonce=run_nonce,
+                evidence_runner_revision=runner_revision,
+            )
+            return KiteErasurePreparation(drill_id, run_nonce, runner_revision)
+        except BaseException:
+            if candidate_path is not None:
+                # A failed pre-erase eligibility check must not leave an
+                # active pointer to a candidate whose private manifest is
+                # about to be removed.
+                await feature._quarantine_adapter(
+                    candidate_path, "external erasure drill preparation failed"
+                )
+            _cleanup_private_scratch_tree(scratch, identities)
+            raise
+
+    def _state(self, preparation: KiteErasurePreparation) -> _PreparedKiteDrill:
+        if not isinstance(preparation, KiteErasurePreparation):
+            raise ExternalReleaseEvidenceError("external erasure observation requires a prepared Kite drill")
+        state = self._prepared.get(preparation._drill_id)
+        if (
+            state is None
+            or preparation.run_nonce != state.run_nonce
+            or preparation.evidence_runner_revision != state.evidence_runner_revision
+        ):
+            raise ExternalReleaseEvidenceError("external erasure preparation is unknown or already consumed")
+        return state
+
+    async def erase_prepared_assertion(self, preparation: KiteErasurePreparation) -> None:
+        """Invoke the server's scoped physical erase for this prepared drill."""
+        state = self._state(preparation)
+        await self._runner._erase_snapshot_assertion(
+            state.feature, state.snapshot, state.run_nonce
+        )
+
+    async def observe(
+        self, preparation: KiteErasurePreparation
+    ) -> ExternalReleaseEvidenceEnvelope:
+        """Verify post-erasure invalidation and sign the fixed external gates."""
+        state = self._state(preparation)
+        try:
+            # Re-establish the exact pre-erase base held by the hook, rather
+            # than accepting a caller-mutated feature cache or a later fresh
+            # snapshot as the observation's lineage source.
+            state.feature._live_corpus_snapshot = state.snapshot
+            invalidation_reason = await state.feature._verify_adapter_lineage(
+                state.candidate_path
+            )
+            lineage = state.feature._adapter_lineage.get(state.candidate_path, {})
+            if not invalidation_reason or lineage.get("state") != "invalid":
+                await state.feature._quarantine_adapter(
+                    state.candidate_path,
+                    "external erasure observation did not establish invalidation",
+                )
+                raise ExternalReleaseEvidenceError(
+                    "erasure did not invalidate the governed corpus candidate"
+                )
+            if state.feature._active_adapter_path is not None:
+                raise ExternalReleaseEvidenceError(
+                    "erasure did not reject served adapter eligibility"
+                )
+            specs = _external_specs()
+            observations: Mapping[str, Mapping[str, object]] = {
+                "external_corpus_consumed": {"erased_count": 1, "remaining_count": 0},
+                "external_candidate_invalidated": {"erased_count": 1, "remaining_count": 0},
+                "external_served_eligibility_rejected": {"erased_count": 1, "remaining_count": 0},
+            }
+            records = tuple(
+                self._runner._record(
+                    specs[gate_id], observations[gate_id], state.run_nonce,
+                    state.evidence_runner_revision,
+                )
+                for gate_id in EXTERNAL_GATE_IDS
+            )
+            attestations: list[ExternalGateAttestation] = []
+            for record in records:
+                artifact = record.artifact
+                drill = specs[record.gate_id].correlation
+                if record.run_digest is None or artifact is None or drill is None:
+                    raise ExternalReleaseEvidenceError(
+                        "signed external record is missing a core binding"
+                    )
+                attestations.append(
+                    ExternalGateAttestation(
+                        gate_id=record.gate_id,
+                        gate_spec_digest=specs[record.gate_id].digest,
+                        result_digest=record.run_digest,
+                        artifact=artifact,
+                        drill=drill,
+                    )
+                )
+            report = ExternalCapabilityReport.attest(
+                capability_id=_CAPABILITY_ID,
+                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+                evidence_runner_revision=state.evidence_runner_revision,
+                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+                attestations=tuple(attestations),
+                run_nonce=state.run_nonce,
+            )
+            return ExternalReleaseEvidenceEnvelope(
+                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+                evidence_runner_revision=state.evidence_runner_revision,
+                run_nonce=state.run_nonce,
+                records=records,
+                report=report,
+            )
+        finally:
+            self._prepared.pop(preparation._drill_id, None)
+            _cleanup_private_scratch_tree(state.scratch_dir, state.scratch_identities)
+
+    async def abort(self, preparation: KiteErasurePreparation) -> None:
+        """Fail closed and clear a prepared drill that will not be observed."""
+        state = self._state(preparation)
+        self._prepared.pop(preparation._drill_id, None)
+        try:
+            await state.feature._quarantine_adapter(
+                state.candidate_path, "external erasure drill aborted before observation"
+            )
+        finally:
+            _cleanup_private_scratch_tree(state.scratch_dir, state.scratch_identities)
+
+
 class ParametricSelfExternalEvidenceRunner:
     """Execute the real external corpus → invalidation → serving drill.
 
@@ -361,140 +617,47 @@ class ParametricSelfExternalEvidenceRunner:
 
     async def run(
         self,
-        feature: "ParametricSelfFeature",
+        feature: ParametricSelfFeature,
         *,
         scratch_dir: Path,
         trusted_scratch_root: Path,
         run_nonce: str,
         erase: ErasureAction | None = None,
     ) -> ExternalReleaseEvidenceEnvelope:
-        """Run one fresh, correlated drill and return its signed envelope.
+        """Compatibility wrapper over the real two-phase Kite hook.
 
-        The caller is responsible for supplying an isolated Kite/test agent,
-        a verifier-issued one-time nonce, and an erasure action scoped to the
-        governed assertion created for this drill.  A no-op, unrelated
-        deletion, stale snapshot, untracked candidate, or still-served adapter
-        all fail closed.
+        New live-agent callers should retain the preparation and call
+        :meth:`ParametricSelfKiteErasureHook.observe` only after the server has
+        physically erased the prepared assertion.  Keeping this wrapper avoids
+        silently weakening existing external CI callers while preserving the
+        same prepare → erase → observe ordering.
         """
         if erase is not None and not callable(erase):
             raise ExternalReleaseEvidenceError("external erasure action must be callable")
-        if (
-            not isinstance(run_nonce, str)
-            or len(run_nonce) != _FRESHNESS_NONCE_BYTES * 2
-            or any(character not in "0123456789abcdef" for character in run_nonce)
-        ):
-            raise ExternalReleaseEvidenceError("external evidence requires a verifier-issued nonce")
-        specs = _external_specs()
-        runner_revision = _resolve_clean_evidence_runner_revision()
-        if getattr(feature, "_active_adapter_path", None) is not None:
-            raise ExternalReleaseEvidenceError("external drill requires an isolated feature with no served adapter")
-        scratch_dir, candidate, corpus_dir, scratch_identities = _prepare_private_scratch_tree(
-            Path(scratch_dir), Path(trusted_scratch_root)
+        hook = ParametricSelfKiteErasureHook(self)
+        preparation = await hook.prepare(
+            feature,
+            scratch_dir=scratch_dir,
+            trusted_scratch_root=trusted_scratch_root,
+            run_nonce=run_nonce,
         )
         try:
-            snapshot, problem = await feature._request_governed_snapshot()
-            if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
-                raise ExternalReleaseEvidenceError("core governed corpus snapshot is unavailable or invalid")
-            if not snapshot.examples:
-                raise ExternalReleaseEvidenceError("external erasure drill requires a non-empty governed corpus")
-            _verify_private_scratch_tree(scratch_dir, scratch_identities)
-            stats = build_corpus(
-                None,
-                str(corpus_dir),
-                governed_snapshot=snapshot,
-                manifest_dir=str(candidate),
-            )
-            _verify_private_scratch_tree(scratch_dir, scratch_identities)
-            if stats.from_facts <= 0 or not stats.assertion_lineage:
-                raise ExternalReleaseEvidenceError("core governed corpus did not contribute an erasure-tracked example")
-            manifest, manifest_problem = feature._manifest_lineage(str(candidate))
-            receipt = feature._manifest_receipt_stamp(manifest or {}) if manifest else None
-            if manifest_problem or receipt is None:
-                raise ExternalReleaseEvidenceError("candidate lineage receipt could not be established")
-
-            candidate_path = str(candidate)
-            feature._adapter_lineage[candidate_path] = {**receipt, "state": "candidate"}
-            feature._active_adapter_path = candidate_path
-            feature._live_corpus_snapshot = snapshot
-
-            # The default path is a real, scoped core physical erasure for the exact
-            # assertion that produced this snapshot.  ``erase`` remains only
-            # for an operator-owned erasure coordinator with a wider physical
-            # surface (vectors/exports): it must still produce this core
-            # tombstone or the lineage verifier below rejects the run.
-            result = (
-                self._erase_snapshot_assertion(feature, snapshot, run_nonce)
-                if erase is None
-                else erase()
-            )
+            result = hook.erase_prepared_assertion(preparation) if erase is None else erase()
             if inspect.isawaitable(result):
                 result = await result
             if result is not None:
                 raise ExternalReleaseEvidenceError("external erasure action must not supply a result claim")
-
-            invalidation_reason = await feature._verify_adapter_lineage(candidate_path)
-            lineage = feature._adapter_lineage.get(candidate_path, {})
-            if not invalidation_reason or lineage.get("state") != "invalid":
-                raise ExternalReleaseEvidenceError("erasure did not invalidate the governed corpus candidate")
-            if feature._active_adapter_path is not None:
-                raise ExternalReleaseEvidenceError("erasure did not reject served adapter eligibility")
-
-            # All three gates are proven by one core-correlated drill.  The
-            # aggregate deliberately reveals neither the assertion count nor its
-            # identity: positive/zero is sufficient to bind the gate schema.
-            observations: Mapping[str, Mapping[str, object]] = {
-                "external_corpus_consumed": {"erased_count": 1, "remaining_count": 0},
-                "external_candidate_invalidated": {"erased_count": 1, "remaining_count": 0},
-                "external_served_eligibility_rejected": {"erased_count": 1, "remaining_count": 0},
-            }
-            records = tuple(
-                self._record(
-                    specs[gate_id], observations[gate_id], run_nonce, runner_revision
-                )
-                for gate_id in EXTERNAL_GATE_IDS
-            )
-            attestations: list[ExternalGateAttestation] = []
-            for record in records:
-                artifact = record.artifact
-                drill = specs[record.gate_id].correlation
-                if record.run_digest is None or artifact is None or drill is None:
-                    raise ExternalReleaseEvidenceError("signed external record is missing a core binding")
-                attestations.append(
-                    ExternalGateAttestation(
-                        gate_id=record.gate_id,
-                        gate_spec_digest=specs[record.gate_id].digest,
-                        result_digest=record.run_digest,
-                        artifact=artifact,
-                        drill=drill,
-                    )
-                )
-            report = ExternalCapabilityReport.attest(
-                capability_id=_CAPABILITY_ID,
-                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
-                evidence_runner_revision=runner_revision,
-                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-                attestations=tuple(attestations),
-                run_nonce=run_nonce,
-            )
-            return ExternalReleaseEvidenceEnvelope(
-                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
-                evidence_runner_revision=runner_revision,
-                run_nonce=run_nonce,
-                records=records,
-                report=report,
-            )
-        finally:
-            # The candidate manifest is lineage-sensitive too.  This exact
-            # fresh tree exists solely for the drill, so delete *all* of it on
-            # success, exceptions, and task cancellation.
-            _cleanup_private_scratch_tree(scratch_dir, scratch_identities)
+            return await hook.observe(preparation)
+        except BaseException:
+            try:
+                await hook.abort(preparation)
+            except ExternalReleaseEvidenceError:
+                pass
+            raise
 
     @staticmethod
     async def _erase_snapshot_assertion(
-        feature: "ParametricSelfFeature",
+        feature: ParametricSelfFeature,
         snapshot: GovernedCorpusSnapshot,
         run_nonce: str,
     ) -> None:
@@ -553,10 +716,141 @@ class ParametricSelfExternalEvidenceRunner:
         )
 
 
+def _load_private_signing_key(path: Path) -> object:
+    """Load a CI signing seed only from an owner-private regular file."""
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise ExternalReleaseEvidenceError("external signing key file is not private")
+        raw = path.read_bytes().strip()
+    except OSError as error:
+        raise ExternalReleaseEvidenceError("external signing key file is unavailable") from error
+    try:
+        seed = bytes.fromhex(raw.decode("ascii")) if len(raw) == 64 else raw
+        if len(seed) != 32:
+            raise ValueError("wrong seed size")
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        return Ed25519PrivateKey.from_private_bytes(seed)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ExternalReleaseEvidenceError("external signing key file is invalid") from error
+
+
+async def _load_kite_feature(factory_reference: str) -> ParametricSelfFeature:
+    """Load an explicit CI factory; never infer a production agent target."""
+    module_name, separator, attribute = factory_reference.partition(":")
+    if not module_name or not separator or not attribute or "." not in module_name:
+        raise ExternalReleaseEvidenceError(
+            "Kite feature factory must be a fully-qualified module:callable reference"
+        )
+    try:
+        factory = getattr(importlib.import_module(module_name), attribute)
+    except (ImportError, AttributeError) as error:
+        raise ExternalReleaseEvidenceError("Kite feature factory is unavailable") from error
+    if not callable(factory):
+        raise ExternalReleaseEvidenceError("Kite feature factory is not callable")
+    feature = factory()
+    if inspect.isawaitable(feature):
+        feature = await feature
+    from .feature import ParametricSelfFeature
+
+    if (
+        not isinstance(feature, ParametricSelfFeature)
+        or getattr(getattr(feature, "agent", None), "is_test_instance", False) is not True
+    ):
+        raise ExternalReleaseEvidenceError(
+            "external evidence CLI requires an isolated Kite ParametricSelfFeature"
+        )
+    return feature
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="parametric-self-release-evidence",
+        description=(
+            "Run the isolated Kite prepare → physical erase → observe evidence drill. "
+            "The feature factory must create a test agent, never a production agent."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--feature-factory", required=True)
+    parser.add_argument("--signing-key-file", type=Path, required=True)
+    parser.add_argument("--issuer-id", required=True)
+    parser.add_argument("--key-id", required=True)
+    parser.add_argument("--run-nonce", required=True)
+    parser.add_argument("--scratch-dir", type=Path, required=True)
+    parser.add_argument("--trusted-scratch-root", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+async def _run_cli(args: argparse.Namespace) -> ExternalReleaseEvidenceEnvelope:
+    feature = await _load_kite_feature(args.feature_factory)
+    identity = CatalogSigningIdentity(
+        issuer_id=args.issuer_id,
+        key_id=args.key_id,
+        private_key=_load_private_signing_key(args.signing_key_file),
+        source=ExecutionSource.EXTERNAL_CI,
+    )
+    runner = ParametricSelfExternalEvidenceRunner(identity)
+    hook = ParametricSelfKiteErasureHook(runner)
+    preparation = await hook.prepare(
+        feature,
+        scratch_dir=args.scratch_dir,
+        trusted_scratch_root=args.trusted_scratch_root,
+        run_nonce=args.run_nonce,
+    )
+    try:
+        # This is deliberately a distinct server-owned phase. No CLI argument
+        # can substitute an assertion ID, lifecycle state, or success claim.
+        await hook.erase_prepared_assertion(preparation)
+        envelope = await hook.observe(preparation)
+    except BaseException:
+        try:
+            await hook.abort(preparation)
+        except ExternalReleaseEvidenceError:
+            pass
+        raise
+    if not args.output.is_absolute() or args.output.exists():
+        raise ExternalReleaseEvidenceError(
+            "external evidence output must be a fresh absolute path"
+        )
+    _lstat_private_directory(args.output.parent)
+    envelope.write(args.output)
+    os.chmod(args.output, 0o600)
+    return envelope
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entrypoint for externally operated, isolated Kite evidence runs."""
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+    try:
+        asyncio.run(_run_cli(args))
+    except ExternalReleaseEvidenceError as error:
+        parser.exit(2, f"external release evidence refused: {error}\n")
+    # Do not print the output path or live-agent identity; callers supplied
+    # those and the resulting envelope is the CI artifact.
+    print("external release evidence completed; core policy verification required")
+    return 0
+
+
 __all__ = [
     "CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST",
     "EXTERNAL_GATE_IDS",
     "ExternalReleaseEvidenceEnvelope",
     "ExternalReleaseEvidenceError",
+    "KiteErasurePreparation",
     "ParametricSelfExternalEvidenceRunner",
+    "ParametricSelfKiteErasureHook",
+    "main",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - entrypoint is tested via main().
+    raise SystemExit(main())

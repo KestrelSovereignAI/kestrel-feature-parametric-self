@@ -4,28 +4,21 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+import sys
+import types
+from argparse import Namespace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-from kestrel_feature_parametric_self import ParametricSelfFeature
-from kestrel_feature_parametric_self import release_evidence as release_evidence_module
-from kestrel_feature_parametric_self.release_evidence import (
-    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-    EXTERNAL_GATE_IDS,
-    ExternalReleaseEvidenceError,
-    ParametricSelfExternalEvidenceRunner,
-)
-_REAL_RUNNER_REVISION_RESOLVER = release_evidence_module._resolve_clean_evidence_runner_revision
 from kestrel_sovereign.knowledge.assertion import (
+    IRI,
     Assertion,
     DirectLineage,
     EpistemicState,
-    IRI,
     Literal,
     OntologyRef,
     SourceOccurrence,
@@ -49,8 +42,12 @@ from kestrel_sovereign.knowledge.release_evidence import (
     attach_external_capability_report,
     release_evidence_template,
 )
-from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFreshnessLedger
-from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
+from kestrel_sovereign.knowledge.release_evidence_execution import (
+    CatalogSigningIdentity,
+)
+from kestrel_sovereign.knowledge.release_evidence_freshness import (
+    ExternalFreshnessLedger,
+)
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
     ExternalCapabilityReport,
@@ -61,6 +58,18 @@ from kestrel_sovereign.knowledge.shacl_validation import (
     ValidationState,
     ValidationWriteAction,
 )
+
+from kestrel_feature_parametric_self import ParametricSelfFeature
+from kestrel_feature_parametric_self import release_evidence as release_evidence_module
+from kestrel_feature_parametric_self.release_evidence import (
+    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+    EXTERNAL_GATE_IDS,
+    ExternalReleaseEvidenceError,
+    ParametricSelfExternalEvidenceRunner,
+    ParametricSelfKiteErasureHook,
+)
+
+_REAL_RUNNER_REVISION_RESOLVER = release_evidence_module._resolve_clean_evidence_runner_revision
 
 
 @pytest.fixture(autouse=True)
@@ -96,7 +105,7 @@ def _snapshot() -> GovernedCorpusSnapshot:
         confidence_method="operator",
         confidence_basis="operator-attested",
         epistemic_state=EpistemicState.ASSERTED,
-        asserted_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        asserted_at=datetime(2026, 7, 31, tzinfo=UTC),
         ontology_version=ontology,
         lineage=DirectLineage(("source-evidence",)),
         privacy_classification="normal",
@@ -119,7 +128,7 @@ def _snapshot() -> GovernedCorpusSnapshot:
         "source-evidence",
         "operator-note",
         "evidence-source",
-        datetime(2026, 7, 31, tzinfo=timezone.utc),
+        datetime(2026, 7, 31, tzinfo=UTC),
     )
     validation = CorpusValidationStatus(ValidationState.CONFORMS, ValidationWriteAction.ACCEPT)
     example = GovernedCorpusExample(
@@ -187,6 +196,11 @@ class _CoreBackedErasureStorage:
                 checkpoint.generation,
             ),
         )
+
+    async def erase_assertion(self, assertion_id, *, operation_id):
+        assert assertion_id == self.snapshot.examples[0].assertion.assertion_id
+        assert operation_id.startswith("parametric-self-release-erasure:")
+        self.erased = True
 
     async def add_node(self, node) -> None:
         self.nodes[node.node_id] = node
@@ -343,8 +357,75 @@ async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_
             run_nonce="a" * 64,
             erase=no_op_erase,
         )
-    assert feature._active_adapter_path is not None
+    # Failed observation fails closed: leaving a candidate marked served after
+    # a purported erasure would be a more dangerous state than quarantining it.
+    assert feature._active_adapter_path is None
     assert not (tmp_path / "fresh-drill").exists()
+
+
+async def test_kite_hook_proves_pre_erase_eligibility_then_observes_server_erasure(tmp_path):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    hook = ParametricSelfKiteErasureHook(ParametricSelfExternalEvidenceRunner(_identity()))
+
+    prepared = await hook.prepare(
+        feature,
+        scratch_dir=tmp_path / "two-phase-drill",
+        trusted_scratch_root=tmp_path,
+        run_nonce="1" * 64,
+    )
+    candidate_path = feature._active_adapter_path
+    assert candidate_path is not None
+    assert feature._adapter_lineage[candidate_path]["candidate_eligibility"] == "accepted"
+    assert feature._adapter_lineage[candidate_path]["served_eligibility"] == "accepted"
+
+    # The server-owned hook selects the precise assertion from the snapshot;
+    # neither the test nor a CLI argument supplies an assertion identifier.
+    await hook.erase_prepared_assertion(prepared)
+    # A caller cannot replace the correlated base with a later/empty cache
+    # between the server erase and the observation.
+    feature._live_corpus_snapshot = None
+    envelope = await hook.observe(prepared)
+
+    assert storage.erased is True
+    assert all(record.passed for record in envelope.records)
+    assert feature._active_adapter_path is None
+    with pytest.raises(ExternalReleaseEvidenceError, match="already consumed"):
+        await hook.observe(prepared)
+
+
+async def test_external_evidence_cli_requires_a_kite_factory_and_runs_two_phases(tmp_path, monkeypatch):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    feature.agent.is_test_instance = True
+    module_name = "kestrel_feature_parametric_self._test_kite_factory"
+    module = types.ModuleType(module_name)
+
+    async def make_feature():
+        return feature
+
+    module.make_feature = make_feature
+    monkeypatch.setitem(sys.modules, module_name, module)
+    key_file = tmp_path / "external-ci.key"
+    key_file.write_text("08" * 32, encoding="ascii")
+    key_file.chmod(0o600)
+    output = tmp_path / "external-evidence.json"
+    args = Namespace(
+        feature_factory=f"{module_name}:make_feature",
+        signing_key_file=key_file,
+        issuer_id="parametric_self_ci",
+        key_id="release_evidence_key",
+        run_nonce="2" * 64,
+        scratch_dir=tmp_path / "cli-drill",
+        trusted_scratch_root=tmp_path,
+        output=output,
+    )
+
+    envelope = await release_evidence_module._run_cli(args)
+
+    assert storage.erased is True
+    assert output.exists()
+    assert json.loads(output.read_text())["run_nonce"] == envelope.run_nonce
 
 
 async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live(tmp_path):
@@ -523,10 +604,12 @@ def test_external_evidence_uses_the_immutable_core_contract_digest() -> None:
 async def test_external_evidence_default_path_uses_real_core_storage_privacy_and_erasure(tmp_path):
     """No fake corpus/delta: core creates the fact and its physical tombstone."""
     from kestrel_sovereign.knowledge import InferenceProfile
-    from kestrel_sovereign.storage.async_assertion_store import _issue_assertion_tenant_capability
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.async_assertion_store import (
+        _issue_assertion_tenant_capability,
+    )
     from kestrel_sovereign.storage.async_storage import AsyncStorage
     from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
-    from kestrel_sovereign.privacy import PrivacyMode
 
     tenant = "did:kestrel:release-evidence:e2e"
     raw = AsyncStorage(
