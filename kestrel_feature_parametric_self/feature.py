@@ -740,7 +740,13 @@ class ParametricSelfFeature(Feature):
             return "governed corpus delta evidence mismatch; adapter cannot be verified"
         return None
 
-    async def _verify_adapter_lineage(self, path: str, *, before_promotion: bool = False) -> Optional[str]:
+    async def _verify_adapter_lineage(
+        self,
+        path: str,
+        *,
+        before_promotion: bool = False,
+        artifact_consumer: Any = None,
+    ) -> Optional[str]:
         """Quarantine an adapter when its exact governed inputs no longer hold."""
         manifest, manifest_error = self._manifest_lineage(path)
         if manifest_error:
@@ -766,7 +772,7 @@ class ParametricSelfFeature(Feature):
                 delta = await changes(
                     snapshot, policy=policy,
                     inference_profile=self._resolved_inference_profile(),
-                    **self._artifact_producer_kwargs(),
+                    **self._artifact_producer_kwargs(artifact_consumer),
                 )
             except Exception:
                 reason = "governed corpus delta unavailable; adapter cannot be verified"
@@ -795,7 +801,9 @@ class ParametricSelfFeature(Feature):
 
         # A process restart cannot reuse an in-memory snapshot as durable proof.
         # Rebuild a fresh approved snapshot and compare exact revisions.
-        fresh, reason = await self._request_governed_snapshot()
+        fresh, reason = await self._request_governed_snapshot(
+            artifact_consumer=artifact_consumer
+        )
         if fresh is None:
             await self._quarantine_adapter(path, reason or "governed corpus unavailable")
             return reason

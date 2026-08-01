@@ -162,11 +162,15 @@ class _CoreBackedErasureStorage:
         self.snapshot = snapshot
         self.erased = False
         self.nodes: dict[str, object] = {}
+        self.snapshot_requests: list[dict[str, object]] = []
+        self.delta_requests: list[dict[str, object]] = []
 
-    async def governed_assertion_corpus_snapshot(self, **_kwargs):
+    async def governed_assertion_corpus_snapshot(self, **kwargs):
+        self.snapshot_requests.append(dict(kwargs))
         return self.snapshot
 
-    async def governed_assertion_corpus_changes_since(self, snapshot, **_kwargs):
+    async def governed_assertion_corpus_changes_since(self, snapshot, **kwargs):
+        self.delta_requests.append(dict(kwargs))
         assert snapshot is self.snapshot
         tombstones = ()
         checkpoint = snapshot.checkpoint
@@ -392,6 +396,43 @@ async def test_kite_hook_proves_pre_erase_eligibility_then_observes_server_erasu
     assert feature._active_adapter_path is None
     with pytest.raises(ExternalReleaseEvidenceError, match="already consumed"):
         await hook.observe(prepared)
+
+
+async def test_kite_hook_retains_original_consumer_identity_after_substitution_attempt(tmp_path):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    identity = _identity()
+    hook = ParametricSelfKiteErasureHook(ParametricSelfExternalEvidenceRunner(identity))
+
+    prepared = await hook.prepare(
+        feature,
+        scratch_dir=tmp_path / "identity-bound-drill",
+        trusted_scratch_root=tmp_path,
+        run_nonce="4" * 64,
+    )
+    feature._governed_artifact_consumer = {
+        "consumer_id": "substituted-consumer",
+        "consumer_key_id": "substituted-key",
+        "consumer_public_key": "f" * 64,
+        "retention_seconds": 1.0,
+    }
+
+    await hook.erase_prepared_assertion(prepared)
+    envelope = await hook.observe(prepared)
+
+    assert all(record.passed for record in envelope.records)
+    registrations = storage.snapshot_requests + storage.delta_requests
+    assert len(registrations) >= 3
+    assert {request["consumer_id"] for request in registrations} == {
+        identity.issuer_id
+    }
+    assert {request["consumer_key_id"] for request in registrations} == {
+        identity.key_id
+    }
+    assert {request["consumer_public_key"] for request in registrations} == {
+        identity.public_key
+    }
+    assert all(request["artifact_id"] for request in registrations)
 
 
 async def test_external_evidence_cli_requires_a_kite_factory_and_runs_two_phases(tmp_path, monkeypatch):

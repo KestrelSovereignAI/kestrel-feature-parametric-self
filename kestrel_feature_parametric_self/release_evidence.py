@@ -27,6 +27,7 @@ import subprocess
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from kestrel_sovereign.knowledge.corpus import GovernedCorpusSnapshot
@@ -96,6 +97,7 @@ class _PreparedKiteDrill:
     scratch_dir: Path
     scratch_identities: Mapping[Path, tuple[int, int]]
     candidate_path: str
+    artifact_consumer: Mapping[str, object]
     run_nonce: str
     evidence_runner_revision: str
 
@@ -415,14 +417,17 @@ class ParametricSelfKiteErasureHook:
             Path(scratch_dir), Path(trusted_scratch_root)
         )
         candidate_path: str | None = None
+        artifact_consumer: Mapping[str, object] = MappingProxyType(
+            {
+                "consumer_id": self._runner._identity.issuer_id,
+                "consumer_key_id": self._runner._identity.key_id,
+                "consumer_public_key": self._runner._identity.public_key,
+                "retention_seconds": 300.0,
+            }
+        )
         try:
             snapshot, problem = await feature._request_governed_snapshot(
-                artifact_consumer={
-                    "consumer_id": self._runner._identity.issuer_id,
-                    "consumer_key_id": self._runner._identity.key_id,
-                    "consumer_public_key": self._runner._identity.public_key,
-                    "retention_seconds": 300.0,
-                }
+                artifact_consumer=artifact_consumer
             )
             if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
                 raise ExternalReleaseEvidenceError(
@@ -460,7 +465,9 @@ class ParametricSelfKiteErasureHook:
             # verifier consumes an in-memory delta base, so restore the exact
             # snapshot for the post-erasure observation below.
             eligibility_problem = await feature._verify_adapter_lineage(
-                candidate_path, before_promotion=True
+                candidate_path,
+                before_promotion=True,
+                artifact_consumer=artifact_consumer,
             )
             if eligibility_problem or feature._active_adapter_path != candidate_path:
                 raise ExternalReleaseEvidenceError(
@@ -481,6 +488,7 @@ class ParametricSelfKiteErasureHook:
                 scratch_dir=scratch,
                 scratch_identities=identities,
                 candidate_path=candidate_path,
+                artifact_consumer=artifact_consumer,
                 run_nonce=run_nonce,
                 evidence_runner_revision=runner_revision,
             )
@@ -526,7 +534,8 @@ class ParametricSelfKiteErasureHook:
             # snapshot as the observation's lineage source.
             state.feature._live_corpus_snapshot = state.snapshot
             invalidation_reason = await state.feature._verify_adapter_lineage(
-                state.candidate_path
+                state.candidate_path,
+                artifact_consumer=state.artifact_consumer,
             )
             lineage = state.feature._adapter_lineage.get(state.candidate_path, {})
             if not invalidation_reason or lineage.get("state") != "invalid":
