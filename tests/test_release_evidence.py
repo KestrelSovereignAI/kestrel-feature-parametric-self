@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
+import traceback
 import types
 from argparse import Namespace
 from dataclasses import replace
@@ -213,6 +215,14 @@ class _CoreBackedErasureStorage:
         assert operation_id.startswith("parametric-self-release-erasure:")
         self.erased = True
 
+    async def get_assertion(self, assertion_id, *, include_inactive=False):
+        if (
+            not self.erased
+            and assertion_id == self.snapshot.examples[0].assertion.assertion_id
+        ):
+            return self.snapshot.examples[0].assertion
+        return None
+
     async def add_node(self, node) -> None:
         self.nodes[node.node_id] = node
 
@@ -307,7 +317,16 @@ def _dual_feature_factory(tmp_path: Path):
     return make_feature, storages
 
 
-async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs(tmp_path):
+def _install_test_feature_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: ParametricSelfExternalEvidenceRunner,
+    builder,
+) -> None:
+    """Keep storage doubles behind a private runner seam, never a caller API."""
+    monkeypatch.setattr(runner, "_build_isolated_feature", builder)
+
+
+async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs(tmp_path, monkeypatch):
     factory, storages = _dual_feature_factory(tmp_path)
     identity = _identity()
     ledger = ExternalFreshnessLedger(
@@ -315,8 +334,9 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     )
     run_nonce = ledger.issue_challenge()
 
-    envelope = await ParametricSelfExternalEvidenceRunner(identity).run(
-        factory,
+    runner = ParametricSelfExternalEvidenceRunner(identity)
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    envelope = await runner.run(
         scratch_dir=tmp_path / "fresh-drill",
         trusted_scratch_root=tmp_path,
         run_nonce=run_nonce,
@@ -383,8 +403,9 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
 
     unknown_factory, _ = _dual_feature_factory(tmp_path / "unknown")
 
-    unknown_envelope = await ParametricSelfExternalEvidenceRunner(identity).run(
-        unknown_factory,
+    unknown_runner = ParametricSelfExternalEvidenceRunner(identity)
+    _install_test_feature_builder(monkeypatch, unknown_runner, unknown_factory)
+    unknown_envelope = await unknown_runner.run(
         scratch_dir=tmp_path / "unknown-drill",
         trusted_scratch_root=tmp_path,
         run_nonce="f" * 64,
@@ -416,7 +437,7 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert str(tmp_path) not in rendered
 
 
-async def test_kite_sqlite_backend_opens_real_storage_and_physically_erases(tmp_path):
+async def test_kite_sqlite_backend_opens_real_storage_and_physically_erases(tmp_path, monkeypatch):
     """Exercise the runner-owned SQLite authority without a storage double."""
     from kestrel_sovereign.knowledge import InferenceProfile
     from kestrel_sovereign.privacy import PrivacyMode
@@ -497,9 +518,9 @@ async def test_kite_sqlite_backend_opens_real_storage_and_physically_erases(tmp_
         feature._governed_corpus_policy = policy
         return feature
 
-    observation = await ParametricSelfExternalEvidenceRunner(_identity())._run_backend(
-        factory, backend, run_nonce="c" * 64
-    )
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    observation = await runner._run_backend(backend, run_nonce="c" * 64)
 
     assert observation.observation == {"erased_count": 1, "remaining_count": 0}
     assert physical_erasure["canonical_row"] is None
@@ -509,20 +530,50 @@ async def test_kite_sqlite_backend_opens_real_storage_and_physically_erases(tmp_
     assert backend._closed
     assert state_path is not None and not state_path.exists()
     assert not backend.scratch_dir.exists()
+    # AsyncStorage's destructive-audit sidecar and SQLite WAL/SHM files must
+    # stay beneath the exact owned state directory and leave no trusted-root
+    # residue after the runner-owned close.
+    assert list(trusted_root.iterdir()) == []
+
+
+async def test_kite_sqlite_cleanup_retries_the_exact_owned_directory(tmp_path, monkeypatch):
+    trusted_root = tmp_path / "trusted-retry"
+    trusted_root.mkdir(mode=0o700)
+    backend = KiteErasureBackend("sqlite", trusted_root, trusted_root / "unused-drill")
+    await backend.open_storage()
+    state_dir = backend._sqlite_state_path.parent
+    original_cleanup = release_evidence_module._cleanup_private_scratch_tree
+    attempts = 0
+
+    def fail_once(path, identities) -> None:
+        nonlocal attempts
+        if Path(path) == state_dir and attempts == 0:
+            attempts += 1
+            raise ExternalReleaseEvidenceError("simulated owned-directory cleanup failure")
+        original_cleanup(path, identities)
+
+    monkeypatch.setattr(release_evidence_module, "_cleanup_private_scratch_tree", fail_once)
+    with pytest.raises(release_evidence_module._ExternalCleanupFailure):
+        await backend.close()
+    assert state_dir.exists()
+
+    await backend.close()
+    assert attempts == 1
+    assert list(trusted_root.iterdir()) == []
 
 
 async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_delta(tmp_path, monkeypatch):
     factory, storages = _dual_feature_factory(tmp_path)
     runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, factory)
 
     async def no_op_erase(*_args) -> None:
         return None
 
     monkeypatch.setattr(runner, "_erase_snapshot_assertion", no_op_erase)
 
-    with pytest.raises(ExternalReleaseEvidenceError, match="did not invalidate"):
+    with pytest.raises(ExternalReleaseEvidenceError, match="did not remove"):
         await runner.run(
-            factory,
             scratch_dir=tmp_path / "fresh-drill",
             trusted_scratch_root=tmp_path,
             run_nonce="a" * 64,
@@ -535,7 +586,219 @@ async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_
     assert _FakeDisposablePostgres.created[-1].closed
 
 
-async def test_external_evidence_refuses_a_skipped_or_failing_backend_and_cleans_up(tmp_path):
+async def test_cancellation_during_prepare_cleans_plaintext_and_preserves_cancellation(
+    tmp_path, monkeypatch
+):
+    base_factory, storages = _dual_feature_factory(tmp_path)
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    sealed = False
+
+    async def cancelled_prepare(backend: KiteErasureBackend):
+        feature = await base_factory(backend)
+
+        async def cancel_snapshot(**_kwargs):
+            raise asyncio.CancelledError()
+
+        feature._request_governed_snapshot = cancel_snapshot
+        return feature
+
+    def refuse_if_sealed(*_args, **_kwargs):
+        nonlocal sealed
+        sealed = True
+        raise AssertionError("cancellation must not sign evidence")
+
+    _install_test_feature_builder(monkeypatch, runner, cancelled_prepare)
+    monkeypatch.setattr(runner, "_seal_envelope", refuse_if_sealed)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(
+            scratch_dir=tmp_path / "cancel-prepare",
+            trusted_scratch_root=tmp_path,
+            run_nonce="a" * 64,
+        )
+
+    assert storages["sqlite"].closed
+    assert not (tmp_path / "cancel-prepare-sqlite").exists()
+    assert _FakeDisposablePostgres.created[-1].closed
+    assert not sealed
+
+
+async def test_cancellation_between_prepare_and_observe_cleans_and_preserves_cancellation(
+    tmp_path, monkeypatch
+):
+    factory, storages = _dual_feature_factory(tmp_path)
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+
+    async def cancel_erase(*_args) -> None:
+        raise asyncio.CancelledError()
+
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    monkeypatch.setattr(runner, "_erase_snapshot_assertion", cancel_erase)
+    monkeypatch.setattr(
+        runner, "_seal_envelope", lambda *_args, **_kwargs: pytest.fail("must not sign")
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(
+            scratch_dir=tmp_path / "cancel-erase",
+            trusted_scratch_root=tmp_path,
+            run_nonce="b" * 64,
+        )
+
+    assert storages["sqlite"].closed
+    assert not (tmp_path / "cancel-erase-sqlite").exists()
+    assert _FakeDisposablePostgres.created[-1].closed
+
+
+async def test_cancellation_during_observe_cleans_and_preserves_cancellation(
+    tmp_path, monkeypatch
+):
+    base_factory, storages = _dual_feature_factory(tmp_path)
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+
+    async def cancelled_observe(backend: KiteErasureBackend):
+        feature = await base_factory(backend)
+        original_verify = feature._verify_adapter_lineage
+
+        async def verify(candidate_path, **kwargs):
+            if not kwargs.get("before_promotion", False):
+                raise asyncio.CancelledError()
+            return await original_verify(candidate_path, **kwargs)
+
+        feature._verify_adapter_lineage = verify
+        return feature
+
+    _install_test_feature_builder(monkeypatch, runner, cancelled_observe)
+    monkeypatch.setattr(
+        runner, "_seal_envelope", lambda *_args, **_kwargs: pytest.fail("must not sign")
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(
+            scratch_dir=tmp_path / "cancel-observe",
+            trusted_scratch_root=tmp_path,
+            run_nonce="c" * 64,
+        )
+
+    assert storages["sqlite"].closed
+    assert not (tmp_path / "cancel-observe-sqlite").exists()
+    assert _FakeDisposablePostgres.created[-1].closed
+
+
+async def test_storage_close_cancellation_still_removes_owned_sqlite_residue(tmp_path):
+    trusted_root = tmp_path / "trusted-cancel-close"
+    trusted_root.mkdir(mode=0o700)
+    backend = KiteErasureBackend("sqlite", trusted_root, trusted_root / "unused-drill")
+    storage = await backend.open_storage()
+    original_close = storage.close
+
+    async def cancel_close() -> None:
+        raise asyncio.CancelledError()
+
+    storage.close = cancel_close
+    with pytest.raises(asyncio.CancelledError):
+        await backend.close()
+
+    assert list(trusted_root.iterdir()) == []
+    await original_close()
+
+
+async def test_cancellation_and_cleanup_failure_are_aggregated_without_signing(
+    tmp_path, monkeypatch
+):
+    factory, _ = _dual_feature_factory(tmp_path)
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    original_close = KiteErasureBackend.close
+    sealed = False
+
+    async def cancel_erase(*_args) -> None:
+        raise asyncio.CancelledError()
+
+    async def fail_close(backend: KiteErasureBackend) -> None:
+        await original_close(backend)
+        if backend.backend == "sqlite":
+            raise ExternalReleaseEvidenceError("simulated cleanup failure")
+
+    def refuse_if_sealed(*_args, **_kwargs):
+        nonlocal sealed
+        sealed = True
+        raise AssertionError("cancellation must not sign evidence")
+
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    monkeypatch.setattr(runner, "_erase_snapshot_assertion", cancel_erase)
+    monkeypatch.setattr(KiteErasureBackend, "close", fail_close)
+    monkeypatch.setattr(runner, "_seal_envelope", refuse_if_sealed)
+    with pytest.raises(BaseExceptionGroup) as failed:
+        await runner.run(
+            scratch_dir=tmp_path / "cancel-combined",
+            trusted_scratch_root=tmp_path,
+            run_nonce="d" * 64,
+        )
+
+    def flatten(error):
+        if isinstance(error, BaseExceptionGroup):
+            return [item for child in error.exceptions for item in flatten(child)]
+        return [error]
+
+    assert any(isinstance(error, asyncio.CancelledError) for error in flatten(failed.value))
+    assert any(
+        isinstance(error, release_evidence_module._ExternalCleanupFailure)
+        for error in flatten(failed.value)
+    )
+    assert not sealed
+
+
+@pytest.mark.parametrize("interrupt", (KeyboardInterrupt, SystemExit))
+async def test_interrupts_rethrow_unchanged_after_cleanup(tmp_path, monkeypatch, interrupt):
+    factory, storages = _dual_feature_factory(tmp_path)
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+
+    async def interrupt_erase(*_args) -> None:
+        raise interrupt()
+
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    monkeypatch.setattr(runner, "_erase_snapshot_assertion", interrupt_erase)
+    monkeypatch.setattr(
+        runner, "_seal_envelope", lambda *_args, **_kwargs: pytest.fail("must not sign")
+    )
+    with pytest.raises(interrupt):
+        await runner.run(
+            scratch_dir=tmp_path / f"interrupt-{interrupt.__name__}",
+            trusted_scratch_root=tmp_path,
+            run_nonce="e" * 64,
+        )
+
+    assert storages["sqlite"].closed
+    assert _FakeDisposablePostgres.created[-1].closed
+    assert not (tmp_path / f"interrupt-{interrupt.__name__}-sqlite").exists()
+
+
+@pytest.mark.parametrize("interrupt", (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
+def test_cleanup_aggregation_keeps_base_exception_leaves_at_top_level(interrupt):
+    execution = RuntimeError("execution failure")
+    interrupted_cleanup = interrupt()
+    ordinary_cleanup_one = OSError("ordinary cleanup one")
+    ordinary_cleanup_two = ValueError("ordinary cleanup two")
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        release_evidence_module._raise_execution_or_cleanup_failure(
+            execution,
+            [
+                interrupted_cleanup,
+                ordinary_cleanup_one,
+                ordinary_cleanup_two,
+            ],
+        )
+
+    group = raised.value
+    assert not isinstance(group, Exception)
+    assert group.exceptions[0] is execution
+    assert group.exceptions[1] is interrupted_cleanup
+    assert isinstance(group.exceptions[2], release_evidence_module._ExternalCleanupFailure)
+    assert group.exceptions[2].failures == (
+        ordinary_cleanup_one,
+        ordinary_cleanup_two,
+    )
+
+
+async def test_external_evidence_refuses_a_skipped_or_failing_backend_and_cleans_up(tmp_path, monkeypatch):
     base_factory, storages = _dual_feature_factory(tmp_path)
 
     async def failing_postgres(backend: KiteErasureBackend):
@@ -543,9 +806,10 @@ async def test_external_evidence_refuses_a_skipped_or_failing_backend_and_cleans
             raise RuntimeError("backend failed")
         return await base_factory(backend)
 
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, failing_postgres)
     with pytest.raises(RuntimeError, match="backend failed"):
-        await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            failing_postgres,
+        await runner.run(
             scratch_dir=tmp_path / "failing-drill",
             trusted_scratch_root=tmp_path,
             run_nonce="e" * 64,
@@ -555,7 +819,7 @@ async def test_external_evidence_refuses_a_skipped_or_failing_backend_and_cleans
     assert _FakeDisposablePostgres.created[-1].closed
 
 
-async def test_external_evidence_attempts_postgres_cleanup_after_sqlite_cleanup_failure(
+async def test_external_evidence_aggregates_all_backend_cleanup_failures(
     tmp_path, monkeypatch
 ):
     """One backend's cleanup failure must not skip the other backend's close."""
@@ -565,27 +829,26 @@ async def test_external_evidence_attempts_postgres_cleanup_after_sqlite_cleanup_
     async def bypass_drill(*_args, **_kwargs) -> object:
         return object()
 
-    async def failing_sqlite_close(backend: KiteErasureBackend) -> None:
+    async def failing_backend_close(backend: KiteErasureBackend) -> None:
         closed.append(backend.backend)
-        if backend.backend == "sqlite":
-            raise ExternalReleaseEvidenceError("simulated SQLite cleanup failure")
+        raise ExternalReleaseEvidenceError(f"simulated {backend.backend} cleanup failure")
 
     monkeypatch.setattr(runner, "_run_backend", bypass_drill)
-    monkeypatch.setattr(KiteErasureBackend, "close", failing_sqlite_close)
+    monkeypatch.setattr(KiteErasureBackend, "close", failing_backend_close)
 
-    with pytest.raises(ExternalReleaseEvidenceError, match="simulated SQLite"):
+    with pytest.raises(release_evidence_module._ExternalCleanupFailure) as refused:
         await runner.run(
-            _dual_feature_factory(tmp_path)[0],
             scratch_dir=tmp_path / "cleanup-order-drill",
             trusted_scratch_root=tmp_path,
             run_nonce="0" * 64,
         )
 
     assert closed == ["sqlite", "postgres"]
+    assert len(refused.value.failures) == 2
     assert _FakeDisposablePostgres.created[-1].closed
 
 
-async def test_external_evidence_rejects_backend_substitution(tmp_path):
+async def test_external_evidence_rejects_backend_substitution(tmp_path, monkeypatch):
     base_factory, _ = _dual_feature_factory(tmp_path)
 
     async def substituted(backend: KiteErasureBackend):
@@ -594,9 +857,10 @@ async def test_external_evidence_rejects_backend_substitution(tmp_path):
             feature.agent.storage.backend_type = "sqlite"
         return feature
 
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, substituted)
     with pytest.raises(ExternalReleaseEvidenceError, match="backend does not match"):
-        await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            substituted,
+        await runner.run(
             scratch_dir=tmp_path / "substituted-drill",
             trusted_scratch_root=tmp_path,
             run_nonce="f" * 64,
@@ -604,25 +868,7 @@ async def test_external_evidence_rejects_backend_substitution(tmp_path):
     assert _FakeDisposablePostgres.created[-1].closed
 
 
-async def test_external_evidence_rejects_unrelated_erase_and_still_active_serving(
-    tmp_path, monkeypatch
-):
-    factory, _ = _dual_feature_factory(tmp_path)
-    runner = ParametricSelfExternalEvidenceRunner(_identity())
-
-    async def erase_unrelated(*_args) -> None:
-        # It supplies no state claim and does not erase the prepared assertion.
-        return None
-
-    monkeypatch.setattr(runner, "_erase_snapshot_assertion", erase_unrelated)
-    with pytest.raises(ExternalReleaseEvidenceError, match="did not invalidate"):
-        await runner.run(
-            factory,
-            scratch_dir=tmp_path / "unrelated-drill",
-            trusted_scratch_root=tmp_path,
-            run_nonce="9" * 64,
-        )
-
+async def test_external_evidence_rejects_still_active_serving(tmp_path, monkeypatch):
     base_factory, _ = _dual_feature_factory(tmp_path / "active")
 
     async def still_serving(backend: KiteErasureBackend):
@@ -638,19 +884,89 @@ async def test_external_evidence_rejects_unrelated_erase_and_still_active_servin
         feature._verify_adapter_lineage = verify
         return feature
 
+    active_runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, active_runner, still_serving)
     with pytest.raises(ExternalReleaseEvidenceError, match="did not reject served"):
-        await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            still_serving,
+        await active_runner.run(
             scratch_dir=tmp_path / "active-drill",
             trusted_scratch_root=tmp_path,
             run_nonce="8" * 64,
         )
 
 
-async def test_external_evidence_rejects_mixed_nonce_revision_and_artifact(tmp_path):
+async def test_external_evidence_rejects_actual_erasure_of_a_second_assertion(
+    tmp_path, monkeypatch
+):
+    """A real tombstone for a decoy assertion cannot stand in for the target."""
+    from kestrel_sovereign.knowledge.assertion import DirectLineage, Literal, SourceOccurrence
+
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir(mode=0o700)
+    backend = KiteErasureBackend("sqlite", trusted_root, trusted_root / "second-assertion")
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    original_builder = runner._build_isolated_feature
+    erased: dict[str, object] = {}
+
+    async def two_assertion_builder(owned_backend: KiteErasureBackend):
+        feature = await original_builder(owned_backend)
+        raw = feature.agent.storage
+        primary = (await raw.assertion_inference_inputs())[0]
+        source = SourceOccurrence(
+            "release-evidence-decoy-source",
+            "agent_tool_invocation",
+            "release-evidence-decoy",
+            datetime(2026, 8, 1, tzinfo=UTC),
+        )
+        decoy = replace(
+            primary,
+            object=Literal("release-evidence-decoy"),
+            revision_id="release-evidence-decoy-revision",
+            asserted_at=datetime(2026, 8, 1, tzinfo=UTC),
+            lineage=DirectLineage((source.source_occurrence_id,)),
+            assertion_id=None,
+        )
+        result = await raw.put_assertion(
+            decoy,
+            source_occurrences=(source,),
+            operation_id="release-evidence-decoy-operation",
+        )
+        assert result.accepted
+        await raw.run_semantic_maintenance(feature.agent.semantic_inference_profile)
+        return feature
+
+    async def erase_only_decoy(feature, snapshot, run_nonce) -> None:
+        target_id = snapshot.examples[0].assertion.assertion_id
+        inputs = await feature.agent.storage.assertion_inference_inputs()
+        decoy = next(item for item in inputs if item.assertion_id != target_id)
+        await feature.agent.storage.erase_assertion(
+            decoy.assertion_id,
+            operation_id=f"parametric-self-release-erasure:{run_nonce}",
+        )
+        erased["decoy_id"] = decoy.assertion_id
+        erased["target_id"] = target_id
+        erased["decoy_missing"] = await feature.agent.storage.get_assertion(
+            decoy.assertion_id, include_inactive=True
+        )
+        erased["tombstone_count"] = await feature.agent.storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertion_erased_operation_tombstones"
+        )
+
+    _install_test_feature_builder(monkeypatch, runner, two_assertion_builder)
+    monkeypatch.setattr(runner, "_erase_snapshot_assertion", erase_only_decoy)
+    with pytest.raises(ExternalReleaseEvidenceError, match="did not remove"):
+        await runner._run_backend(backend, run_nonce="9" * 64)
+
+    assert erased["decoy_id"] != erased["target_id"]
+    assert erased["decoy_missing"] is None
+    assert erased["tombstone_count"] == 1
+    assert list(trusted_root.iterdir()) == []
+
+
+async def test_external_evidence_rejects_mixed_nonce_revision_and_artifact(tmp_path, monkeypatch):
     factory, _ = _dual_feature_factory(tmp_path)
-    envelope = await ParametricSelfExternalEvidenceRunner(_identity()).run(
-        factory,
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    envelope = await runner.run(
         scratch_dir=tmp_path / "mixed-drill",
         trusted_scratch_root=tmp_path,
         run_nonce="7" * 64,
@@ -744,18 +1060,18 @@ async def test_kite_hook_retains_original_consumer_identity_after_substitution_a
     assert all(request["artifact_id"] for request in registrations)
 
 
-async def test_external_evidence_cli_requires_a_kite_factory_and_runs_two_phases(tmp_path, monkeypatch):
+async def test_external_evidence_cli_owns_feature_construction_and_runs_two_phases(tmp_path, monkeypatch):
     factory, storages = _dual_feature_factory(tmp_path)
-    module_name = "kestrel_feature_parametric_self._test_kite_factory"
-    module = types.ModuleType(module_name)
-    module.make_feature = factory
-    monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.setattr(
+        ParametricSelfExternalEvidenceRunner,
+        "_build_isolated_feature",
+        lambda _runner, backend: factory(backend),
+    )
     key_file = tmp_path / "external-ci.key"
     key_file.write_text("08" * 32, encoding="ascii")
     key_file.chmod(0o600)
     output = tmp_path / "external-evidence.json"
     args = Namespace(
-        feature_factory=f"{module_name}:make_feature",
         signing_key_file=key_file,
         issuer_id="parametric_self_ci",
         key_id="release_evidence_key",
@@ -774,6 +1090,58 @@ async def test_external_evidence_cli_requires_a_kite_factory_and_runs_two_phases
     assert json.loads(output.read_text())["run_nonce"] == envelope.run_nonce
 
 
+def test_cli_rejects_caller_selected_executable_factory_surface() -> None:
+    parser = release_evidence_module._build_cli_parser()
+    assert "feature_factory" not in {action.dest for action in parser._actions}
+    with pytest.raises(SystemExit, match="2"):
+        parser.parse_args(["--feature-factory", "attacker.module:erase_everything"])
+
+
+def test_runner_exposes_no_callback_or_dsn_mutation_surface() -> None:
+    import inspect
+
+    run_parameters = inspect.signature(ParametricSelfExternalEvidenceRunner.run).parameters
+    assert set(run_parameters) == {
+        "self", "scratch_dir", "trusted_scratch_root", "run_nonce"
+    }
+    assert "_load_kite_feature_factory" not in vars(release_evidence_module)
+    assert set(inspect.signature(KiteErasureBackend.open_storage).parameters) == {"self"}
+
+
+async def test_atomic_publication_unlinks_post_link_fsync_failure_and_allows_retry(
+    tmp_path, monkeypatch
+):
+    factory, _ = _dual_feature_factory(tmp_path)
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    envelope = await runner.run(
+        scratch_dir=tmp_path / "atomic-drill",
+        trusted_scratch_root=tmp_path,
+        run_nonce="3" * 64,
+    )
+    output = tmp_path / "atomic-evidence.json"
+    parent_identity = (output.parent.stat().st_dev, output.parent.stat().st_ino)
+    original_fsync = os.fsync
+
+    def fail_only_parent_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == parent_identity:
+            raise OSError("simulated post-link directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_only_parent_fsync)
+    with pytest.raises(ExternalReleaseEvidenceError, match="could not be published"):
+        release_evidence_module._write_cli_envelope_atomic(
+            envelope, output, parent_identity
+        )
+    assert not output.exists()
+    assert not list(tmp_path.glob(".atomic-evidence.json.tmp-*"))
+
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    release_evidence_module._write_cli_envelope_atomic(envelope, output, parent_identity)
+    assert output.exists()
+
+
 @pytest.mark.parametrize(
     "failure", ("core_workload", "factory_setup", "factory_forged_refusal")
 )
@@ -785,8 +1153,6 @@ async def test_cli_redacts_infrastructure_and_factory_setup_failures(
         CatalogWorkloadUnavailable,
     )
 
-    module_name = f"kestrel_feature_parametric_self._test_cli_redaction_{failure}"
-    module = types.ModuleType(module_name)
     secret = "postgresql://release-user:secret@private.invalid/release /private/state.db"
 
     async def unsafe_factory(_backend: KiteErasureBackend) -> ParametricSelfFeature:
@@ -794,8 +1160,11 @@ async def test_cli_redacts_infrastructure_and_factory_setup_failures(
             raise ExternalReleaseEvidenceError(secret)
         raise RuntimeError(secret)
 
-    module.make_feature = unsafe_factory
-    monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.setattr(
+        ParametricSelfExternalEvidenceRunner,
+        "_build_isolated_feature",
+        lambda _runner, backend: unsafe_factory(backend),
+    )
     if failure == "core_workload":
 
         class UnavailableCoreWorkload:
@@ -812,7 +1181,6 @@ async def test_cli_redacts_infrastructure_and_factory_setup_failures(
     key_file.chmod(0o600)
     output = tmp_path / "external-evidence.json"
     args = Namespace(
-        feature_factory=f"{module_name}:make_feature",
         signing_key_file=key_file,
         issuer_id="parametric_self_ci",
         key_id="release_evidence_key",
@@ -832,6 +1200,53 @@ async def test_cli_redacts_infrastructure_and_factory_setup_failures(
     assert not (tmp_path / "redaction-drill").exists()
 
 
+@pytest.mark.parametrize("interrupt", (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
+async def test_cli_redacts_ordinary_group_leaves_while_preserving_interrupts(
+    tmp_path, monkeypatch, interrupt
+):
+    secret = "postgresql://release-user:secret@private.invalid/release /private/state.db"
+    interrupt_leaf = interrupt()
+    raw_execution = RuntimeError(secret)
+    raw_cleanup = OSError(secret)
+
+    async def mixed_failure(_runner, **_kwargs):
+        nested_ordinary_failures = ExceptionGroup(
+            "raw nested details",
+            [raw_execution, release_evidence_module._ExternalCleanupFailure([raw_cleanup])],
+        )
+        raise BaseExceptionGroup(
+            "raw mixed details", [nested_ordinary_failures, interrupt_leaf]
+        )
+
+    monkeypatch.setattr(ParametricSelfExternalEvidenceRunner, "run", mixed_failure)
+    key_file = tmp_path / "external-ci.key"
+    key_file.write_text("08" * 32, encoding="ascii")
+    key_file.chmod(0o600)
+    output = tmp_path / "external-evidence.json"
+    args = Namespace(
+        signing_key_file=key_file,
+        issuer_id="parametric_self_ci",
+        key_id="release_evidence_key",
+        run_nonce="d" * 64,
+        scratch_dir=tmp_path / "redaction-drill",
+        trusted_scratch_root=tmp_path,
+        output=output,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as escaped:
+        await release_evidence_module._run_cli(args)
+
+    group = escaped.value
+    assert not isinstance(group, Exception)
+    assert group.exceptions[0] is interrupt_leaf
+    assert isinstance(group.exceptions[1], ExternalReleaseEvidenceError)
+    assert str(group.exceptions[1]) == "external evidence execution is unavailable"
+    rendered = "".join(traceback.format_exception(group))
+    assert secret not in rendered
+    assert str(tmp_path) not in rendered
+    assert not output.exists()
+
+
 @pytest.mark.parametrize(
     "output_case",
     ("relative", "existing", "existing_non_private", "missing_parent", "non_private_parent"),
@@ -840,10 +1255,11 @@ async def test_cli_rejects_unsafe_output_before_physical_erasure(
     tmp_path, monkeypatch, output_case
 ):
     factory, storages = _dual_feature_factory(tmp_path)
-    module_name = "kestrel_feature_parametric_self._test_unsafe_output_factory"
-    module = types.ModuleType(module_name)
-    module.make_feature = factory
-    monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.setattr(
+        ParametricSelfExternalEvidenceRunner,
+        "_build_isolated_feature",
+        lambda _runner, backend: factory(backend),
+    )
     private_parent = tmp_path / "private-output"
     private_parent.mkdir(mode=0o700)
     if output_case == "relative":
@@ -860,7 +1276,6 @@ async def test_cli_rejects_unsafe_output_before_physical_erasure(
         output = non_private_parent / "evidence.json"
 
     args = Namespace(
-        feature_factory=f"{module_name}:make_feature",
         signing_key_file=tmp_path / "unused.key",
         issuer_id="parametric_self_ci",
         key_id="release_evidence_key",
@@ -877,7 +1292,7 @@ async def test_cli_rejects_unsafe_output_before_physical_erasure(
     assert not (tmp_path / "must-not-exist").exists()
 
 
-async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live(tmp_path):
+async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live(tmp_path, monkeypatch):
     base_factory, _ = _dual_feature_factory(tmp_path)
     trusted_root = tmp_path / "trusted-scratch"
     trusted_root.mkdir(mode=0o700)
@@ -905,8 +1320,9 @@ async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live
         storage.erase_assertion = erase
         return feature
 
-    await ParametricSelfExternalEvidenceRunner(_identity()).run(
-        factory,
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    await runner.run(
         scratch_dir=scratch_dir,
         trusted_scratch_root=trusted_root,
         run_nonce="b" * 64,
@@ -916,7 +1332,6 @@ async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live
 
 
 async def test_external_evidence_refuses_unsafe_or_reused_scratch_paths(tmp_path):
-    factory, _ = _dual_feature_factory(tmp_path)
     trusted_root = tmp_path / "trusted-scratch"
     trusted_root.mkdir(mode=0o700)
     unsafe_root = tmp_path / "unsafe-scratch"
@@ -924,14 +1339,12 @@ async def test_external_evidence_refuses_unsafe_or_reused_scratch_paths(tmp_path
 
     with pytest.raises(ExternalReleaseEvidenceError, match="not private"):
         await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            factory,
             scratch_dir=unsafe_root / "drill",
             trusted_scratch_root=unsafe_root,
             run_nonce="c" * 64,
         )
     with pytest.raises(ExternalReleaseEvidenceError, match="directly inside"):
         await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            factory,
             scratch_dir=trusted_root / "nested" / "drill",
             trusted_scratch_root=trusted_root,
             run_nonce="c" * 64,
@@ -940,7 +1353,6 @@ async def test_external_evidence_refuses_unsafe_or_reused_scratch_paths(tmp_path
     linked.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(ExternalReleaseEvidenceError, match="directly inside"):
         await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            factory,
             scratch_dir=linked / "drill",
             trusted_scratch_root=trusted_root,
             run_nonce="c" * 64,
@@ -949,7 +1361,6 @@ async def test_external_evidence_refuses_unsafe_or_reused_scratch_paths(tmp_path
     existing.mkdir(mode=0o700)
     with pytest.raises(ExternalReleaseEvidenceError, match="must be fresh"):
         await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            factory,
             scratch_dir=trusted_root / "existing",
             trusted_scratch_root=trusted_root,
             run_nonce="c" * 64,
@@ -969,15 +1380,30 @@ async def test_external_evidence_detects_scratch_tree_replacement_race(tmp_path,
         return result
 
     monkeypatch.setattr(release_evidence_module, "build_corpus", replace_corpus)
-    with pytest.raises(ExternalReleaseEvidenceError, match="changed during execution"):
-        await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            factory,
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    _install_test_feature_builder(monkeypatch, runner, factory)
+    sealed = False
+
+    def refuse_if_sealed(*_args, **_kwargs):
+        nonlocal sealed
+        sealed = True
+        raise AssertionError("a replaced scratch tree must never be signed")
+
+    monkeypatch.setattr(runner, "_seal_envelope", refuse_if_sealed)
+    with pytest.raises(ExceptionGroup) as refused:
+        await runner.run(
             scratch_dir=scratch_dir,
             trusted_scratch_root=tmp_path,
             run_nonce="d" * 64,
         )
+    assert any(
+        isinstance(error, ExternalReleaseEvidenceError)
+        and "changed during execution" in str(error)
+        for error in refused.value.exceptions
+    )
     # The cleanup guard refuses to delete a path whose identity changed.
     assert (tmp_path / "race-drill-sqlite").exists()
+    assert not sealed
 
 
 async def test_external_evidence_refuses_non_external_signer(tmp_path):
@@ -990,7 +1416,7 @@ async def test_external_evidence_refuses_non_external_signer(tmp_path):
         ParametricSelfExternalEvidenceRunner(wrong_identity)
 
 
-async def test_external_evidence_binds_unique_freshness_to_every_signed_record(tmp_path):
+async def test_external_evidence_binds_unique_freshness_to_every_signed_record(tmp_path, monkeypatch):
     first_factory, _ = _dual_feature_factory(tmp_path / "one")
     second_factory, _ = _dual_feature_factory(tmp_path / "two")
     runner = ParametricSelfExternalEvidenceRunner(_identity())
@@ -998,14 +1424,14 @@ async def test_external_evidence_binds_unique_freshness_to_every_signed_record(t
     ledger = ExternalFreshnessLedger(
         tmp_path / "freshness-ledger.sqlite", trusted_root=tmp_path
     )
+    _install_test_feature_builder(monkeypatch, runner, first_factory)
     left = await runner.run(
-        first_factory,
         scratch_dir=tmp_path / "drill-one",
         trusted_scratch_root=tmp_path,
         run_nonce=ledger.issue_challenge(),
     )
+    _install_test_feature_builder(monkeypatch, runner, second_factory)
     right = await runner.run(
-        second_factory,
         scratch_dir=tmp_path / "drill-two",
         trusted_scratch_root=tmp_path,
         run_nonce=ledger.issue_challenge(),
@@ -1015,6 +1441,54 @@ async def test_external_evidence_binds_unique_freshness_to_every_signed_record(t
     assert {record.artifact.artifact_digest for record in left.records}.isdisjoint(
         {record.artifact.artifact_digest for record in right.records}
     )
+
+
+@pytest.mark.skipif(
+    not (
+        os.environ.get("KESTREL_SEMANTIC_RELEASE_ISOLATED") == "1"
+        and os.environ.get("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN")
+    ),
+    reason=(
+        "requires a disposable PostgreSQL authority: "
+        "KESTREL_SEMANTIC_RELEASE_ISOLATED=1 "
+        "KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN=postgresql://..."
+    ),
+)
+async def test_real_disposable_postgres_dual_backend_removes_database_and_sqlite_residue(
+    tmp_path, monkeypatch
+):
+    """Opt-in live gate: core must drop its DB and no SQLite-owned file remains."""
+    from kestrel_sovereign.knowledge.release_evidence_postgres import (
+        DisposablePostgresDatabase as CoreDisposablePostgresDatabase,
+    )
+
+    observed: dict[str, object] = {}
+    original_close = CoreDisposablePostgresDatabase.close
+
+    async def tracked_close(database) -> None:
+        observed["database_name"] = database.database_name
+        await original_close(database)
+        observed["closed"] = database._closed
+
+    monkeypatch.setattr(
+        release_evidence_module,
+        "DisposablePostgresDatabase",
+        CoreDisposablePostgresDatabase,
+    )
+    monkeypatch.setattr(CoreDisposablePostgresDatabase, "close", tracked_close)
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir(mode=0o700)
+
+    envelope = await ParametricSelfExternalEvidenceRunner(_identity()).run(
+        scratch_dir=trusted_root / "live-dual-drill",
+        trusted_scratch_root=trusted_root,
+        run_nonce="1" * 64,
+    )
+
+    assert all(record.passed for record in envelope.records)
+    assert observed["database_name"]
+    assert observed["closed"] is True
+    assert list(trusted_root.iterdir()) == []
 
 
 def test_external_evidence_uses_the_immutable_core_contract_digest() -> None:
