@@ -416,7 +416,14 @@ class ParametricSelfKiteErasureHook:
         )
         candidate_path: str | None = None
         try:
-            snapshot, problem = await feature._request_governed_snapshot()
+            snapshot, problem = await feature._request_governed_snapshot(
+                artifact_consumer={
+                    "consumer_id": self._runner._identity.issuer_id,
+                    "consumer_key_id": self._runner._identity.key_id,
+                    "consumer_public_key": self._runner._identity.public_key,
+                    "retention_seconds": 300.0,
+                }
+            )
             if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
                 raise ExternalReleaseEvidenceError(
                     "core governed corpus snapshot is unavailable or invalid"
