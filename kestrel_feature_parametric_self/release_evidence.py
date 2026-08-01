@@ -17,7 +17,6 @@ import hashlib
 import inspect
 import json
 import shutil
-import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,8 +130,11 @@ class ExternalReleaseEvidenceEnvelope:
                 record.state is not EvidenceState.PASSED
                 or record.execution_attestation is None
                 or record.execution_attestation.source is not ExecutionSource.EXTERNAL_CI
+                or record.external_run_nonce != self.run_nonce
             ):
-                raise ExternalReleaseEvidenceError("external evidence records must be externally signed passes")
+                raise ExternalReleaseEvidenceError(
+                    "external evidence records must be externally signed passes bound to the verifier nonce"
+                )
         if (
             self.report.capability_id != _CAPABILITY_ID
             or self.report.repository != self.repository
@@ -202,17 +204,25 @@ class ParametricSelfExternalEvidenceRunner:
         feature: "ParametricSelfFeature",
         *,
         scratch_dir: Path,
+        run_nonce: str,
         erase: ErasureAction | None = None,
     ) -> ExternalReleaseEvidenceEnvelope:
         """Run one fresh, correlated drill and return its signed envelope.
 
-        The caller is responsible for supplying an isolated Kite/test agent and
-        an erasure action scoped to the governed assertion created for this
-        drill.  A no-op, unrelated deletion, stale snapshot, untracked
-        candidate, or still-served adapter all fail closed.
+        The caller is responsible for supplying an isolated Kite/test agent,
+        a verifier-issued one-time nonce, and an erasure action scoped to the
+        governed assertion created for this drill.  A no-op, unrelated
+        deletion, stale snapshot, untracked candidate, or still-served adapter
+        all fail closed.
         """
         if erase is not None and not callable(erase):
             raise ExternalReleaseEvidenceError("external erasure action must be callable")
+        if (
+            not isinstance(run_nonce, str)
+            or len(run_nonce) != _FRESHNESS_NONCE_BYTES * 2
+            or any(character not in "0123456789abcdef" for character in run_nonce)
+        ):
+            raise ExternalReleaseEvidenceError("external evidence requires a verifier-issued nonce")
         specs = _external_specs()
         scratch_dir = Path(scratch_dir)
         if scratch_dir.exists():
@@ -228,7 +238,6 @@ class ParametricSelfExternalEvidenceRunner:
 
         candidate = scratch_dir / "candidate"
         corpus_dir = scratch_dir / "corpus"
-        run_nonce = secrets.token_hex(_FRESHNESS_NONCE_BYTES)
         try:
             stats = build_corpus(
                 None,
@@ -364,6 +373,7 @@ class ParametricSelfExternalEvidenceRunner:
             observation,
             artifact,
             state=EvidenceState.PASSED,
+            external_run_nonce=run_nonce,
         )
         return EvidenceRecord._from_trusted_execution(
             spec,
@@ -373,6 +383,7 @@ class ParametricSelfExternalEvidenceRunner:
             execution_attestation=self._identity.sign(
                 kind="evidence_record", spec=spec, run_digest=run_digest
             ),
+            external_run_nonce=run_nonce,
         )
 
 

@@ -50,6 +50,7 @@ from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFresh
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
+    ExternalCapabilityReport,
     ReleaseEvidenceError,
     TrustedExecutionPolicy,
 )
@@ -205,12 +206,16 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     storage = _CoreBackedErasureStorage(_snapshot())
     feature = await _feature(storage, tmp_path)
     identity = _identity()
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "verifier-freshness.sqlite", trusted_root=tmp_path
+    )
+    run_nonce = ledger.issue_challenge()
 
     async def erase() -> None:
         storage.erased = True
 
     envelope = await ParametricSelfExternalEvidenceRunner(identity).run(
-        feature, scratch_dir=tmp_path / "fresh-drill", erase=erase
+        feature, scratch_dir=tmp_path / "fresh-drill", run_nonce=run_nonce, erase=erase
     )
 
     assert envelope.core_release_evidence_contract_digest == CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST
@@ -222,14 +227,13 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert {lineage["state"] for lineage in feature._adapter_lineage.values()} == {"invalid"}
     assert not (tmp_path / "fresh-drill").exists()
     assert len(envelope.run_nonce) == 64
+    assert envelope.run_nonce == run_nonce
     assert len(envelope.report.freshness_receipt) == 64
+    assert {record.external_run_nonce for record in envelope.records} == {run_nonce}
 
     policy = TrustedExecutionPolicy((identity.trusted_key(("external_ci",)),))
     evidence = apply_evidence_records(
         release_evidence_template(), envelope.records, trust_policy=policy
-    )
-    ledger = ExternalFreshnessLedger(
-        tmp_path / "verifier-freshness.sqlite", trusted_root=tmp_path
     )
     attached = attach_external_capability_report(
         evidence, envelope.report, freshness_ledger=ledger
@@ -237,6 +241,38 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert attached.external_capabilities == (envelope.report,)
     with pytest.raises(ReleaseEvidenceError, match="already consumed"):
         attach_external_capability_report(evidence, envelope.report, freshness_ledger=ledger)
+
+    rewrap_nonce = ledger.issue_challenge()
+    rewrapped = ExternalCapabilityReport.attest(
+        capability_id=envelope.report.capability_id,
+        repository=envelope.report.repository,
+        source_revision=envelope.report.source_revision,
+        core_release_evidence_contract_digest=envelope.report.core_release_evidence_contract_digest,
+        run_nonce=rewrap_nonce,
+        attestations=envelope.report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="external run_nonce"):
+        attach_external_capability_report(evidence, rewrapped, freshness_ledger=ledger)
+
+    unknown_storage = _CoreBackedErasureStorage(_snapshot())
+    unknown_feature = await _feature(unknown_storage, tmp_path / "unknown")
+
+    async def erase_unknown() -> None:
+        unknown_storage.erased = True
+
+    unknown_envelope = await ParametricSelfExternalEvidenceRunner(identity).run(
+        unknown_feature,
+        scratch_dir=tmp_path / "unknown-drill",
+        run_nonce="f" * 64,
+        erase=erase_unknown,
+    )
+    unknown_evidence = apply_evidence_records(
+        release_evidence_template(), unknown_envelope.records, trust_policy=policy
+    )
+    with pytest.raises(ReleaseEvidenceError, match="not an issued pending"):
+        attach_external_capability_report(
+            unknown_evidence, unknown_envelope.report, freshness_ledger=ledger
+        )
 
     output = tmp_path / "external-evidence.json"
     envelope.write(output)
@@ -257,7 +293,7 @@ async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_
 
     with pytest.raises(ExternalReleaseEvidenceError, match="did not invalidate"):
         await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            feature, scratch_dir=tmp_path / "fresh-drill", erase=no_op_erase
+            feature, scratch_dir=tmp_path / "fresh-drill", run_nonce="a" * 64, erase=no_op_erase
         )
     assert feature._active_adapter_path is not None
     assert not (tmp_path / "fresh-drill").exists()
@@ -289,8 +325,21 @@ async def test_external_evidence_binds_unique_freshness_to_every_signed_record(t
     async def erase_second():
         second_storage.erased = True
 
-    left = await runner.run(first, scratch_dir=tmp_path / "drill-one", erase=erase_first)
-    right = await runner.run(second, scratch_dir=tmp_path / "drill-two", erase=erase_second)
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "freshness-ledger.sqlite", trusted_root=tmp_path
+    )
+    left = await runner.run(
+        first,
+        scratch_dir=tmp_path / "drill-one",
+        run_nonce=ledger.issue_challenge(),
+        erase=erase_first,
+    )
+    right = await runner.run(
+        second,
+        scratch_dir=tmp_path / "drill-two",
+        run_nonce=ledger.issue_challenge(),
+        erase=erase_second,
+    )
     assert left.run_nonce != right.run_nonce
     assert left.report.freshness_receipt != right.report.freshness_receipt
     assert {record.artifact.artifact_digest for record in left.records}.isdisjoint(
@@ -354,8 +403,13 @@ async def test_external_evidence_default_path_uses_real_core_storage_privacy_and
         feature = ParametricSelfFeature(agent=agent)
         await feature.initialize()
         feature._governed_corpus_policy = policy
+        ledger = ExternalFreshnessLedger(
+            tmp_path / "real-verifier-freshness.sqlite", trusted_root=tmp_path
+        )
         envelope = await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            feature, scratch_dir=tmp_path / "fresh-real-drill"
+            feature,
+            scratch_dir=tmp_path / "fresh-real-drill",
+            run_nonce=ledger.issue_challenge(),
         )
         assert all(record.passed for record in envelope.records)
         # Physical erasure removes the canonical row and records only the

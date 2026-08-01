@@ -68,9 +68,11 @@ fixed repository/revision contract.
 
 Before a drill, the runner binds the immutable core external-adapter contract
 digest, which covers the release-evidence schema/contract and ordered gate
-specification digests. Every invocation generates a one-time freshness nonce;
-core derives and consumes the corresponding receipt through its verifier-owned
-ledger. Its complete fresh scratch tree
+specification digests. Before every invocation, the independent verifier
+persists and issues a one-time freshness nonce; the runner accepts that nonce
+as required input and binds it into every signed record and the report. Core
+derives and consumes the corresponding receipt through its verifier-owned
+ledger, rejecting unknown, replayed, or rewrapped nonces. Its complete fresh scratch tree
 — including the candidate manifest and corpus files — is removed on success,
 failure, or cancellation. With no custom erasure coordinator, the runner uses
 core's scoped physical `erase_assertion` path for the exact assertion
@@ -78,6 +80,12 @@ represented in the governed snapshot. This is intentionally not lifecycle
 `delete_assertion`: the canonical assertion row and its derived/index/corpus
 eligibility are physically removed, while core retains only its blinded,
 identity-free erasure audit/tombstone shell for operation replay protection.
+
+During coordinated development, an unpushed core evidence commit is tested
+with `uv run --no-sync` and `PYTHONPATH` pointing at that local core worktree.
+The package's `pyproject.toml` and lockfile remain pinned to the current
+published/reviewed core commit until a new core commit is pushed and can be
+resolved by a clean installer; do not publish an unreachable Git SHA.
 
 ## Incomplete-shutdown recovery
 
