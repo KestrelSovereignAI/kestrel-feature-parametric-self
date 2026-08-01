@@ -27,7 +27,7 @@ from .feature import ParametricSelfFeature
 from .fidelity import FidelityGate, GateDecision, parse_final_val_loss, parse_latest_iter
 from .local_mlx_adapter import LocalMLXAdapter, TrainerUnavailableError, build_lora_argv
 from .release_evidence import (
-    CORE_RELEASE_EVIDENCE_COMMIT,
+    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     ExternalReleaseEvidenceEnvelope,
     ExternalReleaseEvidenceError,
     ParametricSelfExternalEvidenceRunner,
@@ -43,7 +43,7 @@ __all__ = [
     "LocalMLXAdapter",
     "TrainerUnavailableError",
     "build_lora_argv",
-    "CORE_RELEASE_EVIDENCE_COMMIT",
+    "CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST",
     "ExternalReleaseEvidenceEnvelope",
     "ExternalReleaseEvidenceError",
     "ParametricSelfExternalEvidenceRunner",

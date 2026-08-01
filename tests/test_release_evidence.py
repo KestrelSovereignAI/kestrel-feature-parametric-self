@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kestrel_feature_parametric_self import ParametricSelfFeature
 from kestrel_feature_parametric_self.release_evidence import (
-    CORE_RELEASE_EVIDENCE_COMMIT,
+    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     EXTERNAL_GATE_IDS,
     ExternalReleaseEvidenceError,
     ParametricSelfExternalEvidenceRunner,
@@ -46,9 +46,11 @@ from kestrel_sovereign.knowledge.release_evidence import (
     attach_external_capability_report,
     release_evidence_template,
 )
+from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFreshnessLedger
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
+    ReleaseEvidenceError,
     TrustedExecutionPolicy,
 )
 from kestrel_sovereign.knowledge.shacl_validation import (
@@ -211,7 +213,7 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
         feature, scratch_dir=tmp_path / "fresh-drill", erase=erase
     )
 
-    assert envelope.core_release_evidence_commit == CORE_RELEASE_EVIDENCE_COMMIT
+    assert envelope.core_release_evidence_contract_digest == CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST
     assert tuple(record.gate_id for record in envelope.records) == EXTERNAL_GATE_IDS
     assert all(record.passed for record in envelope.records)
     assert all(record.observation == {"erased_count": 1, "remaining_count": 0} for record in envelope.records)
@@ -220,14 +222,19 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert {lineage["state"] for lineage in feature._adapter_lineage.values()} == {"invalid"}
     assert not (tmp_path / "fresh-drill").exists()
     assert len(envelope.run_nonce) == 64
-    assert len(envelope.freshness_receipt) == 64
+    assert len(envelope.report.freshness_receipt) == 64
 
     policy = TrustedExecutionPolicy((identity.trusted_key(("external_ci",)),))
     evidence = apply_evidence_records(
         release_evidence_template(), envelope.records, trust_policy=policy
     )
-    attached = attach_external_capability_report(evidence, envelope.report)
+    ledger = ExternalFreshnessLedger(tmp_path / "verifier-freshness.sqlite")
+    attached = attach_external_capability_report(
+        evidence, envelope.report, freshness_ledger=ledger
+    )
     assert attached.external_capabilities == (envelope.report,)
+    with pytest.raises(ReleaseEvidenceError, match="already consumed"):
+        attach_external_capability_report(evidence, envelope.report, freshness_ledger=ledger)
 
     output = tmp_path / "external-evidence.json"
     envelope.write(output)
@@ -283,28 +290,15 @@ async def test_external_evidence_binds_unique_freshness_to_every_signed_record(t
     left = await runner.run(first, scratch_dir=tmp_path / "drill-one", erase=erase_first)
     right = await runner.run(second, scratch_dir=tmp_path / "drill-two", erase=erase_second)
     assert left.run_nonce != right.run_nonce
-    assert left.freshness_receipt != right.freshness_receipt
+    assert left.report.freshness_receipt != right.report.freshness_receipt
     assert {record.artifact.artifact_digest for record in left.records}.isdisjoint(
         {record.artifact.artifact_digest for record in right.records}
     )
 
 
-async def test_external_evidence_rejects_a_core_install_with_wrong_vcs_revision(tmp_path, monkeypatch):
-    import kestrel_feature_parametric_self.release_evidence as evidence_module
-
-    dist = tmp_path / "wrong-core.dist-info"
-    dist.mkdir()
-    (dist / "direct_url.json").write_text(
-        json.dumps({"vcs_info": {"commit_id": "f" * 40}})
-    )
-    monkeypatch.setattr(evidence_module, "distribution", lambda _name: SimpleNamespace(_path=dist))
-    storage = _CoreBackedErasureStorage(_snapshot())
-    feature = await _feature(storage, tmp_path)
-    with pytest.raises(ExternalReleaseEvidenceError, match="installed core revision"):
-        await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            feature, scratch_dir=tmp_path / "fresh-drill", erase=lambda: None
-        )
-    assert not (tmp_path / "fresh-drill").exists()
+def test_external_evidence_uses_the_immutable_core_contract_digest() -> None:
+    assert len(CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST) == 64
+    assert set(CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST) <= set("0123456789abcdef")
 
 
 async def test_external_evidence_default_path_uses_real_core_storage_privacy_and_erasure(tmp_path):

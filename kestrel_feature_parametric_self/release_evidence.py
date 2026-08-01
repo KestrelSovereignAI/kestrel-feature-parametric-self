@@ -18,7 +18,6 @@ import inspect
 import json
 import shutil
 import secrets
-from importlib.metadata import PackageNotFoundError, distribution
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from kestrel_sovereign.knowledge.corpus import GovernedCorpusSnapshot
 from kestrel_sovereign.knowledge.release_evidence import (
+    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
     PARAMETRIC_SELF_EVIDENCE_REVISION,
     release_gate_specs,
@@ -48,11 +48,6 @@ if TYPE_CHECKING:
     from .feature import ParametricSelfFeature
 
 
-# This is the merged core revision that introduced the catalog whose exact
-# specs/results/artifacts/drill this feature consumes.  The pyproject source
-# pin is the installation boundary; this value makes that boundary visible in
-# the independently signed, content-free envelope.
-CORE_RELEASE_EVIDENCE_COMMIT = "265cf41831a6d82392771771723184eef75fd7b2"
 EXTERNAL_GATE_IDS = (
     "external_corpus_consumed",
     "external_candidate_invalidated",
@@ -96,26 +91,6 @@ def _external_specs() -> dict[str, GateSpec]:
     return result
 
 
-def _verify_pinned_core_install() -> None:
-    """Refuse an installed core other than the exact reviewed Git revision.
-
-    The catalog shape is not a substitute for its source revision: a later
-    local edit can preserve the shape while changing what the signed gates
-    mean.  Pip records VCS provenance in ``direct_url.json`` for this direct
-    requirement, so require its full commit ID at the execution boundary.
-    """
-    try:
-        info = distribution("kestrel-sovereign")
-        payload = json.loads(
-            (Path(info._path) / "direct_url.json").read_text("utf-8")
-        )
-        commit = payload["vcs_info"]["commit_id"]
-    except (PackageNotFoundError, OSError, ValueError, KeyError, TypeError) as error:
-        raise ExternalReleaseEvidenceError("pinned core revision provenance is unavailable") from error
-    if not isinstance(commit, str) or commit != CORE_RELEASE_EVIDENCE_COMMIT:
-        raise ExternalReleaseEvidenceError("installed core revision does not match #2753 catalog commit")
-
-
 @dataclass(frozen=True, slots=True)
 class ExternalReleaseEvidenceEnvelope:
     """Content-free, independently signed external-CI submission for core.
@@ -124,17 +99,16 @@ class ExternalReleaseEvidenceEnvelope:
     only core's operator-owned :class:`TrustedExecutionPolicy` may trust it.
     """
 
-    core_release_evidence_commit: str
+    core_release_evidence_contract_digest: str
     repository: str
     source_revision: str
     run_nonce: str
-    freshness_receipt: str
     records: tuple[EvidenceRecord, ...]
     report: ExternalCapabilityReport
 
     def __post_init__(self) -> None:
-        if self.core_release_evidence_commit != CORE_RELEASE_EVIDENCE_COMMIT:
-            raise ExternalReleaseEvidenceError("external evidence must bind the #2753 core catalog commit")
+        if self.core_release_evidence_contract_digest != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST:
+            raise ExternalReleaseEvidenceError("external evidence must bind the current core release contract")
         if self.repository != PARAMETRIC_SELF_EVIDENCE_REPOSITORY:
             raise ExternalReleaseEvidenceError("external evidence repository does not match core contract")
         if self.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION:
@@ -143,17 +117,6 @@ class ExternalReleaseEvidenceEnvelope:
             character not in "0123456789abcdef" for character in self.run_nonce
         ):
             raise ExternalReleaseEvidenceError("external evidence requires a fresh nonce")
-        expected_receipt = _digest(
-            {
-                "core_release_evidence_commit": self.core_release_evidence_commit,
-                "repository": self.repository,
-                "source_revision": self.source_revision,
-                "run_nonce": self.run_nonce,
-                "record_digests": [record.run_digest for record in self.records],
-            }
-        )
-        if self.freshness_receipt != expected_receipt:
-            raise ExternalReleaseEvidenceError("external evidence freshness receipt is invalid")
         specs = _external_specs()
         by_gate = {record.gate_id: record for record in self.records}
         if set(by_gate) != set(specs) or len(by_gate) != len(self.records):
@@ -174,8 +137,9 @@ class ExternalReleaseEvidenceEnvelope:
             self.report.capability_id != _CAPABILITY_ID
             or self.report.repository != self.repository
             or self.report.source_revision != self.source_revision
+            or self.report.core_release_evidence_contract_digest
+            != self.core_release_evidence_contract_digest
             or self.report.run_nonce != self.run_nonce
-            or self.report.freshness_receipt != self.freshness_receipt
         ):
             raise ExternalReleaseEvidenceError("external report identity does not match its envelope")
         report_by_gate = {item.gate_id: item for item in self.report.attestations}
@@ -198,11 +162,10 @@ class ExternalReleaseEvidenceEnvelope:
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "core_release_evidence_commit": self.core_release_evidence_commit,
+            "core_release_evidence_contract_digest": self.core_release_evidence_contract_digest,
             "repository": self.repository,
             "source_revision": self.source_revision,
             "run_nonce": self.run_nonce,
-            "freshness_receipt": self.freshness_receipt,
             "trust_status": self.trust_status,
             "records": [record.to_mapping() for record in self.records],
             "report": self.report.to_mapping(),
@@ -233,7 +196,6 @@ class ParametricSelfExternalEvidenceRunner:
         ):
             raise ExternalReleaseEvidenceError("external evidence requires an external_ci signing identity")
         self._identity = signing_identity
-        self._issued_freshness_receipts: set[str] = set()
 
     async def run(
         self,
@@ -251,7 +213,6 @@ class ParametricSelfExternalEvidenceRunner:
         """
         if erase is not None and not callable(erase):
             raise ExternalReleaseEvidenceError("external erasure action must be callable")
-        _verify_pinned_core_install()
         specs = _external_specs()
         scratch_dir = Path(scratch_dir)
         if scratch_dir.exists():
@@ -336,32 +297,19 @@ class ParametricSelfExternalEvidenceRunner:
                         drill=drill,
                     )
                 )
-            receipt = _digest(
-                {
-                    "core_release_evidence_commit": CORE_RELEASE_EVIDENCE_COMMIT,
-                    "repository": PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                    "source_revision": PARAMETRIC_SELF_EVIDENCE_REVISION,
-                    "run_nonce": run_nonce,
-                    "record_digests": [record.run_digest for record in records],
-                }
-            )
-            if receipt in self._issued_freshness_receipts:
-                raise ExternalReleaseEvidenceError("external evidence freshness receipt was already issued")
-            self._issued_freshness_receipts.add(receipt)
             report = ExternalCapabilityReport.attest(
                 capability_id=_CAPABILITY_ID,
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
                 source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
                 attestations=tuple(attestations),
                 run_nonce=run_nonce,
-                freshness_receipt=receipt,
             )
             return ExternalReleaseEvidenceEnvelope(
-                core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+                core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
                 source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
                 run_nonce=run_nonce,
-                freshness_receipt=receipt,
                 records=records,
                 report=report,
             )
@@ -403,7 +351,7 @@ class ParametricSelfExternalEvidenceRunner:
         # caller-controlled log into core's release report.
         artifact_digest = _digest(
             {
-                "core_release_evidence_commit": CORE_RELEASE_EVIDENCE_COMMIT,
+                "core_release_evidence_contract_digest": CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
                 "gate_id": spec.gate_id,
                 "gate_spec_digest": spec.digest,
                 "observation": dict(observation),
@@ -429,7 +377,7 @@ class ParametricSelfExternalEvidenceRunner:
 
 
 __all__ = [
-    "CORE_RELEASE_EVIDENCE_COMMIT",
+    "CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST",
     "EXTERNAL_GATE_IDS",
     "ExternalReleaseEvidenceEnvelope",
     "ExternalReleaseEvidenceError",

@@ -66,10 +66,11 @@ signatures later against its operator-owned `TrustedExecutionPolicy` and
 attaches the envelope's `ExternalCapabilityReport` only when it matches the
 fixed repository/revision contract.
 
-Before a drill, the runner verifies pip's VCS provenance for the exact reviewed
-core commit (`265cf41831a6d82392771771723184eef75fd7b2`); a matching catalog shape on another install is not
-enough. Every invocation generates a one-time freshness nonce and receipt that
-are bound into the artifact and signed records. Its complete fresh scratch tree
+Before a drill, the runner binds the immutable core external-adapter contract
+digest, which covers the release-evidence schema/contract and ordered gate
+specification digests. Every invocation generates a one-time freshness nonce;
+core derives and consumes the corresponding receipt through its verifier-owned
+ledger. Its complete fresh scratch tree
 — including the candidate manifest and corpus files — is removed on success,
 failure, or cancellation. With no custom erasure coordinator, the runner uses
 core's scoped `delete_assertion` path for the exact assertion represented in
