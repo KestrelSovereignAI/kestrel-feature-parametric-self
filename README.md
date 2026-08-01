@@ -30,7 +30,7 @@ The package registers `ParametricSelfFeature` through the
 
 The governed-corpus host surface is currently under development in core. Until
 the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
-this package source-pins the reviewed capability commit (`265cf418`) rather
+this package source-pins the reviewed capability commit (`759906be213d20948fe95c950bb8fded0ee155cf`) rather
 than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
 must replace that pin with the published capability-bearing version.
 
@@ -81,11 +81,10 @@ represented in the governed snapshot. This is intentionally not lifecycle
 eligibility are physically removed, while core retains only its blinded,
 identity-free erasure audit/tombstone shell for operation replay protection.
 
-During coordinated development, an unpushed core evidence commit is tested
-with `uv run --no-sync` and `PYTHONPATH` pointing at that local core worktree.
-The package's `pyproject.toml` and lockfile remain pinned to the current
-published/reviewed core commit until a new core commit is pushed and can be
-resolved by a clean installer; do not publish an unreachable Git SHA.
+The source and lockfile pin the published core evidence commit
+`759906be213d20948fe95c950bb8fded0ee155cf`, so a normal clean `uv sync` can
+install the exact contract implementation. Do not advance that pin to a local
+or otherwise unreachable Git SHA.
 
 ## Incomplete-shutdown recovery
 
@@ -111,6 +110,5 @@ uv sync --extra test
 uv run --extra test pytest
 ```
 
-Until the coordinated core branch is published, contract-evidence tests use
-the local core evidence worktree with `--no-sync` and `PYTHONPATH`; the package
-source pin is not advanced ahead of that publication.
+The contract-evidence tests run against the reachable source pin above; no
+local-worktree `PYTHONPATH` override is required.
