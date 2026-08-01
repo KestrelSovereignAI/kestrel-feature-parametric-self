@@ -71,6 +71,7 @@ _EXTERNAL_CAPABILITY_GATE_IDS = EXTERNAL_GATE_IDS[1:]
 _CAPABILITY_ID = "parametric_self_governed_corpus"
 _FRESHNESS_NONCE_BYTES = 32
 _FULL_COMMIT_LENGTH = 40
+_CLI_EXECUTION_REFUSAL = "external evidence execution is unavailable"
 
 
 class ExternalReleaseEvidenceError(ValueError):
@@ -867,8 +868,12 @@ class ParametricSelfExternalEvidenceRunner:
             finally:
                 # ``_run_backend`` closes its own storage. The explicit calls
                 # are idempotent and cover factories that fail before a hook.
-                await sqlite_backend.close()
-                await postgres_backend.close()
+                # Always attempt both closes: a SQLite cleanup failure must
+                # not strand the independently-created PostgreSQL authority.
+                try:
+                    await sqlite_backend.close()
+                finally:
+                    await postgres_backend.close()
         observation, drill_semantics_digest, runner_revision = self._agree_backends(
             sqlite, postgres, run_nonce=run_nonce
         )
@@ -1289,22 +1294,30 @@ async def _run_cli(args: argparse.Namespace) -> ExternalReleaseEvidenceEnvelope:
     # Validate all output invariants before loading the agent, preparing a
     # candidate, or invoking the irreversible physical erasure.
     output, output_parent_identity = _validate_cli_output(args.output)
-    feature_factory = _load_kite_feature_factory(args.feature_factory)
-    identity = CatalogSigningIdentity(
-        issuer_id=args.issuer_id,
-        key_id=args.key_id,
-        private_key=_load_private_signing_key(args.signing_key_file),
-        source=ExecutionSource.EXTERNAL_CI,
-    )
-    runner = ParametricSelfExternalEvidenceRunner(identity)
-    envelope = await runner.run(
-        feature_factory,
-        scratch_dir=args.scratch_dir,
-        trusted_scratch_root=args.trusted_scratch_root,
-        run_nonce=args.run_nonce,
-    )
-    _write_cli_envelope_atomic(envelope, output, output_parent_identity)
-    return envelope
+    try:
+        feature_factory = _load_kite_feature_factory(args.feature_factory)
+        identity = CatalogSigningIdentity(
+            issuer_id=args.issuer_id,
+            key_id=args.key_id,
+            private_key=_load_private_signing_key(args.signing_key_file),
+            source=ExecutionSource.EXTERNAL_CI,
+        )
+        runner = ParametricSelfExternalEvidenceRunner(identity)
+        envelope = await runner.run(
+            feature_factory,
+            scratch_dir=args.scratch_dir,
+            trusted_scratch_root=args.trusted_scratch_root,
+            run_nonce=args.run_nonce,
+        )
+        _write_cli_envelope_atomic(envelope, output, output_parent_identity)
+        return envelope
+    except Exception:
+        # The external CLI is an information boundary. Core workload errors
+        # (including disposable-PostgreSQL refusal), storage setup failures,
+        # and feature-factory exceptions (including a forged local refusal)
+        # may carry DSNs or local paths. Do not disclose them to the caller or
+        # publish partial evidence.
+        raise ExternalReleaseEvidenceError(_CLI_EXECUTION_REFUSAL) from None
 
 
 def main(argv: list[str] | None = None) -> int:

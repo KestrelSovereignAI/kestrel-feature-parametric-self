@@ -416,6 +416,101 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert str(tmp_path) not in rendered
 
 
+async def test_kite_sqlite_backend_opens_real_storage_and_physically_erases(tmp_path):
+    """Exercise the runner-owned SQLite authority without a storage double."""
+    from kestrel_sovereign.knowledge import InferenceProfile
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    trusted_root = tmp_path / "trusted-scratch"
+    trusted_root.mkdir(mode=0o700)
+    backend = KiteErasureBackend(
+        "sqlite", trusted_root, trusted_root / "sqlite-live-drill"
+    )
+    physical_erasure: dict[str, object] = {}
+
+    async def factory(owned_backend: KiteErasureBackend) -> ParametricSelfFeature:
+        assert owned_backend is backend
+        raw = await owned_backend.open_storage()
+        governed = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        saved = await governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="private e2e value",
+            confidence=0.9,
+            invocation_id="release-evidence-e2e",
+        )
+        assert saved.saved
+        profile = InferenceProfile(
+            OntologyRef(
+                "http://www.w3.org/2000/01/rdf-schema#",
+                "1.0.0",
+                "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                "semantic-kb-v1",
+            ),
+            "1.0.0",
+        )
+        await raw.run_semantic_maintenance(profile)
+        assertion = (await raw.assertion_inference_inputs())[0]
+        capabilities = await raw.semantic_maintenance_capability_versions(profile)
+        policy = GovernedCorpusPolicy(
+            policy_id="release-evidence-e2e",
+            policy_version="1",
+            accepted_epistemic_states=(EpistemicState.REPORTED,),
+            accepted_visibility=(Visibility.PRIVATE,),
+            accepted_privacy_classifications=("normal",),
+            accepted_consent_references=("policy:privacy:normal-v1",),
+            accepted_grounding_classes=("explicit-tool-invocation",),
+            accepted_source_kinds=("agent_tool_invocation",),
+            accepted_ontology_pins=(assertion.ontology_version,),
+            accepted_semantic_capability_versions=tuple(capabilities.items()),
+        )
+        original_erase = raw.erase_assertion
+
+        async def erase_and_verify(assertion_id: str, *, operation_id: str | None) -> None:
+            await original_erase(assertion_id, operation_id=operation_id)
+            physical_erasure["assertion_id"] = assertion_id
+            physical_erasure["canonical_row"] = await raw.get_assertion(
+                assertion_id, include_inactive=True
+            )
+            physical_erasure["row_count"] = await raw.db.fetchval(
+                "SELECT COUNT(*) FROM semantic_assertions WHERE assertion_id = ?",
+                (assertion_id,),
+            )
+            physical_erasure["tombstone_count"] = await raw.db.fetchval(
+                "SELECT COUNT(*) FROM semantic_assertion_erased_operation_tombstones"
+            )
+
+        raw.erase_assertion = erase_and_verify
+        agent = types.SimpleNamespace(
+            storage=raw,
+            storage_path=None,
+            parametric_self_work_dir=str(tmp_path / "real-feature-work"),
+            parametric_self_governed_corpus_policy=policy,
+            semantic_inference_profile=profile,
+            is_test_instance=True,
+            agent_id=owned_backend.agent_id,
+            sleep_hooks=[],
+        )
+        feature = ParametricSelfFeature(agent=agent)
+        await feature.initialize()
+        feature._governed_corpus_policy = policy
+        return feature
+
+    observation = await ParametricSelfExternalEvidenceRunner(_identity())._run_backend(
+        factory, backend, run_nonce="c" * 64
+    )
+
+    assert observation.observation == {"erased_count": 1, "remaining_count": 0}
+    assert physical_erasure["canonical_row"] is None
+    assert physical_erasure["row_count"] == 0
+    assert physical_erasure["tombstone_count"] == 1
+    state_path = backend._sqlite_state_path
+    assert backend._closed
+    assert state_path is not None and not state_path.exists()
+    assert not backend.scratch_dir.exists()
+
+
 async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_delta(tmp_path, monkeypatch):
     factory, storages = _dual_feature_factory(tmp_path)
     runner = ParametricSelfExternalEvidenceRunner(_identity())
@@ -457,6 +552,36 @@ async def test_external_evidence_refuses_a_skipped_or_failing_backend_and_cleans
         )
     assert set(storages) == {"sqlite"}
     assert storages["sqlite"].closed
+    assert _FakeDisposablePostgres.created[-1].closed
+
+
+async def test_external_evidence_attempts_postgres_cleanup_after_sqlite_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    """One backend's cleanup failure must not skip the other backend's close."""
+    runner = ParametricSelfExternalEvidenceRunner(_identity())
+    closed: list[str] = []
+
+    async def bypass_drill(*_args, **_kwargs) -> object:
+        return object()
+
+    async def failing_sqlite_close(backend: KiteErasureBackend) -> None:
+        closed.append(backend.backend)
+        if backend.backend == "sqlite":
+            raise ExternalReleaseEvidenceError("simulated SQLite cleanup failure")
+
+    monkeypatch.setattr(runner, "_run_backend", bypass_drill)
+    monkeypatch.setattr(KiteErasureBackend, "close", failing_sqlite_close)
+
+    with pytest.raises(ExternalReleaseEvidenceError, match="simulated SQLite"):
+        await runner.run(
+            _dual_feature_factory(tmp_path)[0],
+            scratch_dir=tmp_path / "cleanup-order-drill",
+            trusted_scratch_root=tmp_path,
+            run_nonce="0" * 64,
+        )
+
+    assert closed == ["sqlite", "postgres"]
     assert _FakeDisposablePostgres.created[-1].closed
 
 
@@ -647,6 +772,64 @@ async def test_external_evidence_cli_requires_a_kite_factory_and_runs_two_phases
     assert output.exists()
     assert output.stat().st_mode & 0o777 == 0o600
     assert json.loads(output.read_text())["run_nonce"] == envelope.run_nonce
+
+
+@pytest.mark.parametrize(
+    "failure", ("core_workload", "factory_setup", "factory_forged_refusal")
+)
+async def test_cli_redacts_infrastructure_and_factory_setup_failures(
+    tmp_path, monkeypatch, failure
+):
+    """The CLI must not reveal DSNs or paths from dependencies it invokes."""
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogWorkloadUnavailable,
+    )
+
+    module_name = f"kestrel_feature_parametric_self._test_cli_redaction_{failure}"
+    module = types.ModuleType(module_name)
+    secret = "postgresql://release-user:secret@private.invalid/release /private/state.db"
+
+    async def unsafe_factory(_backend: KiteErasureBackend) -> ParametricSelfFeature:
+        if failure == "factory_forged_refusal":
+            raise ExternalReleaseEvidenceError(secret)
+        raise RuntimeError(secret)
+
+    module.make_feature = unsafe_factory
+    monkeypatch.setitem(sys.modules, module_name, module)
+    if failure == "core_workload":
+
+        class UnavailableCoreWorkload:
+            @classmethod
+            async def create(cls):
+                raise CatalogWorkloadUnavailable(secret)
+
+        monkeypatch.setattr(
+            release_evidence_module, "DisposablePostgresDatabase", UnavailableCoreWorkload
+        )
+
+    key_file = tmp_path / "external-ci.key"
+    key_file.write_text("08" * 32, encoding="ascii")
+    key_file.chmod(0o600)
+    output = tmp_path / "external-evidence.json"
+    args = Namespace(
+        feature_factory=f"{module_name}:make_feature",
+        signing_key_file=key_file,
+        issuer_id="parametric_self_ci",
+        key_id="release_evidence_key",
+        run_nonce="d" * 64,
+        scratch_dir=tmp_path / "redaction-drill",
+        trusted_scratch_root=tmp_path,
+        output=output,
+    )
+
+    with pytest.raises(ExternalReleaseEvidenceError) as refused:
+        await release_evidence_module._run_cli(args)
+
+    assert str(refused.value) == "external evidence execution is unavailable"
+    assert secret not in str(refused.value)
+    assert str(tmp_path) not in str(refused.value)
+    assert not output.exists()
+    assert not (tmp_path / "redaction-drill").exists()
 
 
 @pytest.mark.parametrize(
