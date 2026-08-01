@@ -228,7 +228,9 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     evidence = apply_evidence_records(
         release_evidence_template(), envelope.records, trust_policy=policy
     )
-    ledger = ExternalFreshnessLedger(tmp_path / "verifier-freshness.sqlite")
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "verifier-freshness.sqlite", trusted_root=tmp_path
+    )
     attached = attach_external_capability_report(
         evidence, envelope.report, freshness_ledger=ledger
     )

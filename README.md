@@ -73,8 +73,11 @@ core derives and consumes the corresponding receipt through its verifier-owned
 ledger. Its complete fresh scratch tree
 — including the candidate manifest and corpus files — is removed on success,
 failure, or cancellation. With no custom erasure coordinator, the runner uses
-core's scoped `delete_assertion` path for the exact assertion represented in
-the governed snapshot.
+core's scoped physical `erase_assertion` path for the exact assertion
+represented in the governed snapshot. This is intentionally not lifecycle
+`delete_assertion`: the canonical assertion row and its derived/index/corpus
+eligibility are physically removed, while core retains only its blinded,
+identity-free erasure audit/tombstone shell for operation replay protection.
 
 ## Incomplete-shutdown recovery
 
@@ -99,3 +102,7 @@ corpus files.
 uv sync --extra test
 uv run --extra test pytest
 ```
+
+Until the coordinated core branch is published, contract-evidence tests use
+the local core evidence worktree with `--no-sync` and `PYTHONPATH`; the package
+source pin is not advanced ahead of that publication.
