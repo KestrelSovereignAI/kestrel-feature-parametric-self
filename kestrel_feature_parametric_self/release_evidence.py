@@ -16,7 +16,10 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import shutil
+import stat
+import subprocess
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +28,8 @@ from typing import TYPE_CHECKING
 from kestrel_sovereign.knowledge.corpus import GovernedCorpusSnapshot
 from kestrel_sovereign.knowledge.release_evidence import (
     CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+    PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
     PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-    PARAMETRIC_SELF_EVIDENCE_REVISION,
     release_gate_specs,
 )
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
@@ -54,6 +57,7 @@ EXTERNAL_GATE_IDS = (
 )
 _CAPABILITY_ID = "parametric_self_governed_corpus"
 _FRESHNESS_NONCE_BYTES = 32
+_FULL_COMMIT_LENGTH = 40
 
 
 class ExternalReleaseEvidenceError(ValueError):
@@ -69,6 +73,156 @@ def _canonical_json(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _is_full_commit(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _FULL_COMMIT_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _resolve_clean_evidence_runner_revision() -> str:
+    """Return this checkout's immutable runner revision or fail closed.
+
+    The submitted provenance is obtained by the runner itself, rather than
+    supplied by a caller.  A dirty or unverifiable checkout cannot produce
+    release evidence because it has no precise, reviewable source identity.
+    """
+    repository = Path(__file__).resolve().parents[1]
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(repository), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        revision = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ExternalReleaseEvidenceError(
+            "external evidence runner checkout is not clean and verifiable"
+        ) from error
+    if status.stdout or not _is_full_commit(revision):
+        raise ExternalReleaseEvidenceError(
+            "external evidence runner checkout is not clean and verifiable"
+        )
+    return revision
+
+
+def _lstat_private_directory(path: Path, *, expected_identity: tuple[int, int] | None = None) -> tuple[int, int]:
+    """Require an owner-only non-symlink directory and return its identity."""
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ExternalReleaseEvidenceError("external evidence scratch tree is unavailable") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ExternalReleaseEvidenceError("external evidence scratch tree is not private")
+    identity = (metadata.st_dev, metadata.st_ino)
+    if expected_identity is not None and identity != expected_identity:
+        raise ExternalReleaseEvidenceError("external evidence scratch tree changed during execution")
+    return identity
+
+
+def _prepare_private_scratch_tree(
+    scratch_dir: Path,
+    trusted_scratch_root: Path,
+) -> tuple[Path, Path, Path, dict[Path, tuple[int, int]]]:
+    """Create a fresh, private tree inside a verifier-selected root.
+
+    The caller may select a leaf only; the root is explicit and is verified
+    before every creation.  No path component is followed through a symlink.
+    """
+    scratch_dir = Path(scratch_dir)
+    trusted_scratch_root = Path(trusted_scratch_root)
+    if (
+        not scratch_dir.is_absolute()
+        or not trusted_scratch_root.is_absolute()
+        or ".." in scratch_dir.parts
+        or ".." in trusted_scratch_root.parts
+        or trusted_scratch_root.is_symlink()
+    ):
+        raise ExternalReleaseEvidenceError("external evidence scratch path is not trusted")
+    try:
+        root = trusted_scratch_root.resolve(strict=True)
+        relative = scratch_dir.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise ExternalReleaseEvidenceError("external evidence scratch path is not trusted") from error
+    if not relative.parts or scratch_dir.exists() or scratch_dir.is_symlink():
+        raise ExternalReleaseEvidenceError("external evidence scratch directory must be fresh")
+
+    identities: dict[Path, tuple[int, int]] = {root: _lstat_private_directory(root)}
+    current = root
+    for component in relative.parts[:-1]:
+        current = current / component
+        identities[current] = _lstat_private_directory(current)
+    try:
+        os.mkdir(scratch_dir, 0o700)
+        os.chmod(scratch_dir, 0o700)
+        candidate = scratch_dir / "candidate"
+        corpus = scratch_dir / "corpus"
+        os.mkdir(candidate, 0o700)
+        os.mkdir(corpus, 0o700)
+        os.chmod(candidate, 0o700)
+        os.chmod(corpus, 0o700)
+    except OSError as error:
+        raise ExternalReleaseEvidenceError("external evidence scratch tree could not be created") from error
+    identities[scratch_dir] = _lstat_private_directory(scratch_dir)
+    identities[candidate] = _lstat_private_directory(candidate)
+    identities[corpus] = _lstat_private_directory(corpus)
+    _verify_private_scratch_tree(scratch_dir, identities)
+    return scratch_dir, candidate, corpus, identities
+
+
+def _verify_private_scratch_tree(
+    scratch_dir: Path,
+    identities: Mapping[Path, tuple[int, int]],
+) -> None:
+    """Recheck directories and lock generated files to the private tree."""
+    for path, identity in identities.items():
+        _lstat_private_directory(path, expected_identity=identity)
+    try:
+        for parent, directories, files in os.walk(scratch_dir, followlinks=False):
+            parent_path = Path(parent)
+            _lstat_private_directory(parent_path)
+            for name in directories:
+                _lstat_private_directory(parent_path / name)
+            for name in files:
+                child = parent_path / name
+                metadata = child.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                    raise ExternalReleaseEvidenceError("external evidence scratch tree contains an unsafe file")
+                os.chmod(child, 0o600)
+                if stat.S_IMODE(child.lstat().st_mode) & 0o077:
+                    raise ExternalReleaseEvidenceError("external evidence scratch file is not private")
+    except OSError as error:
+        raise ExternalReleaseEvidenceError("external evidence scratch tree is unavailable") from error
+
+
+def _cleanup_private_scratch_tree(
+    scratch_dir: Path,
+    identities: Mapping[Path, tuple[int, int]],
+) -> None:
+    """Remove only the exact tree this invocation created.
+
+    If an identity check fails, leave it for the verifier/operator rather than
+    risking deletion through a replacement path.
+    """
+    try:
+        _verify_private_scratch_tree(scratch_dir, identities)
+    except ExternalReleaseEvidenceError:
+        return
+    shutil.rmtree(scratch_dir)
 
 
 def _external_specs() -> dict[str, GateSpec]:
@@ -100,7 +254,8 @@ class ExternalReleaseEvidenceEnvelope:
 
     core_release_evidence_contract_digest: str
     repository: str
-    source_revision: str
+    capability_source_revision: str
+    evidence_runner_revision: str
     run_nonce: str
     records: tuple[EvidenceRecord, ...]
     report: ExternalCapabilityReport
@@ -110,8 +265,10 @@ class ExternalReleaseEvidenceEnvelope:
             raise ExternalReleaseEvidenceError("external evidence must bind the current core release contract")
         if self.repository != PARAMETRIC_SELF_EVIDENCE_REPOSITORY:
             raise ExternalReleaseEvidenceError("external evidence repository does not match core contract")
-        if self.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION:
+        if self.capability_source_revision != PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION:
             raise ExternalReleaseEvidenceError("external evidence revision does not match core contract")
+        if not _is_full_commit(self.evidence_runner_revision):
+            raise ExternalReleaseEvidenceError("external evidence runner revision is invalid")
         if len(self.run_nonce) != _FRESHNESS_NONCE_BYTES * 2 or any(
             character not in "0123456789abcdef" for character in self.run_nonce
         ):
@@ -131,6 +288,7 @@ class ExternalReleaseEvidenceEnvelope:
                 or record.execution_attestation is None
                 or record.execution_attestation.source is not ExecutionSource.EXTERNAL_CI
                 or record.external_run_nonce != self.run_nonce
+                or record.external_evidence_runner_revision != self.evidence_runner_revision
             ):
                 raise ExternalReleaseEvidenceError(
                     "external evidence records must be externally signed passes bound to the verifier nonce"
@@ -138,7 +296,8 @@ class ExternalReleaseEvidenceEnvelope:
         if (
             self.report.capability_id != _CAPABILITY_ID
             or self.report.repository != self.repository
-            or self.report.source_revision != self.source_revision
+            or self.report.capability_source_revision != self.capability_source_revision
+            or self.report.evidence_runner_revision != self.evidence_runner_revision
             or self.report.core_release_evidence_contract_digest
             != self.core_release_evidence_contract_digest
             or self.report.run_nonce != self.run_nonce
@@ -166,7 +325,8 @@ class ExternalReleaseEvidenceEnvelope:
         return {
             "core_release_evidence_contract_digest": self.core_release_evidence_contract_digest,
             "repository": self.repository,
-            "source_revision": self.source_revision,
+            "capability_source_revision": self.capability_source_revision,
+            "evidence_runner_revision": self.evidence_runner_revision,
             "run_nonce": self.run_nonce,
             "trust_status": self.trust_status,
             "records": [record.to_mapping() for record in self.records],
@@ -204,6 +364,7 @@ class ParametricSelfExternalEvidenceRunner:
         feature: "ParametricSelfFeature",
         *,
         scratch_dir: Path,
+        trusted_scratch_root: Path,
         run_nonce: str,
         erase: ErasureAction | None = None,
     ) -> ExternalReleaseEvidenceEnvelope:
@@ -224,27 +385,26 @@ class ParametricSelfExternalEvidenceRunner:
         ):
             raise ExternalReleaseEvidenceError("external evidence requires a verifier-issued nonce")
         specs = _external_specs()
-        scratch_dir = Path(scratch_dir)
-        if scratch_dir.exists():
-            raise ExternalReleaseEvidenceError("external evidence scratch directory must be fresh")
+        runner_revision = _resolve_clean_evidence_runner_revision()
         if getattr(feature, "_active_adapter_path", None) is not None:
             raise ExternalReleaseEvidenceError("external drill requires an isolated feature with no served adapter")
-
-        snapshot, problem = await feature._request_governed_snapshot()
-        if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
-            raise ExternalReleaseEvidenceError("core governed corpus snapshot is unavailable or invalid")
-        if not snapshot.examples:
-            raise ExternalReleaseEvidenceError("external erasure drill requires a non-empty governed corpus")
-
-        candidate = scratch_dir / "candidate"
-        corpus_dir = scratch_dir / "corpus"
+        scratch_dir, candidate, corpus_dir, scratch_identities = _prepare_private_scratch_tree(
+            Path(scratch_dir), Path(trusted_scratch_root)
+        )
         try:
+            snapshot, problem = await feature._request_governed_snapshot()
+            if problem or not isinstance(snapshot, GovernedCorpusSnapshot):
+                raise ExternalReleaseEvidenceError("core governed corpus snapshot is unavailable or invalid")
+            if not snapshot.examples:
+                raise ExternalReleaseEvidenceError("external erasure drill requires a non-empty governed corpus")
+            _verify_private_scratch_tree(scratch_dir, scratch_identities)
             stats = build_corpus(
                 None,
                 str(corpus_dir),
                 governed_snapshot=snapshot,
                 manifest_dir=str(candidate),
             )
+            _verify_private_scratch_tree(scratch_dir, scratch_identities)
             if stats.from_facts <= 0 or not stats.assertion_lineage:
                 raise ExternalReleaseEvidenceError("core governed corpus did not contribute an erasure-tracked example")
             manifest, manifest_problem = feature._manifest_lineage(str(candidate))
@@ -288,7 +448,9 @@ class ParametricSelfExternalEvidenceRunner:
                 "external_served_eligibility_rejected": {"erased_count": 1, "remaining_count": 0},
             }
             records = tuple(
-                self._record(specs[gate_id], observations[gate_id], run_nonce)
+                self._record(
+                    specs[gate_id], observations[gate_id], run_nonce, runner_revision
+                )
                 for gate_id in EXTERNAL_GATE_IDS
             )
             attestations: list[ExternalGateAttestation] = []
@@ -309,7 +471,8 @@ class ParametricSelfExternalEvidenceRunner:
             report = ExternalCapabilityReport.attest(
                 capability_id=_CAPABILITY_ID,
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+                evidence_runner_revision=runner_revision,
                 core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
                 attestations=tuple(attestations),
                 run_nonce=run_nonce,
@@ -317,7 +480,8 @@ class ParametricSelfExternalEvidenceRunner:
             return ExternalReleaseEvidenceEnvelope(
                 core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+                capability_source_revision=PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION,
+                evidence_runner_revision=runner_revision,
                 run_nonce=run_nonce,
                 records=records,
                 report=report,
@@ -326,8 +490,7 @@ class ParametricSelfExternalEvidenceRunner:
             # The candidate manifest is lineage-sensitive too.  This exact
             # fresh tree exists solely for the drill, so delete *all* of it on
             # success, exceptions, and task cancellation.
-            if scratch_dir.exists():
-                shutil.rmtree(scratch_dir)
+            _cleanup_private_scratch_tree(scratch_dir, scratch_identities)
 
     @staticmethod
     async def _erase_snapshot_assertion(
@@ -354,6 +517,7 @@ class ParametricSelfExternalEvidenceRunner:
         spec: GateSpec,
         observation: Mapping[str, object],
         run_nonce: str,
+        evidence_runner_revision: str,
     ) -> EvidenceRecord:
         # The artifact is a digest of only catalog-bound aggregate fields; it
         # cannot be used to smuggle an assertion, tenant, filesystem path, or
@@ -374,6 +538,7 @@ class ParametricSelfExternalEvidenceRunner:
             artifact,
             state=EvidenceState.PASSED,
             external_run_nonce=run_nonce,
+            external_evidence_runner_revision=evidence_runner_revision,
         )
         return EvidenceRecord._from_trusted_execution(
             spec,
@@ -384,6 +549,7 @@ class ParametricSelfExternalEvidenceRunner:
                 kind="evidence_record", spec=spec, run_digest=run_digest
             ),
             external_run_nonce=run_nonce,
+            external_evidence_runner_revision=evidence_runner_revision,
         )
 
 

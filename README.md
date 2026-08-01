@@ -30,7 +30,7 @@ The package registers `ParametricSelfFeature` through the
 
 The governed-corpus host surface is currently under development in core. Until
 the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
-this package source-pins the reviewed capability commit (`759906be213d20948fe95c950bb8fded0ee155cf`) rather
+this package source-pins the reviewed capability commit (`f1b94e0b8117d1b98f506db4bf664c4c8c5ddc32`) rather
 than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
 must replace that pin with the published capability-bearing version.
 
@@ -68,13 +68,17 @@ fixed repository/revision contract.
 
 Before a drill, the runner binds the immutable core external-adapter contract
 digest, which covers the release-evidence schema/contract and ordered gate
-specification digests. Before every invocation, the independent verifier
+specification digests. It also resolves its own clean, full Git revision and
+binds that identity into every signed record and report; the verifier must
+allow that exact revision. Before every invocation, the independent verifier
 persists and issues a one-time freshness nonce; the runner accepts that nonce
 as required input and binds it into every signed record and the report. Core
 derives and consumes the corresponding receipt through its verifier-owned
-ledger, rejecting unknown, replayed, or rewrapped nonces. Its complete fresh scratch tree
-— including the candidate manifest and corpus files — is removed on success,
-failure, or cancellation. With no custom erasure coordinator, the runner uses
+ledger, rejecting unknown, replayed, or rewrapped nonces. The runner requires
+an explicit owner-only trusted scratch root, creates a fresh owner-only tree
+for its candidate manifest and governed corpus, rechecks it while plaintext is
+live, and removes only that verified tree on success, failure, or cancellation.
+With no custom erasure coordinator, the runner uses
 core's scoped physical `erase_assertion` path for the exact assertion
 represented in the governed snapshot. This is intentionally not lifecycle
 `delete_assertion`: the canonical assertion row and its derived/index/corpus
@@ -82,7 +86,7 @@ eligibility are physically removed, while core retains only its blinded,
 identity-free erasure audit/tombstone shell for operation replay protection.
 
 The source and lockfile pin the published core evidence commit
-`759906be213d20948fe95c950bb8fded0ee155cf`, so a normal clean `uv sync` can
+`f1b94e0b8117d1b98f506db4bf664c4c8c5ddc32`, so a normal clean `uv sync` can
 install the exact contract implementation. Do not advance that pin to a local
 or otherwise unreachable Git SHA.
 

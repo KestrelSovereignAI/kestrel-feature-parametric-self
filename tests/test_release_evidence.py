@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,12 +13,14 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kestrel_feature_parametric_self import ParametricSelfFeature
+from kestrel_feature_parametric_self import release_evidence as release_evidence_module
 from kestrel_feature_parametric_self.release_evidence import (
     CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     EXTERNAL_GATE_IDS,
     ExternalReleaseEvidenceError,
     ParametricSelfExternalEvidenceRunner,
 )
+_REAL_RUNNER_REVISION_RESOLVER = release_evidence_module._resolve_clean_evidence_runner_revision
 from kestrel_sovereign.knowledge.assertion import (
     Assertion,
     DirectLineage,
@@ -58,6 +61,21 @@ from kestrel_sovereign.knowledge.shacl_validation import (
     ValidationState,
     ValidationWriteAction,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stable_runner_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep integration fixtures independent of this worktree's edit state.
+
+    Production resolves the clean checkout itself; dedicated unit tests below
+    exercise that resolver.  During a source-tree test run the checkout is
+    intentionally dirty, so its value cannot be an honest release identity.
+    """
+    monkeypatch.setattr(
+        release_evidence_module,
+        "_resolve_clean_evidence_runner_revision",
+        lambda: "a" * 40,
+    )
 
 
 def _snapshot() -> GovernedCorpusSnapshot:
@@ -215,7 +233,11 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
         storage.erased = True
 
     envelope = await ParametricSelfExternalEvidenceRunner(identity).run(
-        feature, scratch_dir=tmp_path / "fresh-drill", run_nonce=run_nonce, erase=erase
+        feature,
+        scratch_dir=tmp_path / "fresh-drill",
+        trusted_scratch_root=tmp_path,
+        run_nonce=run_nonce,
+        erase=erase,
     )
 
     assert envelope.core_release_evidence_contract_digest == CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST
@@ -230,29 +252,47 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     assert envelope.run_nonce == run_nonce
     assert len(envelope.report.freshness_receipt) == 64
     assert {record.external_run_nonce for record in envelope.records} == {run_nonce}
+    assert len(envelope.evidence_runner_revision) == 40
+    assert {record.external_evidence_runner_revision for record in envelope.records} == {
+        envelope.evidence_runner_revision
+    }
 
     policy = TrustedExecutionPolicy((identity.trusted_key(("external_ci",)),))
     evidence = apply_evidence_records(
         release_evidence_template(), envelope.records, trust_policy=policy
     )
     attached = attach_external_capability_report(
-        evidence, envelope.report, freshness_ledger=ledger
+        evidence,
+        envelope.report,
+        freshness_ledger=ledger,
+        expected_evidence_runner_revision=envelope.evidence_runner_revision,
     )
     assert attached.external_capabilities == (envelope.report,)
     with pytest.raises(ReleaseEvidenceError, match="already consumed"):
-        attach_external_capability_report(evidence, envelope.report, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence,
+            envelope.report,
+            freshness_ledger=ledger,
+            expected_evidence_runner_revision=envelope.evidence_runner_revision,
+        )
 
     rewrap_nonce = ledger.issue_challenge()
     rewrapped = ExternalCapabilityReport.attest(
         capability_id=envelope.report.capability_id,
         repository=envelope.report.repository,
-        source_revision=envelope.report.source_revision,
+        capability_source_revision=envelope.report.capability_source_revision,
+        evidence_runner_revision=envelope.report.evidence_runner_revision,
         core_release_evidence_contract_digest=envelope.report.core_release_evidence_contract_digest,
         run_nonce=rewrap_nonce,
         attestations=envelope.report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="external run_nonce"):
-        attach_external_capability_report(evidence, rewrapped, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence,
+            rewrapped,
+            freshness_ledger=ledger,
+            expected_evidence_runner_revision=envelope.evidence_runner_revision,
+        )
 
     unknown_storage = _CoreBackedErasureStorage(_snapshot())
     unknown_feature = await _feature(unknown_storage, tmp_path / "unknown")
@@ -263,6 +303,7 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     unknown_envelope = await ParametricSelfExternalEvidenceRunner(identity).run(
         unknown_feature,
         scratch_dir=tmp_path / "unknown-drill",
+        trusted_scratch_root=tmp_path,
         run_nonce="f" * 64,
         erase=erase_unknown,
     )
@@ -271,7 +312,10 @@ async def test_external_evidence_runs_real_core_snapshot_to_quarantine_and_signs
     )
     with pytest.raises(ReleaseEvidenceError, match="not an issued pending"):
         attach_external_capability_report(
-            unknown_evidence, unknown_envelope.report, freshness_ledger=ledger
+            unknown_evidence,
+            unknown_envelope.report,
+            freshness_ledger=ledger,
+            expected_evidence_runner_revision=unknown_envelope.evidence_runner_revision,
         )
 
     output = tmp_path / "external-evidence.json"
@@ -293,10 +337,132 @@ async def test_external_evidence_fails_closed_when_erasure_does_not_change_core_
 
     with pytest.raises(ExternalReleaseEvidenceError, match="did not invalidate"):
         await ParametricSelfExternalEvidenceRunner(_identity()).run(
-            feature, scratch_dir=tmp_path / "fresh-drill", run_nonce="a" * 64, erase=no_op_erase
+            feature,
+            scratch_dir=tmp_path / "fresh-drill",
+            trusted_scratch_root=tmp_path,
+            run_nonce="a" * 64,
+            erase=no_op_erase,
         )
     assert feature._active_adapter_path is not None
     assert not (tmp_path / "fresh-drill").exists()
+
+
+async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live(tmp_path):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    trusted_root = tmp_path / "trusted-scratch"
+    trusted_root.mkdir(mode=0o700)
+    scratch_dir = trusted_root / "drill"
+
+    async def erase() -> None:
+        for directory in (scratch_dir, scratch_dir / "candidate", scratch_dir / "corpus"):
+            metadata = directory.stat()
+            assert metadata.st_uid == os.geteuid()
+            assert metadata.st_mode & 0o777 == 0o700
+        for path in scratch_dir.rglob("*"):
+            if path.is_file():
+                assert path.stat().st_mode & 0o777 == 0o600
+        storage.erased = True
+
+    await ParametricSelfExternalEvidenceRunner(_identity()).run(
+        feature,
+        scratch_dir=scratch_dir,
+        trusted_scratch_root=trusted_root,
+        run_nonce="b" * 64,
+        erase=erase,
+    )
+    assert not scratch_dir.exists()
+
+
+async def test_external_evidence_refuses_unsafe_or_reused_scratch_paths(tmp_path):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    trusted_root = tmp_path / "trusted-scratch"
+    trusted_root.mkdir(mode=0o700)
+    unsafe_root = tmp_path / "unsafe-scratch"
+    unsafe_root.mkdir(mode=0o755)
+
+    with pytest.raises(ExternalReleaseEvidenceError, match="not private"):
+        await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature,
+            scratch_dir=unsafe_root / "drill",
+            trusted_scratch_root=unsafe_root,
+            run_nonce="c" * 64,
+        )
+    with pytest.raises(ExternalReleaseEvidenceError, match="not trusted"):
+        await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature,
+            scratch_dir=trusted_root / ".." / "escaped",
+            trusted_scratch_root=trusted_root,
+            run_nonce="c" * 64,
+        )
+    linked = trusted_root / "linked"
+    linked.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ExternalReleaseEvidenceError, match="scratch tree"):
+        await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature,
+            scratch_dir=linked / "drill",
+            trusted_scratch_root=trusted_root,
+            run_nonce="c" * 64,
+        )
+    existing = trusted_root / "existing"
+    existing.mkdir(mode=0o700)
+    with pytest.raises(ExternalReleaseEvidenceError, match="must be fresh"):
+        await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature,
+            scratch_dir=existing,
+            trusted_scratch_root=trusted_root,
+            run_nonce="c" * 64,
+        )
+
+
+async def test_external_evidence_detects_scratch_tree_replacement_race(tmp_path, monkeypatch):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    scratch_dir = tmp_path / "race-drill"
+    original = release_evidence_module.build_corpus
+
+    def replace_corpus(*args, **kwargs):
+        result = original(*args, **kwargs)
+        corpus = Path(args[1])
+        corpus.rename(corpus.with_name("replaced-corpus"))
+        corpus.mkdir(mode=0o700)
+        return result
+
+    monkeypatch.setattr(release_evidence_module, "build_corpus", replace_corpus)
+    with pytest.raises(ExternalReleaseEvidenceError, match="changed during execution"):
+        await ParametricSelfExternalEvidenceRunner(_identity()).run(
+            feature,
+            scratch_dir=scratch_dir,
+            trusted_scratch_root=tmp_path,
+            run_nonce="d" * 64,
+        )
+    # The cleanup guard refuses to delete a path whose identity changed.
+    assert scratch_dir.exists()
+
+
+def test_external_evidence_refuses_dirty_or_unverifiable_runner_checkout(monkeypatch):
+    monkeypatch.setattr(
+        release_evidence_module,
+        "_resolve_clean_evidence_runner_revision",
+        _REAL_RUNNER_REVISION_RESOLVER,
+    )
+    monkeypatch.setattr(
+        release_evidence_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: __import__("subprocess").CompletedProcess(
+            (), 0, stdout=" M runner.py\n", stderr=""
+        ),
+    )
+    with pytest.raises(ExternalReleaseEvidenceError, match="not clean and verifiable"):
+        release_evidence_module._resolve_clean_evidence_runner_revision()
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(release_evidence_module.subprocess, "run", unavailable)
+    with pytest.raises(ExternalReleaseEvidenceError, match="not clean and verifiable"):
+        release_evidence_module._resolve_clean_evidence_runner_revision()
 
 
 async def test_external_evidence_refuses_non_external_signer(tmp_path):
@@ -331,12 +497,14 @@ async def test_external_evidence_binds_unique_freshness_to_every_signed_record(t
     left = await runner.run(
         first,
         scratch_dir=tmp_path / "drill-one",
+        trusted_scratch_root=tmp_path,
         run_nonce=ledger.issue_challenge(),
         erase=erase_first,
     )
     right = await runner.run(
         second,
         scratch_dir=tmp_path / "drill-two",
+        trusted_scratch_root=tmp_path,
         run_nonce=ledger.issue_challenge(),
         erase=erase_second,
     )
@@ -409,6 +577,7 @@ async def test_external_evidence_default_path_uses_real_core_storage_privacy_and
         envelope = await ParametricSelfExternalEvidenceRunner(_identity()).run(
             feature,
             scratch_dir=tmp_path / "fresh-real-drill",
+            trusted_scratch_root=tmp_path,
             run_nonce=ledger.issue_challenge(),
         )
         assert all(record.passed for record in envelope.records)
