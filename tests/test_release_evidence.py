@@ -425,7 +425,60 @@ async def test_external_evidence_cli_requires_a_kite_factory_and_runs_two_phases
 
     assert storage.erased is True
     assert output.exists()
+    assert output.stat().st_mode & 0o777 == 0o600
     assert json.loads(output.read_text())["run_nonce"] == envelope.run_nonce
+
+
+@pytest.mark.parametrize(
+    "output_case",
+    ("relative", "existing", "existing_non_private", "missing_parent", "non_private_parent"),
+)
+async def test_cli_rejects_unsafe_output_before_physical_erasure(
+    tmp_path, monkeypatch, output_case
+):
+    storage = _CoreBackedErasureStorage(_snapshot())
+    feature = await _feature(storage, tmp_path)
+    feature.agent.is_test_instance = True
+    module_name = "kestrel_feature_parametric_self._test_unsafe_output_factory"
+    module = types.ModuleType(module_name)
+
+    async def make_feature():
+        return feature
+
+    module.make_feature = make_feature
+    monkeypatch.setitem(sys.modules, module_name, module)
+    private_parent = tmp_path / "private-output"
+    private_parent.mkdir(mode=0o700)
+    if output_case == "relative":
+        output = Path("relative-external-evidence.json")
+    elif output_case in {"existing", "existing_non_private"}:
+        output = private_parent / "existing.json"
+        output.write_text("occupied", encoding="utf-8")
+        output.chmod(0o644 if output_case == "existing_non_private" else 0o600)
+    elif output_case == "missing_parent":
+        output = tmp_path / "missing" / "evidence.json"
+    else:
+        non_private_parent = tmp_path / "shared-output"
+        non_private_parent.mkdir(mode=0o755)
+        output = non_private_parent / "evidence.json"
+
+    args = Namespace(
+        feature_factory=f"{module_name}:make_feature",
+        signing_key_file=tmp_path / "unused.key",
+        issuer_id="parametric_self_ci",
+        key_id="release_evidence_key",
+        run_nonce="3" * 64,
+        scratch_dir=tmp_path / "must-not-exist",
+        trusted_scratch_root=tmp_path,
+        output=output,
+    )
+
+    with pytest.raises(ExternalReleaseEvidenceError, match="output"):
+        await release_evidence_module._run_cli(args)
+
+    assert storage.erased is False
+    assert feature._active_adapter_path is None
+    assert not (tmp_path / "must-not-exist").exists()
 
 
 async def test_external_evidence_scratch_tree_is_private_while_plaintext_is_live(tmp_path):

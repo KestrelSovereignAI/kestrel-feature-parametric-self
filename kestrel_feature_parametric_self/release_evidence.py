@@ -769,6 +769,119 @@ async def _load_kite_feature(factory_reference: str) -> ParametricSelfFeature:
     return feature
 
 
+def _validate_cli_output(output: Path) -> tuple[Path, tuple[int, int]]:
+    """Validate the output target before the drill can erase anything."""
+    output = Path(output)
+    if not output.is_absolute() or output.name in {"", ".", ".."}:
+        raise ExternalReleaseEvidenceError(
+            "external evidence output must be a fresh absolute path"
+        )
+    try:
+        parent_identity = _lstat_private_directory(output.parent)
+    except ExternalReleaseEvidenceError as error:
+        raise ExternalReleaseEvidenceError(
+            "external evidence output parent is unavailable or not private"
+        ) from error
+    try:
+        output.lstat()
+    except FileNotFoundError:
+        return output, parent_identity
+    except OSError as error:
+        raise ExternalReleaseEvidenceError(
+            "external evidence output target is unavailable"
+        ) from error
+    raise ExternalReleaseEvidenceError(
+        "external evidence output must be a fresh absolute path"
+    )
+
+
+def _write_cli_envelope_atomic(
+    envelope: ExternalReleaseEvidenceEnvelope,
+    output: Path,
+    parent_identity: tuple[int, int],
+) -> None:
+    """Publish a complete envelope without following or replacing a path.
+
+    The private parent is opened and identity-pinned. A complete, fsynced 0600
+    temporary inode is hard-linked into the fresh destination name, which is
+    an atomic no-replace operation, then the temporary name is removed.
+    """
+    _lstat_private_directory(output.parent, expected_identity=parent_identity)
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    temp_name = f".{output.name}.tmp-{secrets.token_hex(16)}"
+    parent_fd: int | None = None
+    temp_created = False
+    target_created = False
+    try:
+        parent_fd = os.open(output.parent, parent_flags)
+        parent_metadata = os.fstat(parent_fd)
+        if (
+            (parent_metadata.st_dev, parent_metadata.st_ino) != parent_identity
+            or parent_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        ):
+            raise ExternalReleaseEvidenceError(
+                "external evidence output parent changed before publication"
+            )
+        try:
+            os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ExternalReleaseEvidenceError(
+                "external evidence output target is no longer fresh"
+            )
+
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(temp_name, open_flags, 0o600, dir_fd=parent_fd)
+        temp_created = True
+        with os.fdopen(file_fd, "w", encoding="utf-8") as stream:
+            stream.write(_canonical_json(envelope.to_mapping()) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        _lstat_private_directory(output.parent, expected_identity=parent_identity)
+        os.link(
+            temp_name,
+            output.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        target_created = True
+        os.unlink(temp_name, dir_fd=parent_fd)
+        temp_created = False
+        os.fsync(parent_fd)
+        _lstat_private_directory(output.parent, expected_identity=parent_identity)
+    except ExternalReleaseEvidenceError:
+        raise
+    except OSError as error:
+        raise ExternalReleaseEvidenceError(
+            "external evidence output could not be published safely"
+        ) from error
+    finally:
+        if parent_fd is not None:
+            if target_created:
+                try:
+                    # Keep a successfully-published target unless the parent
+                    # path changed after publication; then it is not the path
+                    # the verifier approved.
+                    _lstat_private_directory(
+                        output.parent, expected_identity=parent_identity
+                    )
+                except ExternalReleaseEvidenceError:
+                    try:
+                        os.unlink(output.name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+            if temp_created:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            os.close(parent_fd)
+
+
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="parametric-self-release-evidence",
@@ -790,6 +903,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
 
 async def _run_cli(args: argparse.Namespace) -> ExternalReleaseEvidenceEnvelope:
+    # Validate all output invariants before loading the agent, preparing a
+    # candidate, or invoking the irreversible physical erasure.
+    output, output_parent_identity = _validate_cli_output(args.output)
     feature = await _load_kite_feature(args.feature_factory)
     identity = CatalogSigningIdentity(
         issuer_id=args.issuer_id,
@@ -816,13 +932,7 @@ async def _run_cli(args: argparse.Namespace) -> ExternalReleaseEvidenceEnvelope:
         except ExternalReleaseEvidenceError:
             pass
         raise
-    if not args.output.is_absolute() or args.output.exists():
-        raise ExternalReleaseEvidenceError(
-            "external evidence output must be a fresh absolute path"
-        )
-    _lstat_private_directory(args.output.parent)
-    envelope.write(args.output)
-    os.chmod(args.output, 0o600)
+    _write_cli_envelope_atomic(envelope, output, output_parent_identity)
     return envelope
 
 
