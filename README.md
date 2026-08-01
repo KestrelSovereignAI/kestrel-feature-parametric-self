@@ -30,7 +30,7 @@ The package registers `ParametricSelfFeature` through the
 
 The governed-corpus host surface is currently under development in core. Until
 the first core release containing [#2817](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/2817),
-this package source-pins the reviewed capability commit (`f1b94e0b8117d1b98f506db4bf664c4c8c5ddc32`) rather
+this package source-pins the reviewed capability commit (`43f6259ba76ca941ed5ce9c20c8706420f4f8391`) rather
 than falsely advertising PyPI 0.49.5 as compatible. The coordinated release
 must replace that pin with the published capability-bearing version.
 
@@ -86,7 +86,7 @@ eligibility are physically removed, while core retains only its blinded,
 identity-free erasure audit/tombstone shell for operation replay protection.
 
 The source and lockfile pin the published core evidence commit
-`f1b94e0b8117d1b98f506db4bf664c4c8c5ddc32`, so a normal clean `uv sync` can
+`43f6259ba76ca941ed5ce9c20c8706420f4f8391`, so a normal clean `uv sync` can
 install the exact contract implementation. Do not advance that pin to a local
 or otherwise unreachable Git SHA.
 
