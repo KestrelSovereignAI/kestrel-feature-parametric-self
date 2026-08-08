@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-parametric-self"
-version = "0.3.1"
+version = "0.4.0"
 description = "Owned parametric self for Kestrel Sovereign agents — a per-agent local model nightly-finetuned on the agent's own experience"
 readme = "README.md"
 license = "Apache-2.0"
@@ -12,27 +12,36 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    # The governed assertion-corpus capability is post-0.49.5 and has not yet
-    # been released to PyPI. Pin the reviewed core commit instead of claiming a
-    # released version provides it. Replace this source pin with the first
-    # released core version containing #2817 during the coordinated release.
-    # This is a hard safety contract: older hosts must not fall back to direct
-    # factual reads.
-    # #2834 supplies the immutable dual-backend served-adapter envelope,
-    # signed execution contract, and correlated erasure drill used below.
-    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git@797c0f8ba8c84a30f4762b943ac508c0e485d1c0",
+    # The governed assertion-corpus capability (#2817) and the immutable
+    # dual-backend served-adapter envelope (#2834/#2835) both ship in core
+    # 0.50.0, so the temporary git pin on the reviewed commit is now replaced by
+    # the released version it was waiting for — as its own note instructed. This
+    # is a hard safety contract: older hosts must not fall back to direct
+    # factual reads. A direct git reference also cannot be uploaded to PyPI, so
+    # this floor is a precondition of publishing at all.
+    "kestrel-sovereign>=0.50.0,<1",
     "kestrel-sovereign-sdk>=0.14.1,<1",
-    # The MLX LoRA trainer is Apple-Silicon only and imported lazily, so it is
-    # platform-gated: it installs on arm64 macOS and is simply absent elsewhere
-    # (LocalMLXAdapter.is_available() returns False, no blind fallback). This
-    # keeps Linux installs and CI green without a darwin-only wheel.
-    "mlx-lm>=0.31; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # NB: the MLX LoRA trainer's runtime (mlx-lm) is an OPTIONAL extra, not a
+    # hard dependency — see [project.optional-dependencies].local below.
     # NB: the corpus builder reads reflection's plaintext output tables directly
     # (loose coupling, no import), so kestrel-feature-reflection is an *optional*
     # runtime companion (see component.yaml), not a hard dependency.
 ]
 
 [project.optional-dependencies]
+# Local LoRA training runtime. Optional because the code already treats it as
+# optional: ``LocalMLXAdapter._mlx_available()`` swallows every import/init
+# failure and reports "trainer unavailable", and training is launched as a
+# SUBPROCESS (``sys.executable -m mlx_lm lora``) rather than imported. Declaring
+# it as a hard dependency made every host that merely loads this feature install
+# an Apple-Silicon ML stack — mlx, mlx-lm, mlx-metal, sentencepiece, and an
+# unconditional transformers — whether or not it ever trains.
+#
+# The platform marker is kept so ``[local]`` is a harmless no-op off arm64 macOS
+# rather than an install error.
+local = [
+    "mlx-lm>=0.31; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",

@@ -24,6 +24,12 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
       - uses: astral-sh/setup-uv@v3
       - run: uv python install ${{ env.PYTHON_VERSION }}
+      # `uv run` silently re-locks when pyproject has moved ahead of uv.lock, so
+      # a stale committed lock passes every other step in this job. Check it
+      # FIRST, or a dependency-contract change ships with a lockfile still
+      # describing the old contract to anyone installing with `--locked`.
+      - name: Lockfile is in sync with pyproject
+        run: uv lock --check
       - run: uv run --extra test pytest -q
       - run: uv build
       - name: Validate entry point

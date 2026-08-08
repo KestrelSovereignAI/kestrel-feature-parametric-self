@@ -352,18 +352,87 @@ async def test_real_core_mappingproxy_capability_versions_are_accepted(tmp_path)
     assert feature._snapshot_pin_problem(manifest, snapshot, require_exact_snapshot=True) is None
 
 
-def test_governed_core_dependency_is_source_pinned_and_exposes_its_contract():
-    """Never resolve a released pre-capability core under a compatible-looking floor."""
+def test_mlx_runtime_is_an_optional_extra_not_a_hard_dependency():
+    """The trainer runtime must stay opt-in.
+
+    ``LocalMLXAdapter`` is written to work without it: ``_mlx_available()``
+    swallows every import/init failure and reports "trainer unavailable", and
+    training is launched as a subprocess (``sys.executable -m mlx_lm lora``)
+    rather than imported. Declaring ``mlx-lm`` as a hard dependency therefore
+    stated a requirement the code does not have, and made every host that merely
+    *loads* this feature install an Apple-Silicon ML stack — mlx, mlx-lm,
+    mlx-metal, sentencepiece, and an unconditional transformers.
+
+    Hosts that do train install ``kestrel-feature-parametric-self[local]``.
+    """
+    import tomllib
+
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text())
+
+    hard_deps = " ".join(data["project"]["dependencies"])
+    assert "mlx" not in hard_deps, f"mlx must not be a hard dependency: {hard_deps}"
+
+    local_extra = " ".join(data["project"]["optional-dependencies"]["local"])
+    assert "mlx-lm" in local_extra
+    # Keep the platform marker so `[local]` is a no-op off arm64 macOS rather
+    # than an install error.
+    assert "sys_platform" in local_extra and "arm64" in local_extra
+
+
+def test_trainer_unavailable_message_names_an_extra_that_exists():
+    """Remediation must be followable.
+
+    ``TrainerUnavailableError`` tells the operator what to install. Before this
+    release it named an ``'mlx-lm' extra`` that never existed — following it got
+    you no trainer and no error explaining why. A message that names a
+    non-existent extra is worse than no message: it costs the reader a round
+    trip to discover it was wrong.
+    """
+    import re
+    import tomllib
+
+    from kestrel_feature_parametric_self import local_mlx_adapter
+
+    source = Path(local_mlx_adapter.__file__).read_text(encoding="utf-8")
+    named = set(re.findall(r"kestrel-feature-parametric-self\[([a-z0-9_,-]+)\]", source))
+    assert named, "the unavailable message must tell the operator what to install"
+
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    declared = set(tomllib.loads(pyproject.read_text())["project"]["optional-dependencies"])
+    for group in named:
+        for extra in group.split(","):
+            assert extra in declared, f"message points at a non-existent extra: {extra!r}"
+
+
+def test_governed_core_dependency_floor_is_the_first_released_capability_version():
+    """Never resolve a released pre-capability core under a compatible-looking floor.
+
+    The governed assertion corpus (#2817) and the immutable dual-backend
+    served-adapter envelope (#2834/#2835) first ship in core **0.50.0**. Any
+    floor below that can resolve a core without them, and the feature would fall
+    back to direct factual reads — the exact safety contract this guards.
+    ``>=0.49.5`` was the tempting wrong answer.
+
+    Until 0.50.0 existed this was enforced with a git pin on the reviewed
+    commit. That pin is gone because a direct reference cannot be uploaded to
+    PyPI — it made the package unpublishable. The released floor buys the same
+    guarantee and can ship.
+    """
     from kestrel_sovereign.knowledge import GovernedCorpusPolicy, GovernedCorpusSnapshot
     from kestrel_sovereign.storage.async_storage import AsyncStorage
 
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     requirements = pyproject.read_text()
-    assert (
-        "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/"
-        "kestrel-sovereign.git@797c0f8ba8c84a30f4762b943ac508c0e485d1c0"
-    ) in requirements
-    assert "kestrel-sovereign>=0.49.5" not in requirements
+
+    assert "kestrel-sovereign>=0.50.0,<1" in requirements
+    # A direct reference is unpublishable; never reintroduce one.
+    assert "git+https" not in requirements
+    # No floor below the first version that actually carries the capability.
+    for pre_capability in ("kestrel-sovereign>=0.48", "kestrel-sovereign>=0.49"):
+        assert pre_capability not in requirements, pre_capability
+
+    # ...and the core actually resolved here exposes the contract.
     assert GovernedCorpusPolicy is not None
     assert GovernedCorpusSnapshot is not None
     assert callable(getattr(AsyncStorage, "governed_assertion_corpus_snapshot", None))
