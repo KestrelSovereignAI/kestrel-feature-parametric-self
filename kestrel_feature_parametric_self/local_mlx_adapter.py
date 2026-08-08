@@ -130,7 +130,9 @@ class LocalMLXAdapter:
         if not self.is_available():
             raise TrainerUnavailableError(
                 "Local MLX training requires Apple Silicon (arm64 macOS) with "
-                "the 'mlx-lm' extra installed; this host cannot run it."
+                "the trainer runtime installed: "
+                "pip install 'kestrel-feature-parametric-self[local]'. "
+                "This host cannot run it."
             )
 
         argv = build_lora_argv(config)  # validates config before we spawn

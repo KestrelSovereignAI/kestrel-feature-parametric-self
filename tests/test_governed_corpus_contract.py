@@ -380,6 +380,31 @@ def test_mlx_runtime_is_an_optional_extra_not_a_hard_dependency():
     assert "sys_platform" in local_extra and "arm64" in local_extra
 
 
+def test_trainer_unavailable_message_names_an_extra_that_exists():
+    """Remediation must be followable.
+
+    ``TrainerUnavailableError`` tells the operator what to install. Before this
+    release it named an ``'mlx-lm' extra`` that never existed — following it got
+    you no trainer and no error explaining why. A message that names a
+    non-existent extra is worse than no message: it costs the reader a round
+    trip to discover it was wrong.
+    """
+    import re
+    import tomllib
+
+    from kestrel_feature_parametric_self import local_mlx_adapter
+
+    source = Path(local_mlx_adapter.__file__).read_text(encoding="utf-8")
+    named = set(re.findall(r"kestrel-feature-parametric-self\[([a-z0-9_,-]+)\]", source))
+    assert named, "the unavailable message must tell the operator what to install"
+
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    declared = set(tomllib.loads(pyproject.read_text())["project"]["optional-dependencies"])
+    for group in named:
+        for extra in group.split(","):
+            assert extra in declared, f"message points at a non-existent extra: {extra!r}"
+
+
 def test_governed_core_dependency_floor_is_the_first_released_capability_version():
     """Never resolve a released pre-capability core under a compatible-looking floor.
 

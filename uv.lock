@@ -1458,15 +1458,17 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-parametric-self"
-version = "0.3.1"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "kestrel-sovereign" },
     { name = "kestrel-sovereign-sdk" },
-    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
 ]
 
 [package.optional-dependencies]
+local = [
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+]
 test = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1475,14 +1477,14 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "kestrel-sovereign", git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=797c0f8ba8c84a30f4762b943ac508c0e485d1c0" },
+    { name = "kestrel-sovereign", specifier = ">=0.50.0,<1" },
     { name = "kestrel-sovereign-sdk", specifier = ">=0.14.1,<1" },
-    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31" },
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'local'", specifier = ">=0.31" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=1.1.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.3.1" },
 ]
-provides-extras = ["test"]
+provides-extras = ["local", "test"]
 
 [[package]]
 name = "kestrel-llm-bedrock"
@@ -1593,8 +1595,8 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.49.5"
-source = { git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git?rev=797c0f8ba8c84a30f4762b943ac508c0e485d1c0#797c0f8ba8c84a30f4762b943ac508c0e485d1c0" }
+version = "0.50.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
@@ -1656,17 +1658,21 @@ dependencies = [
     { name = "urllib3" },
     { name = "uvicorn" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/fa/66/a99a5f58da9c695a98b9f64302b6f74e736c2354e6306460e18144eb5711/kestrel_sovereign-0.50.0.tar.gz", hash = "sha256:67329371b7f8d8569ae7857c01056e153a061ec6acb6ec54cfb63c4d9606ee89", size = 4279738, upload-time = "2026-08-04T20:22:06.856Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/74/e1f35b04d80d7e3936ddb724e9597ea490df46fa298b7d77b6b3d66976e2/kestrel_sovereign-0.50.0-py3-none-any.whl", hash = "sha256:6d78f14a67289a7d51809a1db886c741dbf12ba3afc4b5559c13e98244907d5a", size = 4751771, upload-time = "2026-08-04T20:22:04.387Z" },
+]
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.32.0"
+version = "0.35.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/be/4e/0209a82261a8a1daf042035d1d565b7e2684040f5758e34cae40c803ede9/kestrel_sovereign_sdk-0.32.0.tar.gz", hash = "sha256:24b7fa79e66fa85f8d0fe4bb55c6ffb90a3c255ac81e4a052c83ca111c691cfc", size = 141727, upload-time = "2026-07-25T14:40:40.445Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/44/c0421c4ddc6ce98987c1782c89e6eefb6d69c8667cfee0c88e3abb334070/kestrel_sovereign_sdk-0.35.0.tar.gz", hash = "sha256:1f788af721ef7bddf894ea3fee95b68e874c31a55ec9694eb0ab6b03a87ced23", size = 155027, upload-time = "2026-08-04T12:59:03.181Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/43/1c6db3b73a9313982a882309589b5599f6f683cf44e89b01d7fbe852140e/kestrel_sovereign_sdk-0.32.0-py3-none-any.whl", hash = "sha256:ca8ecef0b9e0760f4f0b771bd89964bf0f3defba48ae56f79d6a3016f7ef7312", size = 174115, upload-time = "2026-07-25T14:40:38.976Z" },
+    { url = "https://files.pythonhosted.org/packages/63/ca/4cf655f246ce7a7b7135234ef41d695d49e0e54aa53807cf132b54dc82ae/kestrel_sovereign_sdk-0.35.0-py3-none-any.whl", hash = "sha256:009843b9df55dc8ee5372f5c7f6112ea01d66b4d7acbe7bbf5bb29cbd09781f6", size = 186833, upload-time = "2026-08-04T12:59:01.921Z" },
 ]
 
 [package.optional-dependencies]
