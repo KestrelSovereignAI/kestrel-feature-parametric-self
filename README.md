@@ -49,6 +49,17 @@ revision, missing manifest, or unverifiable host capability quarantines the
 affected candidate or served adapter until it is rebuilt. This is intentionally
 a visible no-op rather than a fallback to ungoverned factual training.
 
+## Inference use
+
+`inference_use` decides whether an adapter may influence a live turn. One
+switch covers in-loop serving, oracle consultation and conditioning. `"off"`
+is the only value until one of those routes exists, and anything else is
+refused. `parametric-self-status` reports it, together with
+`adapter_reaches_inference`. While it is off, a promoted, adopted or
+rolled-back adapter is a training record only. Any future route must take its
+adapter from `ParametricSelfFeature.adapter_for_inference()`, which returns
+nothing while the switch is off.
+
 ## Semantic release erasure evidence
 
 The #2753 external-adapter drill is available through
