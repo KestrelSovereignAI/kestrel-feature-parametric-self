@@ -68,8 +68,11 @@ config:
   # Required before a run can use factual examples. The operator supplies an
   # explicit GovernedCorpusPolicy; missing/failed semantic maintenance skips.
   governed_corpus_policy: null
-  # In-loop integration is path-first; promotion to always-on prior is gated.
-  in_loop: false
+  # Whether an adapter may influence a live turn: in-loop serving, oracle
+  # consultation and conditioning, one switch for all three. "off" is the only
+  # value until one of those routes exists (inference_use.py). Read from the
+  # feature's persisted config at load and reported by parametric-self-status.
+  inference_use: "off"
 
 # Tags for discovery
 tags:

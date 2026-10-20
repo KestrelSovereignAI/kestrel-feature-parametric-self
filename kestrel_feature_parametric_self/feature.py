@@ -32,6 +32,7 @@ from kestrel_sdk.tools.result import ToolResult
 
 from .cycle import TrainingShutdownIncomplete, TrainingStillActive, run_nightly_cycle
 from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
+from .inference_use import InferenceUse, parse_inference_use
 from .local_mlx_adapter import LocalMLXAdapter
 from .text_types import TextLoRAConfig
 
@@ -136,6 +137,11 @@ class ParametricSelfFeature(Feature):
         # the immutable candidate-side manifest.
         self._adapter_lineage: Dict[str, Dict[str, Any]] = {}
         self._quarantined_adapters: Dict[str, str] = {}
+        # Whether an adapter may influence a live turn. Off is the only value
+        # this release has; see inference_use.py. A persisted value that fails
+        # to parse leaves the switch off and is reported, never adopted.
+        self._inference_use = InferenceUse.OFF
+        self._inference_use_rejected: Optional[str] = None
         # Optional overrides (tests / non-standard layouts); else resolved from agent.
         self._db_path: Optional[str] = None
         self._work_dir: Optional[str] = None
@@ -192,9 +198,20 @@ class ParametricSelfFeature(Feature):
             "base_model": self._base_config.base_model,
             "active_adapter_path": self._active_adapter_path,
             "governed_corpus_policy": self._policy_mapping(),
+            "inference_use": self._inference_use.value,
         }
 
     async def set_config(self, config: Dict[str, Any]) -> None:
+        # Validated before anything is applied, so a refused value leaves the
+        # rest of the request unapplied too.
+        inference_use = (
+            parse_inference_use(config["inference_use"])
+            if "inference_use" in config
+            else None
+        )
+        if inference_use is not None:
+            self._inference_use = inference_use
+            self._inference_use_rejected = None
         prior_policy_digest = getattr(self._governed_corpus_policy, "digest", None)
         if "enable_nightly_training" in config:
             self._training_enabled = bool(config["enable_nightly_training"])
@@ -289,6 +306,7 @@ class ParametricSelfFeature(Feature):
             "governed_corpus_policy": self._policy_mapping(),
             "adapter_lineage": self._adapter_lineage,
             "quarantined_adapters": self._quarantined_adapters,
+            "inference_use": self._inference_use.value,
         }
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -339,6 +357,15 @@ class ParametricSelfFeature(Feature):
                     str(path): str(reason)
                     for path, reason in cfg["quarantined_adapters"].items()
                 }
+            if "inference_use" in cfg:
+                try:
+                    self._inference_use = parse_inference_use(cfg["inference_use"])
+                except ValueError as exc:
+                    # Stays off. Reported in status so the refusal is visible,
+                    # rather than the stored value being silently dropped.
+                    self._inference_use = InferenceUse.OFF
+                    self._inference_use_rejected = str(exc)
+                    logger.error("parametric-self: persisted %s", exc)
         except Exception as e:
             logger.warning("Failed to restore parametric-self config (ignored): %s", e)
 
@@ -381,12 +408,24 @@ class ParametricSelfFeature(Feature):
                 self._shutdown_recovery_requires_external_confirmation
             ),
             "legacy_corpus_cleanup_needed": legacy_cleanup_needed,
+            "inference_use": self._inference_use.value,
+            "adapter_reaches_inference": self.adapter_for_inference() is not None,
+            "inference_use_rejected": self._inference_use_rejected,
         }
         confirmation = (
             "Parametric-self "
             + ("ENABLED" if self._training_enabled else "disabled")
             + f"; trainer {'available' if data['trainer_available'] else 'unavailable on this host'}."
+            + f" Inference use: {self._inference_use.value}"
+            + (
+                "; no adapter reaches a live turn (a served adapter is a training "
+                "record only)."
+                if not data["adapter_reaches_inference"]
+                else "."
+            )
         )
+        if self._inference_use_rejected:
+            confirmation += f" WARNING: persisted {self._inference_use_rejected}"
         if active_run:
             confirmation += (
                 f" A {active_run['trigger']} training run is in progress"
@@ -411,6 +450,28 @@ class ParametricSelfFeature(Feature):
                 "`!parametric-self-adopt`."
             )
         return ToolResult.ok(confirmation=confirmation, data=data)
+
+    def adapter_for_inference(self) -> Optional[str]:
+        """The adapter a live turn may use, or ``None``. The only such accessor.
+
+        Any in-loop, oracle or conditioning route must get its adapter here
+        and nowhere else (not from ``_active_adapter_path``, which training,
+        adopt and rollback maintain as a training record). While
+        ``inference_use`` is ``off``, which is the only value this release
+        has, it returns ``None`` whatever is served.
+        """
+        if self._inference_use is InferenceUse.OFF:
+            return None
+        raise AssertionError(f"unhandled inference_use {self._inference_use!r}")
+
+    def _inert_note(self) -> str:
+        """What a served-pointer change means while no adapter reaches a turn."""
+        if self.adapter_for_inference() is None:
+            return (
+                f" Inert: inference_use is {self._inference_use.value}, so this "
+                "adapter does not reach a live turn."
+            )
+        return ""
 
     def _active_run_progress(self) -> Optional[Dict[str, Any]]:
         """The in-flight run record enriched with live progress, or None if idle.
@@ -1358,8 +1419,15 @@ class ParametricSelfFeature(Feature):
                 "adapter_path": target_path,
             })
             return ToolResult.ok(
-                confirmation=f"Served adapter rolled back to {Path(target_path).name} (val_loss={val_loss}).",
-                data={"served_adapter": target_path, "served_val_loss": val_loss},
+                confirmation=(
+                    f"Served adapter rolled back to {Path(target_path).name} "
+                    f"(val_loss={val_loss}).{self._inert_note()}"
+                ),
+                data={
+                    "served_adapter": target_path,
+                    "served_val_loss": val_loss,
+                    "reaches_inference": self.adapter_for_inference() is not None,
+                },
             )
         finally:
             self._cycle_in_flight = False
@@ -1454,8 +1522,15 @@ class ParametricSelfFeature(Feature):
                 "adapter_path": target_path,
             })
             return ToolResult.ok(
-                confirmation=f"Adopted adapter {adapter_id} as served (val_loss={val_loss}).",
-                data={"served_adapter": target_path, "served_val_loss": val_loss},
+                confirmation=(
+                    f"Adopted adapter {adapter_id} as served "
+                    f"(val_loss={val_loss}).{self._inert_note()}"
+                ),
+                data={
+                    "served_adapter": target_path,
+                    "served_val_loss": val_loss,
+                    "reaches_inference": self.adapter_for_inference() is not None,
+                },
             )
         finally:
             self._cycle_in_flight = False
@@ -1759,6 +1834,9 @@ class ParametricSelfFeature(Feature):
             "corpus_valid": result.corpus_valid,
             "corpus_manifest_hash": result.corpus_manifest_hash,
             "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
+            # A promotion moves the training record; it reaches no turn unless
+            # the switch says so.
+            "reaches_inference": self.adapter_for_inference() is not None,
         }
         await self._update_run_history(run_id, {
             "state": "completed",
