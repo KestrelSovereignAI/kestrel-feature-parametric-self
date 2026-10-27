@@ -30,8 +30,24 @@ from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from .cycle import TrainingShutdownIncomplete, TrainingStillActive, run_nightly_cycle
-from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
+from .cycle import (
+    CycleResult,
+    ServedAdapter,
+    TrainingShutdownIncomplete,
+    TrainingStillActive,
+    run_nightly_cycle,
+)
+from .fidelity import (
+    BASE_SOURCE,
+    DECIDED_OUTCOMES,
+    FINAL_ADAPTER_FILE,
+    Baseline,
+    FidelityGate,
+    is_usable_loss,
+    parse_final_val_loss,
+    parse_latest_iter,
+    recorded_inputs,
+)
 from .inference_use import InferenceUse, parse_inference_use
 from .local_mlx_adapter import LocalMLXAdapter
 from .text_types import TextLoRAConfig
@@ -40,6 +56,10 @@ logger = logging.getLogger(__name__)
 
 # How many recent run-history entries to retain (append-only, capped).
 _RUN_HISTORY_LIMIT = 50
+
+
+class RunHistoryUnavailable(RuntimeError):
+    """A run-history write that must be durable could not be made."""
 
 
 def _utc_now_iso() -> str:
@@ -117,10 +137,21 @@ class ParametricSelfFeature(Feature):
         """Initialize the parametric-self feature (training off by default)."""
         self._adapter = LocalMLXAdapter()           # lazy MLX; inert off Apple Silicon
         self._gate = FidelityGate()                 # held-out promotion check
+        # A persisted gate config that fails validation leaves the pinned
+        # defaults in force and is reported, never adopted.
+        self._gate_config_rejected: Optional[str] = None
         self._training_enabled = False              # per-agent gate; default OFF
         self._base_config = TextLoRAConfig()        # base hyperparameters
         self._active_adapter_path: Optional[str] = None   # currently served adapter
-        self._last_val_loss: Optional[float] = None        # served adapter's fidelity
+        # The served adapter's promoted checkpoint (a weights file in its dir).
+        self._active_checkpoint_id: Optional[str] = None
+        # The served checkpoint's val loss when it was promoted. Display only:
+        # the gate scores its baseline afresh on every run's validation set.
+        self._last_val_loss: Optional[float] = None
+        # This process's most recent fidelity-gate attempt: its record and
+        # whether that record was persisted. Status health comes from it, since
+        # a failed record write may leave no trace of the attempt in history.
+        self._last_gate_attempt: Optional[Dict[str, Any]] = None
         # The feature never infers a permissive training policy.  An operator or
         # host must supply this explicit governed-corpus release policy.
         self._governed_corpus_policy = None
@@ -197,8 +228,10 @@ class ParametricSelfFeature(Feature):
             "enable_nightly_training": self._training_enabled,
             "base_model": self._base_config.base_model,
             "active_adapter_path": self._active_adapter_path,
+            "active_checkpoint_id": self._active_checkpoint_id,
             "governed_corpus_policy": self._policy_mapping(),
             "inference_use": self._inference_use.value,
+            "gate": self._gate.to_config(),
         }
 
     async def set_config(self, config: Dict[str, Any]) -> None:
@@ -209,9 +242,17 @@ class ParametricSelfFeature(Feature):
             if "inference_use" in config
             else None
         )
+        gate = (
+            FidelityGate.from_config(config["gate"], base=self._gate)
+            if "gate" in config
+            else None
+        )
         if inference_use is not None:
             self._inference_use = inference_use
             self._inference_use_rejected = None
+        if gate is not None:
+            self._gate = gate
+            self._gate_config_rejected = None
         prior_policy_digest = getattr(self._governed_corpus_policy, "digest", None)
         if "enable_nightly_training" in config:
             self._training_enabled = bool(config["enable_nightly_training"])
@@ -299,14 +340,16 @@ class ParametricSelfFeature(Feature):
             "enable_nightly_training": self._training_enabled,
             "base_model": self._base_config.base_model,
             # Served-adapter state must persist too: the status tool needs the
-            # pointer after restart, and the fidelity gate needs prior_val_loss
-            # as its anti-regression baseline (it's lost across restarts otherwise).
+            # pointer after restart, and the fidelity gate scores the served
+            # checkpoint as its baseline (it's lost across restarts otherwise).
             "active_adapter_path": self._active_adapter_path,
+            "active_checkpoint_id": self._active_checkpoint_id,
             "last_val_loss": self._last_val_loss,
             "governed_corpus_policy": self._policy_mapping(),
             "adapter_lineage": self._adapter_lineage,
             "quarantined_adapters": self._quarantined_adapters,
             "inference_use": self._inference_use.value,
+            "gate": self._gate.to_config(),
         }
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
@@ -340,10 +383,17 @@ class ParametricSelfFeature(Feature):
             self._training_enabled = bool(cfg.get("enable_nightly_training", self._training_enabled))
             if cfg.get("base_model"):
                 self._base_config.base_model = str(cfg["base_model"])
-            # Restore served-adapter state so status + the regression gate
-            # survive a restart.
+            # Restore served-adapter state so status + the gate's served
+            # baseline survive a restart.
             if cfg.get("active_adapter_path") is not None:
                 self._active_adapter_path = str(cfg["active_adapter_path"])
+                checkpoint_id = cfg.get("active_checkpoint_id")
+                # A pointer persisted before checkpoint-aware promotion served
+                # the run's final weights, which is what the dir's
+                # adapters.safetensors still holds.
+                self._active_checkpoint_id = (
+                    str(checkpoint_id) if checkpoint_id is not None else FINAL_ADAPTER_FILE
+                )
             if cfg.get("last_val_loss") is not None:
                 self._last_val_loss = float(cfg["last_val_loss"])
             if "governed_corpus_policy" in cfg:
@@ -366,6 +416,15 @@ class ParametricSelfFeature(Feature):
                     self._inference_use = InferenceUse.OFF
                     self._inference_use_rejected = str(exc)
                     logger.error("parametric-self: persisted %s", exc)
+            if "gate" in cfg:
+                try:
+                    self._gate = FidelityGate.from_config(cfg["gate"])
+                except ValueError as exc:
+                    # The pinned defaults stay in force; status reports the
+                    # refusal so a weakened gate is never silently adopted.
+                    self._gate = FidelityGate()
+                    self._gate_config_rejected = str(exc)
+                    logger.error("parametric-self: persisted gate config refused: %s", exc)
         except Exception as e:
             logger.warning("Failed to restore parametric-self config (ignored): %s", e)
 
@@ -395,11 +454,25 @@ class ParametricSelfFeature(Feature):
         )
         active_run = self._active_run_progress()
         legacy_cleanup_needed = self._legacy_corpus_cleanup_needed()
+        attempt = await self._latest_gate_attempt()
+        last_gate = attempt["record"] if attempt is not None else None
+        last_gate_persisted = attempt["persisted"] if attempt is not None else None
+        # Health is the latest gate attempt's alone: healthy only when it
+        # decided its run and that decision is on record. No attempt, an
+        # inconclusive one, or one whose record never landed is not healthy,
+        # whatever an earlier run decided.
+        gate_healthy = (
+            last_gate_persisted is True
+            and last_gate is not None
+            and last_gate.get("decision") in DECIDED_OUTCOMES
+        )
+        last_recorded_gate = await self._last_gate_record()
         data = {
             "training_enabled": self._training_enabled,
             "trainer_available": self._adapter.is_available(),
             "base_model": self._base_config.base_model,
             "served_adapter": self._active_adapter_path,
+            "served_checkpoint": self._active_checkpoint_id,
             "served_val_loss": self._last_val_loss,
             "recoverable_adapters": recoverable,
             "active_run": active_run,
@@ -411,6 +484,15 @@ class ParametricSelfFeature(Feature):
             "inference_use": self._inference_use.value,
             "adapter_reaches_inference": self.adapter_for_inference() is not None,
             "inference_use_rejected": self._inference_use_rejected,
+            "fidelity_gate": {
+                **self._gate.to_config(),
+                "config_rejected": self._gate_config_rejected,
+                "last_decision": last_gate,
+                "last_decision_persisted": last_gate_persisted,
+                # History only: an earlier decision never makes a newer attempt healthy.
+                "last_recorded_decision": last_recorded_gate,
+                "healthy": gate_healthy,
+            },
         }
         confirmation = (
             "Parametric-self "
@@ -426,6 +508,36 @@ class ParametricSelfFeature(Feature):
         )
         if self._inference_use_rejected:
             confirmation += f" WARNING: persisted {self._inference_use_rejected}"
+        if attempt is None:
+            confirmation += " Fidelity gate: no decision recorded yet, so not healthy."
+        elif not last_gate_persisted:
+            decided = (
+                f"{last_gate.get('decision')} ({last_gate.get('reason')})"
+                if last_gate is not None else "unknown"
+            )
+            confirmation += (
+                f" WARNING: the last fidelity-gate decision, {decided}, could not be recorded; "
+                "promotion is blocked and the gate is not healthy."
+            )
+            if last_recorded_gate is not None:
+                confirmation += (
+                    f" The last recorded decision was {last_recorded_gate.get('decision')} "
+                    f"({last_recorded_gate.get('reason')})."
+                )
+        elif not gate_healthy:
+            confirmation += (
+                f" WARNING: the last fidelity-gate decision was {last_gate.get('decision')} "
+                f"({last_gate.get('reason')}); promotion is blocked and the gate is not healthy."
+            )
+        else:
+            confirmation += (
+                f" Last fidelity-gate decision: {last_gate.get('decision')} ({last_gate.get('reason')})."
+            )
+        if self._gate_config_rejected:
+            confirmation += (
+                f" WARNING: persisted gate config refused ({self._gate_config_rejected}); "
+                "pinned defaults in force."
+            )
         if active_run:
             confirmation += (
                 f" A {active_run['trigger']} training run is in progress"
@@ -625,6 +737,7 @@ class ParametricSelfFeature(Feature):
         self._quarantined_adapters[path] = reason
         if self._active_adapter_path == path:
             self._active_adapter_path = None
+            self._active_checkpoint_id = None
             self._last_val_loss = None
         lineage = self._adapter_lineage.setdefault(path, {})
         lineage["state"] = "invalid"
@@ -978,7 +1091,7 @@ class ParametricSelfFeature(Feature):
 
     @tool(
         name="parametric-self-history",
-        description="List recent parametric-self training runs (timestamp, trigger, corpus size, val_loss, promoted, reason)",
+        description="List recent parametric-self training runs (timestamp, trigger, corpus size, val_loss, promoted, fidelity-gate comparison, reason)",
         category=ToolCategory.SYSTEM,
         command_prefix="!parametric-self-history",
     )
@@ -999,10 +1112,18 @@ class ParametricSelfFeature(Feature):
         for r in recent[:10]:
             # Older entries predate the state field; default to a terminal label.
             state = r.get("state", "completed")
+            gate = r.get("gate")
+            comparison = (
+                f" gate={gate.get('decision')}/{gate.get('reason')}"
+                f" best={gate.get('best_checkpoint_id')}@{gate.get('best_val_loss')}"
+                f" final={gate.get('final_checkpoint_id')}@{gate.get('final_val_loss')}"
+                f" baseline={gate.get('baseline_source')}@{gate.get('baseline_val_loss')}"
+                if isinstance(gate, dict) else ""
+            )
             lines.append(
                 f"  {r.get('timestamp', '?')} [{r.get('trigger', '?')}] "
                 f"state={state} trained={r.get('trained')} promoted={r.get('promoted')} "
-                f"val_loss={r.get('val_loss')} corpus={r.get('corpus_train')} "
+                f"val_loss={r.get('val_loss')} corpus={r.get('corpus_train')}{comparison} "
                 f"— {r.get('reason', '')}".rstrip()
             )
         return ToolResult.ok(confirmation="\n".join(lines), data={"runs": recent})
@@ -1382,51 +1503,66 @@ class ParametricSelfFeature(Feature):
                         "Pass an adapter_id from `!parametric-self-adapters`."
                     )
 
-            # Re-read the target's val_loss so the regression baseline tracks the
-            # adapter we are now serving. Refuse to serve an adapter without a
-            # parseable validation loss: serving it would bypass the fidelity
-            # guarantee and leave the anti-regression gate with no baseline.
-            val_loss: Optional[float] = None
-            log = Path(target_path) / "train.log"
-            if log.is_file():
-                try:
-                    val_loss = parse_final_val_loss(log.read_text())
-                except Exception:
-                    val_loss = None
+            name = Path(target_path).name
+            quarantined = self._quarantined_adapters.get(target_path)
+            if quarantined:
+                # Quarantine holds until a clean rebuild.
+                return ToolResult.failed(f"Adapter '{name}' is quarantined: {quarantined}.")
+            # Roll back to exactly the checkpoint that was promoted, never to
+            # whatever weights the run happened to end on.
+            promotion = await self._promotion(target_path)
+            if promotion is None:
+                return ToolResult.failed(
+                    f"Adapter '{name}' was never promoted, so there is nothing to roll back to; "
+                    "`!parametric-self-adopt` runs the fidelity gate on a candidate."
+                )
+            checkpoint_id, val_loss = promotion
+            if not (Path(target_path) / checkpoint_id).is_file():
+                return ToolResult.failed(
+                    f"Adapter '{name}' checkpoint {checkpoint_id} is no longer on disk; "
+                    "refusing to serve it."
+                )
+            # Refuse to serve a checkpoint with no usable promoted score:
+            # serving it would bypass the fidelity guarantee.
             if val_loss is None:
                 return ToolResult.failed(
-                    f"Adapter '{Path(target_path).name}' has no parseable validation loss "
-                    "(incomplete/failed run); refusing to serve it."
+                    f"Adapter '{name}' has no recorded validation loss for checkpoint "
+                    f"{checkpoint_id} (incomplete/failed run); refusing to serve it."
                 )
 
             lineage_problem = await self._verify_adapter_lineage(target_path)
             if lineage_problem:
                 return ToolResult.failed(
-                    f"Adapter '{Path(target_path).name}' is quarantined: {lineage_problem}."
+                    f"Adapter '{name}' is quarantined: {lineage_problem}."
                 )
 
             self._active_adapter_path = target_path
+            self._active_checkpoint_id = checkpoint_id
             self._last_val_loss = val_loss
             await self._persist_config()
+            reaches_inference = self.adapter_for_inference() is not None
             await self._append_run_history({
                 "timestamp": _utc_now_iso(),
                 "trigger": "rollback",
                 "trained": False,
                 "promoted": False,
                 "val_loss": val_loss,
-                "reason": f"rolled back served adapter to {Path(target_path).name}",
+                "checkpoint_id": checkpoint_id,
+                "reason": f"rolled back served adapter to {name} ({checkpoint_id})",
                 "corpus_train": 0,
                 "adapter_path": target_path,
+                "reaches_inference_at_promotion": reaches_inference,
             })
             return ToolResult.ok(
                 confirmation=(
-                    f"Served adapter rolled back to {Path(target_path).name} "
+                    f"Served adapter rolled back to {name} checkpoint {checkpoint_id} "
                     f"(val_loss={val_loss}).{self._inert_note()}"
                 ),
                 data={
                     "served_adapter": target_path,
+                    "served_checkpoint": checkpoint_id,
                     "served_val_loss": val_loss,
-                    "reaches_inference": self.adapter_for_inference() is not None,
+                    "reaches_inference": reaches_inference,
                 },
             )
         finally:
@@ -1445,8 +1581,9 @@ class ParametricSelfFeature(Feature):
         run left a valid candidate on disk but no served-adapter pointer/history
         (e.g. a legacy/interrupted run). Unlike rollback — which reverts to a
         *previously promoted* adapter — adopt fronts a candidate for the first
-        time, evaluating the same fidelity gate against the current baseline and
-        recording an ``adopt`` history entry.
+        time. Its validation set is gone, so it re-takes the fidelity gate on
+        the scores the candidate's own training run recorded, and records the
+        decision in an ``adopt`` history entry before anything is served.
         """
         gate = self._require_sovereign_class()
         if gate is not None:
@@ -1479,19 +1616,32 @@ class ParametricSelfFeature(Feature):
                 return ToolResult.failed(f"No candidate adapter '{adapter_id}' on disk.")
             target_path = str(target)
 
-            # Require a parseable validation loss: serving an adapter without one
-            # bypasses the fidelity guarantee and leaves the gate with no baseline.
-            val_loss: Optional[float] = None
-            log = target / "train.log"
-            if log.is_file():
-                try:
-                    val_loss = parse_final_val_loss(log.read_text())
-                except Exception:
-                    val_loss = None
-            if val_loss is None:
+            quarantined = self._quarantined_adapters.get(target_path)
+            if quarantined:
+                # Quarantine holds until a clean rebuild: a quarantined
+                # candidate is neither re-verified nor re-scored here.
+                return ToolResult.failed(f"Adapter '{adapter_id}' is quarantined: {quarantined}.")
+
+            # The only scores of these checkpoint files are the ones their
+            # training run measured on its validation set. With no such record
+            # the gate gets nothing to compare and is inconclusive.
+            record = await self._training_gate_record(target_path)
+            try:
+                checkpoints, recorded_baseline, val_set = (
+                    recorded_inputs(record) if record is not None else ((), None, None)
+                )
+            except ValueError as exc:
                 return ToolResult.failed(
-                    f"Adapter '{adapter_id}' has no parseable validation loss "
-                    "(incomplete/failed run); refusing to serve it."
+                    f"Adapter '{adapter_id}' has a malformed fidelity-gate record ({exc}); "
+                    "refusing to serve it."
+                )
+            missing = next(
+                (c.checkpoint_id for c in checkpoints if not (target / c.checkpoint_id).is_file()), None,
+            )
+            if missing is not None:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' checkpoint {missing} is no longer on disk; "
+                    "refusing to serve it."
                 )
 
             lineage_problem = await self._verify_adapter_lineage(target_path)
@@ -1500,40 +1650,200 @@ class ParametricSelfFeature(Feature):
                     f"Adapter '{adapter_id}' is quarantined: {lineage_problem}."
                 )
 
-            # Same fidelity gate as a nightly promotion, against the current
-            # baseline (``prior_val_loss`` is None in the first-adoption case).
-            decision = self._gate.evaluate(val_loss, prior_val_loss=self._last_val_loss)
-            if not decision.promote:
-                return ToolResult.failed(
-                    f"Adapter '{adapter_id}' fails the fidelity gate: {decision.reason}."
-                )
-
-            self._active_adapter_path = target_path
-            self._last_val_loss = val_loss
-            await self._persist_config()
-            await self._append_run_history({
+            decision = self._gate.evaluate(
+                checkpoints=checkpoints,
+                baseline=self._adoption_baseline(recorded_baseline),
+                val_set=val_set,
+            )
+            best_loss = decision.best.val_loss if decision.best is not None else None
+            run_id = uuid.uuid4().hex[:12]
+            recorded = await self._persist_gate_record(run_id, decision.to_record(), new_entry={
                 "timestamp": _utc_now_iso(),
                 "trigger": "adopt",
+                "state": "completed",
                 "trained": False,
-                "promoted": True,
-                "val_loss": val_loss,
-                "reason": f"adopted candidate adapter {adapter_id} as served",
+                "promoted": False,
+                "val_loss": best_loss,
+                "checkpoint_id": None,
+                "reason": decision.summary,
                 "corpus_train": 0,
                 "adapter_path": target_path,
             })
+            if not recorded:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' was not adopted: its fidelity-gate record "
+                    "could not be persisted."
+                )
+            if not decision.promote:
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' was not adopted; {decision.summary}."
+                )
+
+            checkpoint_id = decision.promoted_checkpoint_id
+            await self._apply_promotion(target_path, checkpoint_id, best_loss)
+            reaches_inference = self.adapter_for_inference() is not None
+            await self._update_run_history(run_id, {
+                "promoted": True,
+                "checkpoint_id": checkpoint_id,
+                "reason": f"adopted candidate adapter {adapter_id} ({checkpoint_id}) as served",
+                "reaches_inference_at_promotion": reaches_inference,
+            })
             return ToolResult.ok(
                 confirmation=(
-                    f"Adopted adapter {adapter_id} as served "
-                    f"(val_loss={val_loss}).{self._inert_note()}"
+                    f"Adopted adapter {adapter_id} checkpoint {checkpoint_id} as served "
+                    f"(val_loss={best_loss}).{self._inert_note()}"
                 ),
                 data={
                     "served_adapter": target_path,
-                    "served_val_loss": val_loss,
-                    "reaches_inference": self.adapter_for_inference() is not None,
+                    "served_checkpoint": checkpoint_id,
+                    "served_val_loss": best_loss,
+                    "reaches_inference": reaches_inference,
+                    "gate": decision.to_record(),
                 },
             )
         finally:
             self._cycle_in_flight = False
+
+    # ------------------------------------------------------------------
+    # Served checkpoint + fidelity-gate records
+    # ------------------------------------------------------------------
+
+    def _served_adapter(self) -> Optional[ServedAdapter]:
+        """The served adapter and checkpoint: the gate's baseline when present."""
+        if not self._active_adapter_path:
+            return None
+        # A pointer set before checkpoint-aware promotion served the run's
+        # final weights (see _restore_persisted_config).
+        return ServedAdapter(
+            self._active_adapter_path, self._active_checkpoint_id or FINAL_ADAPTER_FILE,
+        )
+
+    def _adoption_baseline(self, recorded: Optional[Baseline]) -> Baseline:
+        """Baseline for adopting a candidate whose validation set is gone.
+
+        Only the baseline the candidate's training run scored, on that run's
+        validation set, can stand, and only while it is still the baseline: the
+        same served checkpoint, or the base with nothing served. Otherwise it
+        has no loss, so the gate is inconclusive rather than comparing against
+        a number from another run.
+        """
+        served = self._served_adapter()
+        source = served.source if served is not None else BASE_SOURCE
+        if recorded is not None and recorded.source == source:
+            return recorded
+        return Baseline(source)
+
+    async def _training_gate_record(self, adapter_path: str) -> Optional[Dict[str, Any]]:
+        """The gate record of the training run that produced ``adapter_path``."""
+        for entry in reversed(await self._load_run_history()):
+            gate = entry.get("gate")
+            if (
+                entry.get("adapter_path") == adapter_path
+                and entry.get("trigger") != "adopt"
+                and isinstance(gate, dict)
+            ):
+                return gate
+        return None
+
+    async def _promotion(self, adapter_path: str) -> Optional[Tuple[str, Optional[float]]]:
+        """The checkpoint ``adapter_path`` was promoted with, and its promoted score.
+
+        None if it was never promoted. The score is the one the promoting gate
+        run measured for that checkpoint file, or None if none usable is on record.
+        """
+        lineage = self._adapter_lineage.get(adapter_path, {})
+        if isinstance(lineage.get("promoted_checkpoint_id"), str):
+            loss = lineage.get("promoted_val_loss")
+            return lineage["promoted_checkpoint_id"], loss if is_usable_loss(loss) else None
+        for entry in reversed(await self._load_run_history()):
+            if not (entry.get("promoted") and entry.get("adapter_path") == adapter_path):
+                continue
+            if "checkpoint_id" not in entry:
+                # A promotion recorded before checkpoint-aware promotion served
+                # the run's final weights, gated on its last logged val loss.
+                loss = parse_final_val_loss(self._read_train_log(Path(adapter_path)))
+                return FINAL_ADAPTER_FILE, loss if is_usable_loss(loss) else None
+            if isinstance(entry["checkpoint_id"], str):
+                loss = entry.get("val_loss")
+                return entry["checkpoint_id"], loss if is_usable_loss(loss) else None
+        return None
+
+    @staticmethod
+    def _read_train_log(adapter_dir: Path) -> str:
+        try:
+            return (adapter_dir / "train.log").read_text()
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    async def _persist_gate_record(
+        self,
+        run_id: str,
+        record: Dict[str, Any],
+        *,
+        new_entry: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Durably attach a gate decision to run ``run_id``.
+
+        Appends ``new_entry`` carrying the record, or merges the record into
+        the run's existing entry. Returns False when the write did not happen;
+        the caller must then promote nothing.
+        """
+        try:
+            if new_entry is not None:
+                await self._append_run_history({**new_entry, "run_id": run_id, "gate": record}, strict=True)
+            else:
+                await self._update_run_history(run_id, {"gate": record}, strict=True)
+        except Exception as exc:  # noqa: BLE001 - any storage failure fails closed
+            logger.error(
+                "parametric-self: fidelity-gate record for run %s not persisted; "
+                "promotion blocked: %s", run_id, exc,
+            )
+            persisted = False
+        else:
+            persisted = True
+        self._last_gate_attempt = {"run_id": run_id, "record": record, "persisted": persisted}
+        return persisted
+
+    async def _apply_promotion(
+        self, adapter_path: str, checkpoint_id: Optional[str], val_loss: Optional[float],
+    ) -> None:
+        """Serve one checkpoint. Called only after its gate record is durable."""
+        self._active_adapter_path = adapter_path
+        self._active_checkpoint_id = checkpoint_id
+        self._last_val_loss = val_loss
+        lineage = self._adapter_lineage.setdefault(adapter_path, {})
+        lineage["state"] = "served"
+        lineage["promoted_checkpoint_id"] = checkpoint_id
+        lineage["promoted_val_loss"] = val_loss
+        lineage["reaches_inference_at_promotion"] = self.adapter_for_inference() is not None
+        # Persist so the served pointer and checkpoint survive a restart.
+        await self._persist_config()
+
+    async def _last_gate_record(self) -> Optional[Dict[str, Any]]:
+        """The most recent fidelity-gate decision recorded in history."""
+        for entry in reversed(await self._load_run_history()):
+            if isinstance(entry.get("gate"), dict):
+                return entry["gate"]
+        return None
+
+    async def _latest_gate_attempt(self) -> Optional[Dict[str, Any]]:
+        """The newest fidelity-gate attempt: its ``record`` and whether it ``persisted``.
+
+        This process's own latest attempt comes first, because a failed record
+        write can leave history with no trace of it. After a restart, history
+        is the only witness. A run entry with ``gate_record_persisted: false``
+        is an attempt whose record never landed.
+        """
+        if self._last_gate_attempt is not None:
+            return dict(self._last_gate_attempt)
+        for entry in reversed(await self._load_run_history()):
+            gate = entry.get("gate")
+            persisted = entry.get("gate_record_persisted")
+            if isinstance(gate, dict):
+                return {"run_id": entry.get("run_id"), "record": gate, "persisted": persisted is not False}
+            if persisted is not None:
+                return {"run_id": entry.get("run_id"), "record": None, "persisted": False}
+        return None
 
     def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
         """Resolve optional reflection DB and required adapter working directory.
@@ -1750,7 +2060,7 @@ class ParametricSelfFeature(Feature):
                 adapter=self._adapter,
                 gate=self._gate,
                 config=config,
-                prior_val_loss=self._last_val_loss,
+                served=self._served_adapter(),
                 adapter_id=adapter_id,
             )
             if result.training_active:
@@ -1773,6 +2083,18 @@ class ParametricSelfFeature(Feature):
             self._active_run = None
             raise
 
+        # Every gate decision is durable before anything can be promoted. If the
+        # record cannot be written, the decision stands but nothing is promoted.
+        gate_record = result.gate.to_record() if result.gate is not None else None
+        gate_record_persisted: Optional[bool] = None
+        if gate_record is not None:
+            gate_record_persisted = await self._persist_gate_record(run_id, gate_record)
+            if not gate_record_persisted and result.promoted:
+                self._block_promotion(
+                    result,
+                    "fidelity-gate record could not be persisted; promotion blocked. " + result.reason,
+                )
+
         manifest, manifest_error = self._manifest_lineage(adapter_path)
         receipt = self._manifest_receipt_stamp(manifest or {}) if manifest_error is None else None
         candidate_lineage = {
@@ -1784,6 +2106,7 @@ class ParametricSelfFeature(Feature):
             "semantic_checkpoint_id": result.semantic_checkpoint_id,
             "assertion_lineage": [list(pair) for pair in result.assertion_lineage],
             "state": "candidate",
+            "reaches_inference_at_train": active_run.get("reaches_inference_at_train"),
         }
         if receipt is not None and result.corpus_manifest_hash == receipt["manifest_hash"]:
             candidate_lineage.update(receipt)
@@ -1792,30 +2115,21 @@ class ParametricSelfFeature(Feature):
         if result.promoted and receipt is None:
             # A promoted adapter without the immutable corpus receipt is never
             # a valid served artifact, even if a trainer reports success.
-            result.promoted = False
-            result.promoted_adapter_path = None
-            result.reason = "candidate missing governed corpus manifest"
+            self._block_promotion(result, "candidate missing governed corpus manifest")
         elif result.promoted and result.corpus_manifest_hash != receipt["manifest_hash"]:
-            result.promoted = False
-            result.promoted_adapter_path = None
-            result.reason = "candidate manifest receipt does not match training result"
+            self._block_promotion(result, "candidate manifest receipt does not match training result")
 
         if result.promoted and result.promoted_adapter_path:
             lifecycle_problem = await self._verify_adapter_lineage(
                 result.promoted_adapter_path, before_promotion=True
             )
             if lifecycle_problem:
-                result.promoted = False
-                result.promoted_adapter_path = None
-                result.reason = f"candidate quarantined: {lifecycle_problem}"
+                self._block_promotion(result, f"candidate quarantined: {lifecycle_problem}")
 
         if result.promoted and result.promoted_adapter_path:
-            self._active_adapter_path = result.promoted_adapter_path
-            self._last_val_loss = result.val_loss
-            self._adapter_lineage[result.promoted_adapter_path]["state"] = "served"
-            # Persist the new served adapter + its val loss so the pointer and
-            # the regression baseline survive a restart.
-            await self._persist_config()
+            await self._apply_promotion(
+                result.promoted_adapter_path, result.promoted_checkpoint_id, result.val_loss,
+            )
         elif receipt is not None:
             # Candidate lineage is durable even when fidelity rejects it; an
             # operator can inspect exactly why it must not silently be served.
@@ -1825,18 +2139,22 @@ class ParametricSelfFeature(Feature):
             "parametric-self %s cycle: trained=%s promoted=%s val_loss=%s (%s)",
             trigger, result.trained, result.promoted, result.val_loss, result.reason,
         )
+        # A promotion moves the training record; it reaches no turn unless
+        # the switch says so.
+        reaches_inference = self.adapter_for_inference() is not None
         outcome = {
             "trained": result.trained,
             "promoted": result.promoted,
             "val_loss": result.val_loss,
+            "checkpoint_id": result.promoted_checkpoint_id,
             "reason": result.reason,
+            "gate": gate_record,
+            "gate_record_persisted": gate_record_persisted,
             "corpus_train": result.corpus_train,
             "corpus_valid": result.corpus_valid,
             "corpus_manifest_hash": result.corpus_manifest_hash,
             "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
-            # A promotion moves the training record; it reaches no turn unless
-            # the switch says so.
-            "reaches_inference": self.adapter_for_inference() is not None,
+            "reaches_inference": reaches_inference,
         }
         await self._update_run_history(run_id, {
             "state": "completed",
@@ -1844,8 +2162,11 @@ class ParametricSelfFeature(Feature):
             "trained": result.trained,
             "promoted": result.promoted,
             "val_loss": result.val_loss,
+            "checkpoint_id": result.promoted_checkpoint_id,
             "reason": result.reason,
             "corpus_train": result.corpus_train,
+            "gate_record_persisted": gate_record_persisted,
+            "reaches_inference_at_promotion": reaches_inference if result.promoted else None,
             # Record the served path only on promotion (matches the prior
             # contract); otherwise keep the candidate path for traceability.
             "adapter_path": result.promoted_adapter_path or adapter_path,
@@ -1858,12 +2179,23 @@ class ParametricSelfFeature(Feature):
         self._active_run = None
         return outcome
 
+    @staticmethod
+    def _block_promotion(result: CycleResult, reason: str) -> None:
+        """Withdraw a gate promotion the feature may not apply."""
+        result.promoted = False
+        result.promoted_adapter_path = None
+        result.promoted_checkpoint_id = None
+        result.reason = reason
+
     async def _begin_active_run(self, *, trigger: str, work_dir: str) -> Dict[str, Any]:
         """Create the durable in-progress record for a training run."""
         run_id = uuid.uuid4().hex[:12]
         adapter_id = uuid.uuid4().hex[:12]
         adapter_path = str(Path(work_dir) / "candidates" / adapter_id)
         started_at = _utc_now_iso()
+        # Taken from the effective switch now, so the record shows whether any
+        # adapter could reach a live turn while this one trained (#31).
+        reaches_inference_at_train = self.adapter_for_inference() is not None
         active_run = {
             "run_id": run_id,
             "adapter_id": adapter_id,
@@ -1871,6 +2203,7 @@ class ParametricSelfFeature(Feature):
             "started_at": started_at,
             "state": "in_progress",
             "adapter_path": adapter_path,
+            "reaches_inference_at_train": reaches_inference_at_train,
         }
         self._active_run = dict(active_run)
         await self._append_run_history({
@@ -1886,6 +2219,7 @@ class ParametricSelfFeature(Feature):
             "corpus_train": 0,
             "adapter_id": adapter_id,
             "adapter_path": adapter_path,
+            "reaches_inference_at_train": reaches_inference_at_train,
         })
         return dict(active_run)
 
@@ -2004,14 +2338,22 @@ class ParametricSelfFeature(Feature):
     def _history_node_id(self) -> str:
         return f"parametric_self_runs:{self.name}"
 
-    async def _append_run_history(self, entry: Dict[str, Any]) -> None:
-        """Append one run record to the durable, capped history list."""
+    async def _append_run_history(self, entry: Dict[str, Any], *, strict: bool = False) -> None:
+        """Append one run record to the durable, capped history list.
+
+        History is best effort, except for a ``strict`` write (a fidelity-gate
+        record), which raises rather than being skipped. Either way the list is
+        rewritten only after it was read intact: a history that cannot be read,
+        or is malformed, is never written over.
+        """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
+            if strict:
+                raise RunHistoryUnavailable("no storage to persist parametric-self run history")
             return
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
-            runs = await self._load_run_history()
+            runs = await self._load_run_history(strict=True)
             runs.append(entry)
             # Keep only the most recent N so the node stays bounded.
             runs = runs[-_RUN_HISTORY_LIMIT:]
@@ -2022,9 +2364,13 @@ class ParametricSelfFeature(Feature):
                 properties={"runs": runs},
             ))
         except Exception as e:  # history is best-effort; never break a cycle
-            logger.warning("Failed to append parametric-self run history: %s", e)
+            if strict:
+                raise
+            logger.warning("Failed to append parametric-self run history (write skipped): %s", e)
 
-    async def _update_run_history(self, run_id: str, updates: Dict[str, Any]) -> None:
+    async def _update_run_history(
+        self, run_id: str, updates: Dict[str, Any], *, strict: bool = False,
+    ) -> None:
         """Merge ``updates`` into the most recent history entry with ``run_id``.
 
         Lets a run's record transition in place (``in_progress`` ->
@@ -2032,14 +2378,18 @@ class ParametricSelfFeature(Feature):
         ``shutdown_incomplete`` state) instead of appending a second entry, so
         an in-flight run is one durable record an agent can poll to completion.
         No-ops if the entry is gone (capped out) — falls back to appending so the
-        outcome is never silently lost.
+        outcome is never silently lost. As with ``_append_run_history``, the
+        list is rewritten only after it was read intact, and a ``strict`` write
+        raises on failure instead of logging it.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
+            if strict:
+                raise RunHistoryUnavailable("no storage to persist parametric-self run history")
             return
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
-            runs = await self._load_run_history()
+            runs = await self._load_run_history(strict=True)
             for entry in reversed(runs):
                 if entry.get("run_id") == run_id:
                     entry.update(updates)
@@ -2056,7 +2406,9 @@ class ParametricSelfFeature(Feature):
                 properties={"runs": runs},
             ))
         except Exception as e:  # history is best-effort; never break a cycle
-            logger.warning("Failed to update parametric-self run history: %s", e)
+            if strict:
+                raise
+            logger.warning("Failed to update parametric-self run history (write skipped): %s", e)
 
     async def _reconcile_stale_runs(self) -> None:
         """Mark any persisted ``in_progress`` run as interrupted on load.
@@ -2071,7 +2423,8 @@ class ParametricSelfFeature(Feature):
             return
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
-            runs = await self._load_run_history()
+            # Rewritten below, so it must be read intact.
+            runs = await self._load_run_history(strict=True)
             changed = False
             # Re-enabling the same live feature retains its adapter/process
             # provenance. Only a fresh feature instance has lost that handle.
@@ -2109,8 +2462,14 @@ class ParametricSelfFeature(Feature):
         except Exception as e:  # reconciliation is best-effort; never break load
             logger.warning("Failed to reconcile stale parametric-self runs: %s", e)
 
-    async def _load_run_history(self) -> List[Dict[str, Any]]:
-        """Load the run-history list (most recent last); [] if absent/malformed."""
+    async def _load_run_history(self, *, strict: bool = False) -> List[Dict[str, Any]]:
+        """Load the run-history list (most recent last).
+
+        Every read that a history write is built on is ``strict``: it raises on
+        an unreadable or malformed store, so no write can replace history it
+        failed to read. A non-strict read is for display only; it returns []
+        when the store cannot be read and skips entries that are not records.
+        """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
             return []
@@ -2121,8 +2480,15 @@ class ParametricSelfFeature(Feature):
             runs = node.properties.get("runs")
             if isinstance(runs, str):
                 runs = json.loads(runs)
-            return list(runs) if isinstance(runs, list) else []
+            if not isinstance(runs, list):
+                raise RunHistoryUnavailable("parametric-self run history is malformed")
+            records = [entry for entry in runs if isinstance(entry, dict)]
+            if strict and len(records) != len(runs):
+                raise RunHistoryUnavailable("parametric-self run history holds a non-record entry")
+            return records
         except Exception as e:
+            if strict:
+                raise
             logger.warning("Failed to load parametric-self run history (ignored): %s", e)
             return []
 

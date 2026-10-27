@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,7 +18,7 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 
-from kestrel_feature_parametric_self import ParametricSelfFeature
+from kestrel_feature_parametric_self import Baseline, Checkpoint, FidelityGate, ParametricSelfFeature, ValSet
 
 
 def _snapshot():
@@ -101,6 +102,39 @@ def _stamp_adapter_receipt(feature, candidate) -> None:
     receipt = feature._manifest_receipt_stamp(manifest or {})
     assert receipt is not None
     feature._adapter_lineage[str(candidate)] = {**receipt, "state": "candidate"}
+
+
+ITER_200 = "0000200_adapters.safetensors"
+ITER_400 = "0000400_adapters.safetensors"
+WEIGHT_FILES = ("0000100_adapters.safetensors", ITER_200, "0000300_adapters.safetensors", ITER_400, "adapters.safetensors")
+JUNE_LOG = "Iter 1: Val loss 8.977, x\nIter 200: Val loss 1.866, x\nIter 400: Val loss 2.688, x\n"
+IMPROVING_LOG = "Iter 1: Val loss 8.977, x\nIter 200: Val loss 1.866, x\nIter 400: Val loss 1.800, x\n"
+# What the candidate's training run scored each checkpoint file at.
+JUNE_SCORES = {ITER_200: 1.866, ITER_400: 2.688}
+IMPROVING_SCORES = {ITER_200: 1.866, ITER_400: 1.800}
+
+
+def _write_run(candidate, log, files=WEIGHT_FILES):
+    """A finished candidate dir: its train.log and the weights mlx_lm saved."""
+    candidate.mkdir(parents=True, exist_ok=True)
+    (candidate / "train.log").write_text(log)
+    for name in files:
+        (candidate / name).write_bytes(b"weights")
+
+
+async def _record_training_gate(
+    feature, candidate, scores=IMPROVING_SCORES, *, baseline=("base", 8.977),
+    digest="sha256:" + "cd" * 32, examples=7,
+):
+    """The gate record the candidate's training run left: every score adopt re-decides from."""
+    checkpoints = tuple(Checkpoint(name, int(name[:7]), loss) for name, loss in scores.items())
+    record = FidelityGate().evaluate(
+        checkpoints=checkpoints, baseline=Baseline(*baseline), val_set=ValSet(digest, examples),
+    ).to_record()
+    await feature._append_run_history({
+        "run_id": f"train-{candidate.name}", "trigger": "nightly", "state": "completed",
+        "trained": True, "promoted": False, "adapter_path": str(candidate), "gate": record,
+    })
 
 
 # ----------------------------------------------------------------------
@@ -885,14 +919,14 @@ async def test_rollback_default_to_previous_promoted(tmp_path):
     old = cands / "old111"
     new = cands / "new222"
     for d, loss in ((old, "2.900"), (new, "2.600")):
-        d.mkdir(parents=True)
-        (d / "train.log").write_text(f"Val loss {loss}\n")
+        _write_run(d, f"Iter 400: Val loss {loss}\n", files=("adapters.safetensors",))
         _write_governed_manifest(d)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, old)
     _stamp_adapter_receipt(f, new)
-    # History records both promotions; new is currently served.
+    # History records both promotions (made before checkpoint-aware promotion,
+    # so they served each run's final weights); new is currently served.
     await f._append_run_history({"promoted": True, "adapter_path": str(old), "trigger": "nightly"})
     await f._append_run_history({"promoted": True, "adapter_path": str(new), "trigger": "nightly"})
     f._active_adapter_path = str(new)
@@ -900,10 +934,40 @@ async def test_rollback_default_to_previous_promoted(tmp_path):
     result = await f.parametric_self_rollback()
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(old)
+    assert f._active_checkpoint_id == "adapters.safetensors"
     assert f._last_val_loss == pytest.approx(2.900)
     # Rollback is recorded in history.
     runs = await f._load_run_history()
     assert runs[-1]["trigger"] == "rollback"
+    assert runs[-1]["checkpoint_id"] == "adapters.safetensors"
+    assert runs[-1]["reaches_inference_at_promotion"] is False
+
+
+async def test_rollback_restores_the_promoted_checkpoint_not_the_final_one(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates"
+    old, new = cands / "old111", cands / "new222"
+    _write_run(old, JUNE_LOG)
+    _write_run(new, IMPROVING_LOG)
+    for d in (old, new):
+        _write_governed_manifest(d)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, old)
+    _stamp_adapter_receipt(f, new)
+    await f._append_run_history({
+        "promoted": True, "adapter_path": str(old), "checkpoint_id": ITER_200, "val_loss": 1.866,
+        "trigger": "nightly",
+    })
+    await f._append_run_history({
+        "promoted": True, "adapter_path": str(new), "checkpoint_id": ITER_400, "val_loss": 1.8,
+        "trigger": "nightly",
+    })
+    f._active_adapter_path, f._active_checkpoint_id = str(new), ITER_400
+
+    result = await f.parametric_self_rollback()
+    assert result.status == ToolResultStatus.OK
+    assert (f._active_adapter_path, f._active_checkpoint_id) == (str(old), ITER_200)
+    assert f._last_val_loss == pytest.approx(1.866)
+    assert result.data["served_checkpoint"] == ITER_200
 
 
 @pytest.mark.parametrize("arg", ["pick99", "adapter_id=pick99"])
@@ -911,18 +975,80 @@ async def test_rollback_explicit_adapter_id(tmp_path, arg):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"
     target = cands / "pick99"
-    target.mkdir(parents=True)
-    (target / "train.log").write_text("Val loss 2.750\n")
+    _write_run(target, "Iter 1: Val loss 9.0, x\nIter 200: Val loss 2.750, x\nIter 400: Val loss 2.800, x\n")
     _write_governed_manifest(target)
 
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, target)
+    f._adapter_lineage[str(target)].update(promoted_checkpoint_id=ITER_200, promoted_val_loss=2.750)
     f._active_adapter_path = "/some/other/served"
     # Accept both the split form ("pick99") and a leaked key=value token.
     result = await f.parametric_self_rollback(adapter_id=arg)
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(target)
+    assert f._active_checkpoint_id == ITER_200
     assert f._last_val_loss == pytest.approx(2.750)
+
+
+async def test_rollback_refuses_a_candidate_that_was_never_promoted(tmp_path):
+    """Serving an ungated candidate's weights would bypass the fidelity gate."""
+    target = tmp_path / "parametric_self" / "candidates" / "never"
+    _write_run(target, IMPROVING_LOG)
+    _write_governed_manifest(target)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, target)
+
+    result = await f.parametric_self_rollback(adapter_id="never")
+    assert result.status == ToolResultStatus.ERROR
+    assert "never promoted" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+async def test_rollback_refuses_a_checkpoint_whose_recorded_loss_is_not_finite(tmp_path):
+    target = tmp_path / "parametric_self" / "candidates" / "diverged"
+    _write_run(target, IMPROVING_LOG)
+    _write_governed_manifest(target)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, target)
+    f._adapter_lineage[str(target)].update(promoted_checkpoint_id=ITER_200, promoted_val_loss=math.nan)
+
+    result = await f.parametric_self_rollback(adapter_id="diverged")
+    assert result.status == ToolResultStatus.ERROR
+    assert "no recorded validation loss" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+async def test_rollback_takes_the_promoted_score_never_the_training_log(tmp_path):
+    """The log's Iter 200 line was measured one step before 0000200 was saved."""
+    target = tmp_path / "parametric_self" / "candidates" / "scored"
+    _write_run(target, JUNE_LOG)
+    _write_governed_manifest(target)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, target)
+    f._adapter_lineage[str(target)].update(promoted_checkpoint_id=ITER_200, promoted_val_loss=1.9)
+
+    result = await f.parametric_self_rollback(adapter_id="scored")
+    assert result.status == ToolResultStatus.OK
+    assert f._last_val_loss == 1.9
+
+
+async def test_rollback_refuses_a_quarantined_adapter_without_reverifying_it(tmp_path):
+    target = tmp_path / "parametric_self" / "candidates" / "bad"
+    _write_run(target, IMPROVING_LOG)
+    _write_governed_manifest(target)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, target)
+    f._adapter_lineage[str(target)]["promoted_checkpoint_id"] = ITER_200
+    f._quarantined_adapters[str(target)] = "governed assertion lineage invalidated; rebuild required"
+
+    async def _must_not_verify(*_args, **_kwargs):
+        raise AssertionError("a quarantined adapter is not re-verified")
+
+    f._verify_adapter_lineage = _must_not_verify
+    result = await f.parametric_self_rollback(adapter_id="bad")
+    assert result.status == ToolResultStatus.ERROR
+    assert "quarantined" in (result.error or "")
+    assert f._active_adapter_path is None
 
 
 async def test_rollback_unknown_adapter_id_fails(tmp_path):
@@ -970,12 +1096,12 @@ async def test_rollback_refused_while_cycle_in_flight(tmp_path):
 async def test_rollback_refuses_adapter_without_val_loss(tmp_path):
     """An incomplete candidate (no parseable val_loss) must not be served."""
     cands = tmp_path / "parametric_self" / "candidates" / "incomplete"
-    cands.mkdir(parents=True)
-    (cands / "train.log").write_text("Iter 10: training started...\n")  # no Val loss line
+    _write_run(cands, "Iter 10: training started...\n")  # no Val loss line
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    await f._append_run_history({"promoted": True, "adapter_path": str(cands), "checkpoint_id": ITER_200})
     result = await f.parametric_self_rollback(adapter_id="incomplete")
     assert result.status == ToolResultStatus.ERROR
-    assert "no parseable validation loss" in (result.error or "")
+    assert "no recorded validation loss" in (result.error or "")
     assert f._active_adapter_path is None
 
 
@@ -1027,44 +1153,148 @@ async def test_status_keeps_untracked_candidates_non_serving(tmp_path):
 
 async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
-    cands.mkdir(parents=True)
-    (cands / "train.log").write_text("Iter 400: Val loss 2.688\n")
+    _write_run(cands, IMPROVING_LOG)
     _write_governed_manifest(cands)
     storage = _FakeStorage()
     f = await _feature(storage, storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
 
     result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(cands)
-    assert f._last_val_loss == pytest.approx(2.688)
+    assert f._active_checkpoint_id == ITER_400
+    assert f._last_val_loss == pytest.approx(1.800)
     assert f._config_node_id() in storage.nodes  # served pointer persisted
     runs = await f._load_run_history()
     assert runs[-1]["trigger"] == "adopt"
     assert runs[-1]["adapter_path"] == str(cands)
+    assert runs[-1]["promoted"] is True
+    assert runs[-1]["checkpoint_id"] == ITER_400
+    assert runs[-1]["reaches_inference_at_promotion"] is False
+    gate = runs[-1]["gate"]
+    assert gate["decision"] == "promote"
+    assert gate["baseline_source"] == "base" and gate["baseline_val_loss"] == 8.977
+    assert gate["val_set_digest"] == "sha256:" + "cd" * 32
+
+
+async def test_adopt_promotes_the_best_checkpoint_when_overfit_check_is_relaxed(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
+    _write_run(cands, JUNE_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, JUNE_SCORES)  # rejected for overfit when trained
+    await f.set_config({"gate": {"overfit_ratio": 1.5}})
+
+    result = await f.parametric_self_adopt(adapter_id="ded33cd017d9")
+    assert result.status == ToolResultStatus.OK
+    assert f._active_checkpoint_id == ITER_200
+
+
+async def test_adopt_without_a_recorded_val_set_is_inconclusive(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "legacy"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+
+    result = await f.parametric_self_adopt(adapter_id="legacy")
+    assert result.status == ToolResultStatus.ERROR
+    assert "inconclusive (val_set_missing)" in (result.error or "")
+    assert f._active_adapter_path is None
+    runs = await f._load_run_history()
+    assert runs[-1]["gate"]["decision"] == "inconclusive"
+
+
+async def test_adopt_with_an_adapter_served_is_inconclusive_not_a_stored_comparison(tmp_path):
+    """The served adapter cannot be scored on a deleted val set; no stored loss stands in."""
+    cands = tmp_path / "parametric_self" / "candidates" / "next"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
+    f._active_adapter_path, f._active_checkpoint_id = "/served/old", ITER_200
+    f._last_val_loss = 50.0  # a stored loss that would let the candidate through
+
+    result = await f.parametric_self_adopt(adapter_id="next")
+    assert result.status == ToolResultStatus.ERROR
+    assert "baseline_unavailable" in (result.error or "")
+    assert f._active_adapter_path == "/served/old"
+
+
+async def test_adopt_uses_a_served_baseline_scored_in_the_candidates_own_gate_run(tmp_path):
+    """While the served checkpoint is unchanged, its training-run score still stands."""
+    cands = tmp_path / "parametric_self" / "candidates" / "next"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, baseline=(f"served:old/{ITER_200}", 2.5))
+    f._active_adapter_path, f._active_checkpoint_id = "/served/old", ITER_200
+
+    result = await f.parametric_self_adopt(adapter_id="next")
+    assert result.status == ToolResultStatus.OK
+    assert result.data["gate"]["baseline_val_loss"] == 2.5
+    assert f._active_checkpoint_id == ITER_400
+
+
+async def test_adopt_decides_from_recorded_scores_never_the_training_log(tmp_path):
+    """The log credits 0000400 with 1.0; the file itself scored 10.0 when it was trained."""
+    cands = tmp_path / "parametric_self" / "candidates" / "logged"
+    _write_run(cands, "Iter 1: Val loss 9.0, x\nIter 200: Val loss 1.866, x\nIter 400: Val loss 1.000, x\n")
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, {ITER_200: 1.866, ITER_400: 10.0})
+
+    result = await f.parametric_self_adopt(adapter_id="logged")
+    assert result.status == ToolResultStatus.ERROR
+    assert "fidelity gate reject (overfit)" in (result.error or "")
+    assert f._active_adapter_path is None
+
+
+async def test_adopt_refuses_a_malformed_training_gate_record(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "garbled"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await f._append_run_history({
+        "run_id": "train-garbled", "trigger": "nightly", "adapter_path": str(cands),
+        "gate": {"decision": "promote", "val_set_digest": "sha256:x", "val_set_examples": 7},
+    })
+
+    result = await f.parametric_self_adopt(adapter_id="garbled")
+    assert result.status == ToolResultStatus.ERROR
+    assert "malformed fidelity-gate record" in (result.error or "")
+    assert f._active_adapter_path is None
 
 
 @pytest.mark.parametrize("arg", ["ded33cd017d9", "adapter_id=ded33cd017d9"])
 async def test_adopt_accepts_leaked_key_value_token(tmp_path, arg):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
-    cands.mkdir(parents=True)
-    (cands / "train.log").write_text("Val loss 2.688\n")
+    _write_run(cands, IMPROVING_LOG)
     _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
     result = await f.parametric_self_adopt(adapter_id=arg)
     assert result.status == ToolResultStatus.OK
     assert f._active_adapter_path == str(cands)
 
 
-async def test_adopt_refuses_adapter_without_val_loss(tmp_path):
-    cands = tmp_path / "parametric_self" / "candidates" / "incomplete"
-    cands.mkdir(parents=True)
-    (cands / "train.log").write_text("Iter 10: training started...\n")  # no Val loss
+async def test_adopt_refuses_a_recorded_checkpoint_that_is_gone_from_disk(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "pruned"
+    _write_run(cands, IMPROVING_LOG, files=(ITER_200,))
+    _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
-    result = await f.parametric_self_adopt(adapter_id="incomplete")
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
+    result = await f.parametric_self_adopt(adapter_id="pruned")
     assert result.status == ToolResultStatus.ERROR
-    assert "no parseable validation loss" in (result.error or "")
+    assert f"checkpoint {ITER_400} is no longer on disk" in (result.error or "")
     assert f._active_adapter_path is None
 
 
@@ -1102,17 +1332,39 @@ async def test_adopt_refused_for_governed_agent(tmp_path):
 
 
 async def test_adopt_rejects_candidate_failing_fidelity_gate(tmp_path):
-    """A candidate whose val_loss exceeds the ceiling must not be adopted."""
+    """Emma's overfit June run must not be adopted under the default gate."""
     cands = tmp_path / "parametric_self" / "candidates" / "toobad"
-    cands.mkdir(parents=True)
-    (cands / "train.log").write_text("Val loss 3.500\n")  # > max_val_loss (3.0)
+    _write_run(cands, JUNE_LOG)
     _write_governed_manifest(cands)
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, JUNE_SCORES)
     result = await f.parametric_self_adopt(adapter_id="toobad")
     assert result.status == ToolResultStatus.ERROR
-    assert "fidelity gate" in (result.error or "")
+    assert "fidelity gate reject (overfit)" in (result.error or "")
     assert f._active_adapter_path is None
+
+
+async def test_adopt_refuses_a_quarantined_candidate_without_rescoring_it(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "bad"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
+    f._quarantined_adapters[str(cands)] = "governed assertion lineage invalidated; rebuild required"
+    history_before = json.dumps(await f._load_run_history(), sort_keys=True)
+
+    class _NoScoring:
+        def evaluate(self, **_kwargs):
+            raise AssertionError("a quarantined candidate is not re-scored")
+
+    f._gate = _NoScoring()
+    result = await f.parametric_self_adopt(adapter_id="bad")
+    assert result.status == ToolResultStatus.ERROR
+    assert "quarantined" in (result.error or "")
+    assert f._active_adapter_path is None
+    assert json.dumps(await f._load_run_history(), sort_keys=True) == history_before
 
 
 async def test_adopt_refused_while_cycle_in_flight(tmp_path):

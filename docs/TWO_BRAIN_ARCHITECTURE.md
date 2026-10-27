@@ -106,7 +106,7 @@ Training turns user-authored content into two artifacts: a **transient corpus**
   any use of raw turns must decrypt **inside the agent trust boundary**.
 - **Training adapter:** a new `LocalMLXAdapter` + `TextLoRAConfig` in `features/training/`, **importing** (never copying) the modality-neutral lifecycle types (`TrainingState`/`TrainingJob`/`TrainingStatus`/`TrainingProviderFactory`) and adding a `ProviderType.LOCAL_MLX`. See [§8](#8-build-strategy) — this is Strategy B (parallel LLM path), not a refactor of the image pipeline.
 - **Serving:** the owned brain serves via `mlx_lm.server` (OpenAI-compatible), reached through the existing generic OpenAI-compatible route in `llm/provider_registry.py` — **zero new LLM adapters**, just a config route (vendor/route/model).
-- **Promotion gate:** a held-out fidelity check (§5.2); the nightly adapter is hot-swapped **only if** quality holds. Otherwise the prior adapter stays. This mirrors the forgetting/retention gate already in the sleep cycle.
+- **Promotion gate:** a held-out fidelity check (§5.2); the nightly adapter is hot-swapped **only if** quality holds. Otherwise the prior adapter stays. This mirrors the forgetting/retention gate already in the sleep cycle. The loss gate is relative: the run's best checkpoint must beat the served adapter (or the untuned base) by a margin, each saved checkpoint file and the baseline scored on the same validation set in the same run, and a run that overfits from best to final is rejected; an inconclusive gate blocks promotion. Validation loss measures fit to the agent's own data, not identity drift, so the behavioural fidelity exam remains the real gate.
 
 ## 7. Proof of feasibility
 

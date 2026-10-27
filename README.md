@@ -49,6 +49,48 @@ revision, missing manifest, or unverifiable host capability quarantines the
 affected candidate or served adapter until it is rebuilt. This is intentionally
 a visible no-op rather than a fallback to ungoverned factual training.
 
+## Promotion gate
+
+The loss gate decides whether a trained candidate may be promoted. It measures
+validation loss, which is fit to the agent's own data only. **It says nothing
+about identity drift**; the behavioural fidelity exam (epic #1) is the real gate.
+
+- Training saves a checkpoint every `save_every` steps. When it ends, every
+  saved checkpoint file, including the final weights, is scored with
+  `mlx_lm.lora --test` on the run's whole validation set. The gate picks the
+  **best** checkpoint by that score, never the final one by default, and every
+  decision names checkpoint ids. The in-training `Iter N` validation loss is
+  progress only: mlx_lm measures it one optimizer step before it saves
+  checkpoint N, so it never describes a saved file.
+- The gate is **relative**. The baseline is the served adapter's promoted
+  checkpoint, or the untuned base (`--test` with no adapter) when nothing is
+  served. It is scored the same way, on the same validation set, in the same
+  run; a stored loss is never a baseline.
+- Order of checks: inconclusive inputs, then overfit, then margin; the first
+  failure decides. Config keys, overridable through `set_config({"gate": {...}})`
+  and persisted:
+  - `gate.margin` (default `0.02`): promote only if
+    `best < baseline × (1 − margin)`. Equality fails.
+  - `gate.overfit_ratio` (default `1.20`): reject when `final / best` is
+    greater. Equality passes.
+  - `gate.overfit_check` (default `true`).
+- `inconclusive` (no validation set, an empty one, a non-finite loss, no
+  checkpoints, a checkpoint or baseline that cannot be scored) blocks
+  promotion and is never reported healthy by `parametric-self-status` or the
+  sleep hook.
+- Every decision writes a record (best/final checkpoint ids and losses, every
+  checkpoint's score, baseline source and loss, margin, ratio, validation-set
+  digest, decision and reason, explicit nulls) into run history **before** any
+  promotion. If that write fails, nothing is promoted. Status health comes from
+  the latest gate attempt alone: an attempt whose record did not persist is not
+  healthy, whatever an earlier run decided. A history write never replaces
+  history it could not read intact.
+- Adopt re-takes the gate on the scores the candidate's own training run
+  recorded, because its validation set is gone; if the baseline has changed
+  since, the result is inconclusive. Rollback restores the checkpoint an
+  adapter was promoted with, at its promoted score. Quarantined adapters are
+  never re-scored, adopted or rolled back to.
+
 ## Inference use
 
 `inference_use` decides whether an adapter may influence a live turn. One
