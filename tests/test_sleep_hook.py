@@ -61,7 +61,7 @@ async def test_governed_corpus_unavailability_is_a_visible_sleep_failure():
 
 @pytest.mark.parametrize(
     "reason",
-    ["trainer unavailable on this host", "empty corpus — no grounded reflections to train on"],
+    ["trainer unavailable on this host", "empty corpus — no governed examples to train on"],
 )
 async def test_expected_local_training_noops_are_structured_sleep_skips(reason):
     feature = MagicMock()

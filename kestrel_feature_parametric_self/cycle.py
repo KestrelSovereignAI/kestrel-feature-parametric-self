@@ -6,7 +6,7 @@ without MLX or a real training run. The feature wires the real
 ``LocalMLXAdapter`` + ``FidelityGate``.
 
 This is the body of the sleep-cycle hook (§6 of the design doc): it runs after
-consolidation, trains a candidate adapter on the night's reflections, and
+consolidation, trains a candidate adapter on the night's governed corpus, and
 promotes it only if it clears the gate (§5.2).
 """
 
@@ -77,7 +77,6 @@ class CycleResult:
 async def run_nightly_cycle(
     *,
     agent_id: str,
-    db_path: str | None,
     work_dir: str,
     governed_snapshot: Any,
     adapter: _TrainerProtocol,
@@ -124,14 +123,13 @@ async def run_nightly_cycle(
     training_active = False
     try:
         stats = build_corpus(
-            db_path,
             corpus_dir,
             governed_snapshot=governed_snapshot,
             manifest_dir=adapter_dir,
         )
         if stats.train == 0:
             return CycleResult(
-                False, reason="empty corpus — no grounded reflections to train on",
+                False, reason="empty corpus — no governed examples to train on",
                 corpus_train=0, corpus_valid=stats.valid,
                 corpus_manifest_path=stats.manifest_path,
                 corpus_manifest_hash=stats.manifest_hash,

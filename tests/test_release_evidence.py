@@ -1374,7 +1374,7 @@ async def test_external_evidence_detects_scratch_tree_replacement_race(tmp_path,
 
     def replace_corpus(*args, **kwargs):
         result = original(*args, **kwargs)
-        corpus = Path(args[1])
+        corpus = Path(args[0])
         corpus.rename(corpus.with_name("replaced-corpus"))
         corpus.mkdir(mode=0o700)
         return result

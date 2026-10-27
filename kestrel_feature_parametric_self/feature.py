@@ -1,10 +1,11 @@
 """Parametric Self feature — owned, nightly-finetuned, in-the-loop second brain.
 
 P2a wires the real nightly training cycle behind a default-OFF gate: after
-memory consolidation, ``on_post_consolidation`` builds a corpus from the night's
-reflections, trains a candidate LoRA adapter, and promotes it only if it clears
-the fidelity gate (§5.2 of ``docs/TWO_BRAIN_ARCHITECTURE.md``). Nothing runs
-unless training is explicitly enabled for this agent AND the host can run MLX.
+memory consolidation, ``on_post_consolidation`` builds a corpus from the host's
+governed snapshot (reflections included), trains a candidate LoRA adapter, and
+promotes it only if it clears the fidelity gate (§5.2 of
+``docs/TWO_BRAIN_ARCHITECTURE.md``). Nothing runs unless training is explicitly
+enabled for this agent AND the host can run MLX.
 
 The sleep cycle calls a ``*SleepHook`` wrapper (see ``sleep_hook.py``), not this
 feature method directly. How that wrapper gets dispatched is P2b: ``sleep.py``
@@ -22,14 +23,16 @@ import json
 import logging
 import uuid
 from collections.abc import Mapping
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
+from .corpus import corpus_manifest_problem
 from .cycle import TrainingShutdownIncomplete, TrainingStillActive, run_nightly_cycle
 from .fidelity import FidelityGate, parse_final_val_loss, parse_latest_iter
 from .inference_use import InferenceUse, parse_inference_use
@@ -142,8 +145,7 @@ class ParametricSelfFeature(Feature):
         # to parse leaves the switch off and is reported, never adopted.
         self._inference_use = InferenceUse.OFF
         self._inference_use_rejected: Optional[str] = None
-        # Optional overrides (tests / non-standard layouts); else resolved from agent.
-        self._db_path: Optional[str] = None
+        # Optional override (tests / non-standard layouts); else resolved from agent.
         self._work_dir: Optional[str] = None
         self._sleep_hook = None                     # set in post_all_features_loaded
         # In-flight manual training run (train_now). Detached so the tool call
@@ -263,6 +265,19 @@ class ParametricSelfFeature(Feature):
             raise ValueError("governed_corpus_policy must be a public policy or mapping")
         from kestrel_sovereign.knowledge import GovernedCorpusPolicy, OntologyRef
 
+        # Core's own restore keeps every policy field, exclusion sets included,
+        # and refuses a field it does not know.
+        restore = getattr(GovernedCorpusPolicy, "from_mapping", None)
+        if callable(restore):
+            return restore(value)
+        # A core without ``from_mapping`` predates corpus exclusions, so its
+        # policy has only the fields rebuilt below.  Any other field (an
+        # exclusion set, say) is refused, never silently dropped.
+        unknown = set(value) - {field.name for field in fields(GovernedCorpusPolicy)} - {"schema_version"}
+        if unknown:
+            raise ValueError(
+                f"governed_corpus_policy has fields this core cannot apply: {sorted(unknown)}"
+            )
         pins = tuple(OntologyRef.from_mapping(item) for item in value["accepted_ontology_pins"])
         capabilities = tuple(
             (str(item["name"]), str(item["version"]))
@@ -613,6 +628,9 @@ class ParametricSelfFeature(Feature):
             actual = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             if actual != expected:
                 return None, "candidate manifest hash mismatch"
+            corpus_problem = corpus_manifest_problem(raw)
+            if corpus_problem:
+                return None, corpus_problem
             # Keep the verified receipt separate from the on-disk schema.  It
             # is compared with the durable feature-side stamp before this
             # manifest can authorize an existing adapter.
@@ -633,13 +651,11 @@ class ParametricSelfFeature(Feature):
 
     @staticmethod
     def _manifest_assertion_pairs(manifest: Dict[str, Any]) -> set[tuple[str, str]]:
-        pairs: set[tuple[str, str]] = set()
-        for example in manifest.get("examples", ()):
-            lineage = example.get("lineage", {}) if isinstance(example, dict) else {}
-            assertion_id, revision_id = lineage.get("assertion_id"), lineage.get("revision_id")
-            if isinstance(assertion_id, str) and isinstance(revision_id, str):
-                pairs.add((assertion_id, revision_id))
-        return pairs
+        """Every example's assertion revision; ``_manifest_lineage`` guarantees each has one."""
+        return {
+            (example["lineage"]["assertion_id"], example["lineage"]["revision_id"])
+            for example in manifest["examples"]
+        }
 
     @classmethod
     def _manifest_receipt_stamp(cls, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -817,7 +833,7 @@ class ParametricSelfFeature(Feature):
         if persisted_problem:
             await self._quarantine_adapter(path, persisted_problem)
             return persisted_problem
-        pairs = self._manifest_assertion_pairs(manifest or {})
+        pairs = self._manifest_assertion_pairs(manifest)
         snapshot = self._live_corpus_snapshot
         storage = getattr(self.agent, "storage", None)
         policy = self._resolved_governed_policy()
@@ -914,7 +930,7 @@ class ParametricSelfFeature(Feature):
 
     def _candidates_dir(self) -> Optional[Path]:
         """The directory holding staged candidate adapters, or None if unresolved."""
-        _, work_dir = self._resolve_paths()
+        work_dir = self._resolve_work_dir()
         if not work_dir:
             return None
         return Path(work_dir) / "candidates"
@@ -1106,7 +1122,7 @@ class ParametricSelfFeature(Feature):
             )
         if not self._adapter.is_available():
             return ToolResult.failed("Trainer unavailable on this host (MLX/Apple Silicon required).")
-        db_path, work_dir = self._resolve_paths()
+        work_dir = self._resolve_work_dir()
         if not work_dir:
             return ToolResult.failed("Could not resolve parametric-self work directory.")
 
@@ -1535,29 +1551,28 @@ class ParametricSelfFeature(Feature):
         finally:
             self._cycle_in_flight = False
 
-    def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve optional reflection DB and required adapter working directory.
+    def _resolve_work_dir(self) -> Optional[str]:
+        """Resolve the adapter working directory.
 
-        The agent may expose a SQLite ``storage_path`` for the optional
-        reflection source; factual training data never comes from that file.
-        There is no ``data_dir`` attribute on the agent.
+        An explicit work dir wins; otherwise it sits beside the agent's
+        ``storage_path``.  No training data is read from that storage file —
+        every example arrives in the governed snapshot.  There is no
+        ``data_dir`` attribute on the agent.
         """
-        if self._db_path and self._work_dir:
-            return self._db_path, self._work_dir
         configured_work = getattr(self.agent, "parametric_self_work_dir", None)
         explicit_work = self._work_dir or (
             configured_work if isinstance(configured_work, (str, Path)) and str(configured_work) else None
         )
+        if explicit_work:
+            return str(explicit_work)
         storage_path = getattr(self.agent, "storage_path", None)
         if not storage_path:
-            return self._db_path, str(explicit_work) if explicit_work else None
-        db = self._db_path or str(storage_path)
-        work = explicit_work or str(Path(storage_path).parent / "parametric_self")
-        return db, work
+            return None
+        return str(Path(storage_path).parent / "parametric_self")
 
     def _legacy_corpus_cleanup_needed(self) -> bool:
         """Whether unknown-owner pre-per-run corpus files must be retained."""
-        _, work_dir = self._resolve_paths()
+        work_dir = self._resolve_work_dir()
         if not work_dir:
             return False
         legacy_dir = Path(work_dir) / "corpus"
@@ -1716,7 +1731,7 @@ class ParametricSelfFeature(Feature):
         # supported host, corpus/policy evidence remains a hard prerequisite.
         if not self._adapter.is_available():
             return {"trained": False, "promoted": False, "reason": "trainer unavailable on this host"}
-        db_path, work_dir = self._resolve_paths()
+        work_dir = self._resolve_work_dir()
         if not work_dir:
             return {"trained": False, "promoted": False, "reason": "could not resolve parametric-self work directory"}
 
@@ -1744,7 +1759,6 @@ class ParametricSelfFeature(Feature):
         try:
             result = await run_nightly_cycle(
                 agent_id=str(agent_id),
-                db_path=db_path,
                 work_dir=work_dir,
                 governed_snapshot=governed_snapshot,
                 adapter=self._adapter,
@@ -1977,7 +1991,7 @@ class ParametricSelfFeature(Feature):
 
     def _delete_confirmed_retained_corpora(self, paths: set[str]) -> None:
         """Delete only per-run corpora whose child stop was affirmatively proven."""
-        _, work_dir = self._resolve_paths()
+        work_dir = self._resolve_work_dir()
         if not work_dir:
             return
         corpus_root = (Path(work_dir) / "corpus").resolve()

@@ -23,9 +23,10 @@ dependencies = [
     "kestrel-sovereign-sdk>=0.14.1,<1",
     # NB: the MLX LoRA trainer's runtime (mlx-lm) is an OPTIONAL extra, not a
     # hard dependency — see [project.optional-dependencies].local below.
-    # NB: the corpus builder reads reflection's plaintext output tables directly
-    # (loose coupling, no import), so kestrel-feature-reflection is an *optional*
-    # runtime companion (see component.yaml), not a hard dependency.
+    # NB: reflections reach the corpus only as governed assertions from a
+    # reflection source; this package never imports reflection or reads its
+    # tables, so kestrel-feature-reflection is an *optional* runtime companion
+    # (see component.yaml), not a hard dependency.
 ]
 
 [project.optional-dependencies]

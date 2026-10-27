@@ -37,17 +37,44 @@ must replace that pin with the published capability-bearing version.
 ## Governed training corpus
 
 Nightly training remains disabled by default and requires an explicit
-`GovernedCorpusPolicy` from the host/operator before it can use factual
-examples. The feature asks the agent's storage capability for a checkpointed,
+`GovernedCorpusPolicy` from the host/operator before it can use any example.
+The feature asks the agent's storage capability for a checkpointed,
 policy-pinned governed assertion snapshot after successful semantic
-maintenance; it never reads factual graph rows or a local database directly.
-Reflection insights remain a distinct source.
+maintenance; it never reads graph rows, reflection's tables or a local
+database directly.
+
+Reflection insights remain a distinct, separately labelled source, but they
+arrive only as governed assertions whose source kind is
+`REFLECTION_SOURCE_KIND` (`"agent_reflection"`), so the policy's consent,
+source and exclusion rules apply to them as to every other example. A
+reflection is admitted only when every reflection source names the session(s)
+it was derived from and the snapshot's policy can exclude sessions and saved
+items (kestrel-sovereign#3849). Otherwise it is left out and counted as
+`reflection_unresolved` in the manifest. It is never admitted by default. On a
+core release without those exclusions, no reflection reaches training. A
+snapshot that includes an example its own policy excludes is refused outright.
+A policy restored from its mapping keeps its exclusion sets. A core that cannot
+apply a field refuses it rather than dropping it.
+
+**No reflection reaches training yet.** Nothing publishes `"agent_reflection"`
+assertions today. `kestrel-feature-reflection` stores insights only in its own
+`reflection_insights` table. That table's `session_id` names the reflection
+run, not the conversations the insight was drawn from, and nothing records
+those conversation sessions. Until a producer records them and publishes
+insights through core's governed write path, every reflection is unresolved and
+left out.
 
 Each candidate retains an immutable, content-free manifest of its accepted
 assertion/revision lineage and semantic checkpoint. A tombstone, stale
 revision, missing manifest, or unverifiable host capability quarantines the
 affected candidate or served adapter until it is rebuilt. This is intentionally
 a visible no-op rather than a fallback to ungoverned factual training.
+
+An adapter is also quarantined if its manifest was built under an earlier
+corpus policy, if any example lacks an assertion revision, or if a reflection
+example names no session. Adapters from the old policy may hold reflection rows
+read straight from reflection's table. Restart, adoption and rollback all refuse
+them, so they must be rebuilt rather than grandfathered.
 
 ## Inference use
 

@@ -18,6 +18,7 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_feature_parametric_self import ParametricSelfFeature
+from kestrel_feature_parametric_self.corpus import CORPUS_POLICY_VERSION
 
 
 def _snapshot():
@@ -40,11 +41,14 @@ def _snapshot():
 
 def _write_governed_manifest(candidate):
     raw = {
-        "schema_version": 1, "corpus_policy_version": "parametric-self-corpus-v1",
+        "schema_version": 1, "corpus_policy_version": CORPUS_POLICY_VERSION,
         "policy_digest": "sha256:policy", "snapshot_hash": "sha256:snapshot",
         "semantic_checkpoint": {"tenant_id": "tenant:test", "generation": 1, "event_id": "event:1"},
         "capability_versions": {"semantic_maintenance": "1"},
-        "counts": {"total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1},
+        "counts": {
+            "total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1,
+            "reflection_unresolved": 0,
+        },
         "examples": [{"example_id": "example:1", "source": "governed_assertion", "split": "train", "lineage": {
             "assertion_id": "assertion:test", "revision_id": "revision:test", "content_hash": "sha256:test",
             "source_occurrence_ids": [], "eligibility": "included",
@@ -1208,8 +1212,7 @@ async def test_active_candidate_marked_in_progress_not_recoverable(tmp_path):
 async def test_cycle_records_in_progress_then_completed(tmp_path):
     """The cycle appends an in_progress entry up front and updates it in place
     on completion — one durable record, not a completion-only append."""
-    db = _db_path_with_corpus(tmp_path)
-    f = await _feature(_FakeStorage(), storage_path=db)
+    f = await _feature(_FakeStorage(), storage_path=_storage_path(tmp_path))
     f._adapter.is_available = lambda: True
     seen_states = []
 
@@ -1225,7 +1228,7 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
         from kestrel_feature_parametric_self.corpus import build_corpus
         candidate = kwargs["work_dir"] + "/candidates/" + kwargs["adapter_id"]
         stats = build_corpus(
-            kwargs["db_path"], kwargs["work_dir"] + "/corpus",
+            kwargs["work_dir"] + "/corpus",
             governed_snapshot=kwargs["governed_snapshot"], manifest_dir=candidate,
         )
         return CycleResult(
@@ -1259,8 +1262,7 @@ async def test_cycle_records_in_progress_then_completed(tmp_path):
 
 
 async def test_cycle_marks_failed_on_exception(tmp_path):
-    db = _db_path_with_corpus(tmp_path)
-    f = await _feature(_FakeStorage(), storage_path=db)
+    f = await _feature(_FakeStorage(), storage_path=_storage_path(tmp_path))
     # Reach the patched training exception path on Linux CI as well as macOS.
     f._adapter.is_available = lambda: True
     import kestrel_feature_parametric_self.feature as feat_mod
@@ -1294,6 +1296,6 @@ async def test_reconcile_marks_stale_in_progress_interrupted():
     assert runs[-1]["state"] == "interrupted"
 
 
-def _db_path_with_corpus(tmp_path) -> str:
-    """Minimal storage_path; run_nightly_cycle is faked so the DB is unused."""
+def _storage_path(tmp_path) -> str:
+    """Minimal storage_path; it only places the work dir beside it."""
     return str(tmp_path / "kestrel_prime.db")

@@ -12,8 +12,9 @@ dict. It is **not** memory — RAG remains the factual layer.
 See ``docs/TWO_BRAIN_ARCHITECTURE.md`` and
 epic #1 for the design and phased build.
 
-P1 adds the text-native training path: ``TextLoRAConfig``, the reflection-derived
-corpus builder, and ``LocalMLXAdapter`` (Apple-Silicon MLX LoRA).
+P1 adds the text-native training path: ``TextLoRAConfig``, the governed corpus
+builder (reflections arrive as governed assertions from
+``REFLECTION_SOURCE_KIND``), and ``LocalMLXAdapter`` (Apple-Silicon MLX LoRA).
 
 P2a adds the nightly orchestration behind a default-OFF gate: the ``FidelityGate``
 (held-out val-loss promotion check), ``run_nightly_cycle`` (corpus→train→gate),
@@ -21,7 +22,7 @@ and ``ParametricSelfSleepHook`` (the sleep-cycle wrapper). Core sleep-hook
 dispatch is P2b.
 """
 
-from .corpus import CorpusStats, build_corpus
+from .corpus import REFLECTION_SOURCE_KIND, CorpusStats, build_corpus
 from .cycle import CycleResult, run_nightly_cycle
 from .feature import ParametricSelfFeature
 from .fidelity import FidelityGate, GateDecision, parse_final_val_loss, parse_latest_iter
@@ -43,6 +44,7 @@ __all__ = [
     "TextLoRAConfig",
     "build_corpus",
     "CorpusStats",
+    "REFLECTION_SOURCE_KIND",
     "LocalMLXAdapter",
     "TrainerUnavailableError",
     "build_lora_argv",

@@ -738,7 +738,6 @@ class ParametricSelfKiteErasureHook:
                 )
             _verify_private_scratch_tree(scratch, identities)
             stats = build_corpus(
-                None,
                 str(corpus_dir),
                 governed_snapshot=snapshot,
                 manifest_dir=str(candidate),

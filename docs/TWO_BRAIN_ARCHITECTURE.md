@@ -95,14 +95,20 @@ Training turns user-authored content into two artifacts: a **transient corpus**
 ## 6. Where it lives in the system
 
 - **Training trigger:** a new phase in the sleep cycle, after `_consolidate_memories()` in `kestrel_sovereign/agent/sleep.py`. Consolidation already produces the curated corpus.
-- **Corpus source:** reflection insights remain a separately labelled symbolic-self
-  source. Factual examples arrive only through the host's governed assertion-
-  corpus snapshot after successful semantic maintenance—never by opening a
-  cognition database or reading a graph projection. Every candidate records an
+- **Corpus source:** every example, factual or reflective, arrives only through
+  the host's governed assertion-corpus snapshot after successful semantic
+  maintenance—never by opening a cognition database or reading a graph
+  projection. Reflection insights remain a separately labelled symbolic-self
+  source: governed assertions from a reflection source whose provenance names
+  the session(s) they were derived from, admitted only under a policy that can
+  exclude sessions (an unresolved reflection is left out). No producer publishes
+  those assertions yet: reflection keeps insights in its own table without the
+  conversation sessions they came from, so today no reflection reaches
+  training. Every candidate records an
   immutable, content-free manifest with the policy/capability pins, checkpoint,
   assertion revisions, hashes, eligibility lineage, and deterministic split.
   Tombstones quarantine affected candidates/served adapters until a clean
-  rebuild. Note: `conversation_history.content` is Fernet-encrypted at rest, so
+  rebuild, as does a manifest built under an earlier corpus policy. Note: `conversation_history.content` is Fernet-encrypted at rest, so
   any use of raw turns must decrypt **inside the agent trust boundary**.
 - **Training adapter:** a new `LocalMLXAdapter` + `TextLoRAConfig` in `features/training/`, **importing** (never copying) the modality-neutral lifecycle types (`TrainingState`/`TrainingJob`/`TrainingStatus`/`TrainingProviderFactory`) and adding a `ProviderType.LOCAL_MLX`. See [§8](#8-build-strategy) — this is Strategy B (parallel LLM path), not a refactor of the image pipeline.
 - **Serving:** the owned brain serves via `mlx_lm.server` (OpenAI-compatible), reached through the existing generic OpenAI-compatible route in `llm/provider_registry.py` — **zero new LLM adapters**, just a config route (vendor/route/model).

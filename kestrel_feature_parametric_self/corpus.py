@@ -1,10 +1,15 @@
-"""Build a transient MLX corpus from reflections and governed assertions.
+"""Build a transient MLX corpus from a governed assertion snapshot.
 
-Reflections remain this feature's distinct symbolic-self input.  Factual
-examples arrive only in a host-provided governed assertion snapshot: this
-module never opens a fact table, receives a database handle, or reconstructs
-assertion eligibility itself.  The durable sidecar records lineage hashes and
-identifiers, never prompt/answer text.
+Every example arrives in a host-provided governed assertion snapshot: this
+module never opens a database, receives a database handle, or reconstructs
+assertion eligibility itself.  Reflections remain this feature's distinct
+symbolic-self source, but only as governed assertions read from a reflection
+source (``REFLECTION_SOURCE_KIND``), so they carry the same consent, source and
+exclusion decisions as every other example.  A reflection is admitted only
+when its provenance names the session(s) it was derived from and the snapshot's
+policy can exclude sessions; otherwise it is left out, never admitted by
+default.  The durable sidecar records lineage hashes and identifiers, never
+prompt/answer text.
 """
 
 from __future__ import annotations
@@ -12,14 +17,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 
-EXTERNALLY_GROUNDED_TYPES = ("failure", "success", "improvement")
-CORPUS_POLICY_VERSION = "parametric-self-corpus-v1"
+REFLECTION_SOURCE_KIND = "agent_reflection"
+CORPUS_POLICY_VERSION = "parametric-self-corpus-v2"
 MANIFEST_FILENAME = "corpus_manifest.json"
 
 
@@ -36,6 +40,7 @@ class CorpusStats:
     valid: int
     from_insights: int
     from_facts: int
+    insights_unresolved: int
     out_dir: str
     manifest_path: str
     manifest_hash: str
@@ -72,56 +77,36 @@ def _human_term(value: object) -> str:
     return raw.replace("_", " ").strip()
 
 
-def _reflection_examples(db_path: str | None, grounded_only: bool) -> list[dict[str, Any]]:
-    """Read reflection's own table only; no factual data is read from SQLite."""
-    if not db_path or not Path(db_path).is_file():
-        return []
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        rows = con.execute(
-            "SELECT id, type, title, description, suggested_action FROM reflection_insights "
-            "WHERE title IS NOT NULL AND length(trim(title)) > 0"
-        ).fetchall()
-    finally:
-        con.close()
-    examples: list[dict[str, Any]] = []
-    for insight_id, insight_type, title, description, suggested_action in rows:
-        if grounded_only and insight_type not in EXTERNALLY_GROUNDED_TYPES:
+def _reflection_sessions(sources: tuple[Any, ...]) -> tuple[str, ...] | None:
+    """The sessions a reflection was derived from, or None if one source names none.
+
+    Called only under a policy that can exclude sessions; every core with such
+    a policy also names sessions in source provenance.
+    """
+    from kestrel_sovereign.knowledge import SourceReferenceKind
+
+    sessions: set[str] = set()
+    for source in sources:
+        if getattr(source, "source_kind", None) != REFLECTION_SOURCE_KIND:
             continue
-        description = (description or "").strip()
-        suggested_action = (suggested_action or "").strip()
-        if not description and not suggested_action:
-            continue
-        answer = description
-        if suggested_action:
-            answer = f"{answer}\n\nWhat to do: {suggested_action}".strip()
-        stable_identity = {
-            "source": "reflection",
-            "reflection_id": str(insight_id),
-            "type": str(insight_type),
-            "title": title.strip(),
-            "content_hash": _digest([description, suggested_action]),
-            "policy_version": CORPUS_POLICY_VERSION,
+        named = {
+            identifier
+            for kind, identifier in getattr(source, "references", ())
+            if kind is SourceReferenceKind.SESSION
         }
-        examples.append(
-            {
-                "example_id": _digest(stable_identity),
-                "source": "reflection",
-                "lineage": {"reflection_id": str(insight_id), "content_hash": stable_identity["content_hash"]},
-                "messages": [
-                    {"role": "user", "content": f"From your reflections, what did you learn about: {title.strip()}?"},
-                    {"role": "assistant", "content": answer},
-                ],
-            }
-        )
-    return examples
+        if not named:
+            return None
+        sessions |= named
+    return tuple(sorted(sessions))
 
 
-def _governed_examples(snapshot: Any) -> list[dict[str, Any]]:
-    """Translate immutable host-approved examples without second-guessing policy."""
+def _governed_examples(snapshot: Any) -> tuple[list[dict[str, Any]], int]:
+    """Translate host-approved examples; return them with the unresolved-reflection count."""
     if snapshot is None or not getattr(snapshot, "verified", False):
         raise GovernedCorpusRequiredError("governed_corpus_snapshot_required")
+    excludes = getattr(getattr(snapshot, "policy", None), "excludes", None)
     examples: list[dict[str, Any]] = []
+    unresolved_reflections = 0
     for item in tuple(getattr(snapshot, "examples", ())):
         decision = getattr(item, "decision", None)
         if not bool(getattr(decision, "included", False)):
@@ -137,15 +122,35 @@ def _governed_examples(snapshot: Any) -> list[dict[str, Any]]:
         value = _term_value(getattr(assertion, "object", "")).strip()
         if not subject or not predicate or not value:
             raise GovernedCorpusRequiredError("governed_corpus_example_content_invalid")
+        sources = tuple(getattr(item, "source_occurrences", ()))
+        if callable(excludes) and excludes(assertion, sources):
+            raise GovernedCorpusRequiredError("governed_corpus_contains_excluded_example")
         source_ids = tuple(
             sorted(
                 str(getattr(source, "source_occurrence_id"))
-                for source in tuple(getattr(item, "source_occurrences", ()))
+                for source in sources
                 if getattr(source, "source_occurrence_id", None)
             )
         )
+        lineage: dict[str, Any] = {
+            "assertion_id": assertion_id,
+            "revision_id": revision_id,
+            "content_hash": content_hash,
+            "source_occurrence_ids": source_ids,
+            "eligibility": getattr(getattr(decision, "reason", None), "value", "included"),
+        }
+        source_label = "governed_assertion"
+        if any(getattr(source, "source_kind", None) == REFLECTION_SOURCE_KIND for source in sources):
+            # Without a policy that can exclude sessions, a reflection cannot
+            # be shown to be clear of an excluded one.
+            sessions = _reflection_sessions(sources) if callable(excludes) else None
+            if sessions is None:
+                unresolved_reflections += 1
+                continue
+            source_label = "reflection"
+            lineage["session_ids"] = sessions
         stable_identity = {
-            "source": "governed_assertion",
+            "source": source_label,
             "assertion_id": assertion_id,
             "revision_id": revision_id,
             "content_hash": content_hash,
@@ -154,21 +159,15 @@ def _governed_examples(snapshot: Any) -> list[dict[str, Any]]:
         examples.append(
             {
                 "example_id": _digest(stable_identity),
-                "source": "governed_assertion",
-                "lineage": {
-                    "assertion_id": assertion_id,
-                    "revision_id": revision_id,
-                    "content_hash": content_hash,
-                    "source_occurrence_ids": source_ids,
-                    "eligibility": getattr(getattr(decision, "reason", None), "value", "included"),
-                },
+                "source": source_label,
+                "lineage": lineage,
                 "messages": [
                     {"role": "user", "content": f"What do you know about {subject}'s {predicate}?"},
                     {"role": "assistant", "content": value},
                 ],
             }
         )
-    return examples
+    return examples, unresolved_reflections
 
 
 def _split_examples(examples: Iterable[dict[str, Any]], valid_every: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -193,6 +192,42 @@ def _write_jsonl(path: Path, examples: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps({"messages": example["messages"]}, ensure_ascii=False) + "\n")
 
 
+def corpus_manifest_problem(manifest: dict[str, Any]) -> str | None:
+    """Why a manifest cannot authorize its adapter under this corpus policy, if it can't.
+
+    The manifest is the only record of what an adapter's weights absorbed, so
+    an adapter is accepted only if its manifest was built under the current
+    corpus policy and every example is a governed assertion revision.  A
+    reflection must also name the session(s) it was derived from.  An adapter
+    built under an earlier policy may hold reflection rows read straight from
+    reflection's table, with no consent, source or exclusion decision; it must
+    be rebuilt, never grandfathered.
+    """
+    if manifest.get("corpus_policy_version") != CORPUS_POLICY_VERSION:
+        return "candidate corpus policy superseded; rebuild required"
+    examples = manifest.get("examples")
+    if not isinstance(examples, list):
+        return "candidate manifest governed evidence is malformed"
+    for example in examples:
+        lineage = example.get("lineage") if isinstance(example, dict) else None
+        if (
+            not isinstance(lineage, dict)
+            or example.get("source") not in ("governed_assertion", "reflection")
+            or not isinstance(lineage.get("assertion_id"), str)
+            or not isinstance(lineage.get("revision_id"), str)
+        ):
+            return "candidate manifest example lineage missing; rebuild required"
+        if example["source"] == "reflection":
+            sessions = lineage.get("session_ids")
+            if (
+                not isinstance(sessions, list)
+                or not sessions
+                or not all(isinstance(item, str) and item for item in sessions)
+            ):
+                return "candidate manifest reflection session lineage missing; rebuild required"
+    return None
+
+
 def _write_immutable_manifest(path: Path, manifest: dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest_hash = _digest(manifest)
@@ -210,12 +245,10 @@ def _write_immutable_manifest(path: Path, manifest: dict[str, Any]) -> str:
 
 
 def build_corpus(
-    db_path: str | None,
     out_dir: str,
     *,
     governed_snapshot: Any,
     manifest_dir: str,
-    grounded_only: bool = True,
     valid_every: int = 10,
 ) -> CorpusStats:
     """Build transient JSONL plus an immutable, content-free lineage sidecar.
@@ -223,11 +256,11 @@ def build_corpus(
     ``governed_snapshot`` must be the public capability result captured by the
     host after semantic maintenance.  It is mandatory even if this particular
     agent currently has zero accepted assertions: capability absence is never
-    interpreted as permission to use an ungoverned fact source.
+    interpreted as permission to use an ungoverned source.
     """
     if valid_every < 0:
         raise ValueError("valid_every must be non-negative")
-    governed = _governed_examples(governed_snapshot)
+    all_examples, unresolved_reflections = _governed_examples(governed_snapshot)
     checkpoint = getattr(governed_snapshot, "checkpoint", None)
     policy = getattr(governed_snapshot, "policy", None)
     policy_digest = getattr(policy, "digest", None)
@@ -246,11 +279,7 @@ def build_corpus(
         raise GovernedCorpusRequiredError("governed_corpus_snapshot_metadata_invalid")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    reflections = _reflection_examples(db_path, grounded_only)
-    all_examples = [
-        example for example in reflections + governed
-        if example["messages"][1]["content"]
-    ]
+    reflections = sum(1 for example in all_examples if example["source"] == "reflection")
     train, valid = _split_examples(all_examples, valid_every)
     split_by_id = {example["example_id"]: "train" for example in train}
     split_by_id.update({example["example_id"]: "valid" for example in valid})
@@ -276,7 +305,9 @@ def build_corpus(
         "capability_versions": dict(sorted(dict(getattr(governed_snapshot, "capability_versions", {})).items())),
         "counts": {
             "total": len(all_examples), "train": len(train), "valid": len(valid),
-            "reflection": len(reflections), "governed_assertion": len(governed),
+            "reflection": reflections,
+            "governed_assertion": len(all_examples) - reflections,
+            "reflection_unresolved": unresolved_reflections,
         },
         "examples": manifest_examples,
     }
@@ -287,11 +318,11 @@ def build_corpus(
     assertion_lineage = tuple(
         (example["lineage"]["assertion_id"], example["lineage"]["revision_id"])
         for example in manifest_examples
-        if example["source"] == "governed_assertion"
     )
     return CorpusStats(
         total=len(all_examples), train=len(train), valid=len(valid),
-        from_insights=len(reflections), from_facts=len(governed), out_dir=str(out),
+        from_insights=reflections, from_facts=len(all_examples) - reflections,
+        insights_unresolved=unresolved_reflections, out_dir=str(out),
         manifest_path=str(manifest_path), manifest_hash=manifest_hash,
         semantic_checkpoint_generation=generation,
         semantic_checkpoint_id=getattr(checkpoint, "latest_event_id", None),
