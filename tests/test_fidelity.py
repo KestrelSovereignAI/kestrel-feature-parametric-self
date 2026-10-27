@@ -53,6 +53,7 @@ JUNE_FILES = (
     FINAL_ADAPTER_FILE,
 )
 VAL = ValSet(digest="sha256:" + "ab" * 32, examples=75)
+BASE = "mlx-community/gemma-4-31b-it-4bit"
 
 
 def _june():
@@ -122,13 +123,13 @@ def test_the_final_weights_file_is_a_checkpoint_when_no_periodic_save_holds_them
 
 def test_june_r1_baseline_present_decision_is_not_inconclusive():
     checkpoints, baseline = _june()
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.outcome is not GateOutcome.INCONCLUSIVE
 
 
 def test_june_r2a_default_config_rejects_overfit_and_promotes_nothing():
     checkpoints, baseline = _june()
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.outcome is GateOutcome.REJECT
     assert decision.reason is GateReason.OVERFIT
     assert decision.promote is False
@@ -145,7 +146,7 @@ def test_june_r2a_default_config_rejects_overfit_and_promotes_nothing():
 )
 def test_june_r2b_relaxed_overfit_promotes_the_iter_200_checkpoint(gate):
     checkpoints, baseline = _june()
-    decision = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.outcome is GateOutcome.PROMOTE
     assert decision.promoted_checkpoint_id == ITER_200
 
@@ -159,7 +160,7 @@ def test_june_r2b_relaxed_overfit_promotes_the_iter_200_checkpoint(gate):
 ])
 def test_june_r2c_iter_400_is_never_promoted(gate):
     checkpoints, baseline = _june()
-    decision = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.promoted_checkpoint_id != ITER_400
 
 
@@ -187,7 +188,7 @@ def test_june_r3_legacy_gate_promoted_the_overfit_final_checkpoint():
     assert final.checkpoint_id == ITER_400
     assert parse_final_val_loss(JUNE_LOG) == final.val_loss == 2.688
     # The new gate, on the same fixture, does not.
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=_june()[1], val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=_june()[1], val_set=VAL, base_model=BASE)
     assert decision.promote is False
 
 
@@ -205,14 +206,14 @@ def _assert_inconclusive(decision, reason):
 
 def test_inconclusive_when_val_set_missing():
     checkpoints, baseline = _june()
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=None)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=None, base_model=BASE)
     _assert_inconclusive(decision, GateReason.VAL_SET_MISSING)
 
 
 def test_inconclusive_when_val_set_empty():
     checkpoints, baseline = _june()
     decision = FidelityGate().evaluate(
-        checkpoints=checkpoints, baseline=baseline, val_set=ValSet(VAL.digest, 0),
+        checkpoints=checkpoints, baseline=baseline, val_set=ValSet(VAL.digest, 0), base_model=BASE,
     )
     _assert_inconclusive(decision, GateReason.VAL_SET_EMPTY)
 
@@ -220,47 +221,47 @@ def test_inconclusive_when_val_set_empty():
 @pytest.mark.parametrize("bad", [math.nan, math.inf, 0.0, -1.0], ids=["nan", "inf", "zero", "negative"])
 def test_inconclusive_when_a_candidate_loss_is_unusable(bad):
     checkpoints, baseline = _run((200, 2.0), (400, bad))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.CANDIDATE_LOSS_INVALID)
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, 0.0, -1.0], ids=["nan", "inf", "zero", "negative"])
 def test_inconclusive_when_the_baseline_loss_is_unusable(bad):
     checkpoints, baseline = _run((200, 2.0), (400, 2.0), baseline_loss=bad)
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.BASELINE_LOSS_INVALID)
 
 
 def test_non_finite_losses_stay_visible_in_the_record():
     checkpoints, baseline = _run((200, math.nan), (400, 2.0), baseline_loss=math.inf)
     record = FidelityGate().evaluate(
-        checkpoints=checkpoints, baseline=baseline, val_set=VAL,
+        checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE,
     ).to_record()
     assert record["final_val_loss"] == 2.0
     assert record["baseline_val_loss"] == "inf"
 
 
 def test_inconclusive_when_there_are_no_checkpoints():
-    decision = FidelityGate().evaluate(checkpoints=(), baseline=Baseline("base", 8.0), val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=(), baseline=Baseline("base", 8.0), val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.NO_CHECKPOINTS)
 
 
 def test_inconclusive_when_no_checkpoint_has_a_val_loss():
     checkpoints, baseline = _run((100, None), (200, None))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.NO_CHECKPOINT_VAL_LOSS)
     assert decision.best is None
 
 
 def test_inconclusive_when_the_final_checkpoint_was_not_scored():
     checkpoints, baseline = _run((200, 2.0), (300, None))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.FINAL_CHECKPOINT_NO_VAL_LOSS)
 
 
 def test_inconclusive_when_the_base_was_not_scored():
     checkpoints, baseline = _run((200, 1.866), (400, 1.800), baseline_loss=None)
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.BASELINE_UNAVAILABLE)
 
 
@@ -270,14 +271,14 @@ def test_inconclusive_when_a_checkpoint_could_not_be_scored():
         Checkpoint(ITER_200, 200, None, error="evaluation reported no test loss"),
         Checkpoint(ITER_400, 400, 1.5),
     )
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=Baseline("base", 9.0), val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=Baseline("base", 9.0), val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.CANDIDATE_EVAL_FAILED)
     assert "no test loss" in decision.detail
 
 
 def test_inconclusive_when_there_is_no_baseline():
     checkpoints, _ = _run((200, 2.0), (400, 2.0))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=None, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=None, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.BASELINE_UNAVAILABLE)
 
 
@@ -286,22 +287,38 @@ def test_inconclusive_when_scoring_the_baseline_failed():
     decision = FidelityGate().evaluate(
         checkpoints=checkpoints,
         baseline=Baseline("served:abc/0000200_adapters.safetensors", error="RuntimeError: boom"),
-        val_set=VAL,
+        val_set=VAL, base_model=BASE,
     )
     _assert_inconclusive(decision, GateReason.BASELINE_EVAL_FAILED)
     assert "boom" in decision.detail
 
 
+def test_inconclusive_when_the_baseline_changed_before_the_decision():
+    """A baseline that stopped being the baseline is never compared, whatever it scored."""
+    checkpoints, _ = _run((200, 2.0), (400, 2.0))
+    decision = FidelityGate().evaluate(
+        checkpoints=checkpoints,
+        baseline=Baseline(
+            "served:abc/0000200_adapters.safetensors", 50.0,
+            changed="the served adapter changed during this run",
+        ),
+        val_set=VAL, base_model=BASE,
+    )
+    _assert_inconclusive(decision, GateReason.BASELINE_CHANGED)
+    assert "changed during this run" in decision.detail
+    assert decision.to_record()["baseline_changed"] == "the served adapter changed during this run"
+
+
 def test_inconclusive_checks_run_before_overfit_and_margin():
     """A run that would also fail overfit and margin reports what blocked it first."""
     checkpoints, _ = _run((200, 1.0), (400, 9.0))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=None, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=None, val_set=VAL, base_model=BASE)
     _assert_inconclusive(decision, GateReason.BASELINE_UNAVAILABLE)
 
 
 def test_overfit_is_checked_before_margin():
     checkpoints, baseline = _run((200, 7.99), (400, 9.6), baseline_loss=8.0)
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.reason is GateReason.OVERFIT
 
 
@@ -314,7 +331,7 @@ BASELINE_LOSS = 2.5
 
 def _margin_case(best_loss):
     checkpoints, baseline = _run((200, best_loss), (400, best_loss), baseline_loss=BASELINE_LOSS)
-    return FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    return FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
 
 
 def test_margin_exactly_at_the_boundary_rejects():
@@ -340,7 +357,7 @@ def test_margin_just_outside_the_boundary_rejects():
 
 def _ratio_case(final_loss, best_loss=1.25):
     checkpoints, baseline = _run((200, best_loss), (400, final_loss), baseline_loss=8.0)
-    return FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    return FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
 
 
 def test_ratio_exactly_at_the_limit_passes_the_overfit_check():
@@ -370,7 +387,7 @@ def test_ratio_just_over_the_limit_rejects_overfit():
 
 def test_a_clearly_improving_run_promotes_its_best_checkpoint():
     checkpoints, baseline = _run((100, 4.0), (200, 2.4), (300, 2.1), (400, 2.0), baseline_loss=9.0)
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.outcome is GateOutcome.PROMOTE
     assert decision.reason is GateReason.PASSED
     assert decision.promoted_checkpoint_id == ITER_400
@@ -378,13 +395,13 @@ def test_a_clearly_improving_run_promotes_its_best_checkpoint():
 
 def test_a_mild_back_half_rise_promotes_the_best_not_the_final():
     checkpoints, baseline = _run((200, 2.0), (400, 2.2), baseline_loss=9.0)
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.promoted_checkpoint_id == ITER_200
 
 
 def test_ties_go_to_the_earlier_checkpoint():
     checkpoints, baseline = _run((200, 2.0), (400, 2.0), baseline_loss=9.0)
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL)
+    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
     assert decision.promoted_checkpoint_id == ITER_200
 
 
@@ -397,13 +414,13 @@ def _decisions_by_path():
     margin_checkpoints, margin_base = _run((200, 2.45), (400, 2.45), baseline_loss=BASELINE_LOSS)
     return {
         "promote": FidelityGate(overfit_ratio=1.5).evaluate(
-            checkpoints=june_checkpoints, baseline=june_base, val_set=VAL),
+            checkpoints=june_checkpoints, baseline=june_base, val_set=VAL, base_model=BASE),
         "reject-overfit": FidelityGate().evaluate(
-            checkpoints=june_checkpoints, baseline=june_base, val_set=VAL),
+            checkpoints=june_checkpoints, baseline=june_base, val_set=VAL, base_model=BASE),
         "reject-margin": FidelityGate().evaluate(
-            checkpoints=margin_checkpoints, baseline=margin_base, val_set=VAL),
+            checkpoints=margin_checkpoints, baseline=margin_base, val_set=VAL, base_model=BASE),
         "inconclusive": FidelityGate().evaluate(
-            checkpoints=june_checkpoints, baseline=None, val_set=None),
+            checkpoints=june_checkpoints, baseline=None, val_set=None, base_model=BASE),
     }
 
 
@@ -429,6 +446,7 @@ def test_records_carry_the_comparison_and_explicit_nulls():
     assert promote["required_below"] == margin_threshold(8.977, 0.02)
     assert promote["ratio"] == pytest.approx(1.4405, abs=1e-4)
     assert promote["val_set_digest"] == VAL.digest and promote["val_set_examples"] == 75
+    assert promote["base_model"] == BASE and promote["baseline_changed"] is None
     assert promote["promoted_checkpoint_id"] == ITER_200
     assert promote["checkpoints"] == [
         {"checkpoint_id": ITER_200, "iteration": 200, "val_loss": 1.866, "error": None},
@@ -438,8 +456,8 @@ def test_records_carry_the_comparison_and_explicit_nulls():
     inconclusive = decisions["inconclusive"].to_record()
     for field in (
         "best_checkpoint_id", "best_val_loss", "final_checkpoint_id", "final_val_loss",
-        "baseline_source", "baseline_val_loss", "baseline_error", "required_below", "ratio",
-        "val_set_digest", "val_set_examples", "promoted_checkpoint_id",
+        "baseline_source", "baseline_val_loss", "baseline_error", "baseline_changed",
+        "required_below", "ratio", "val_set_digest", "val_set_examples", "promoted_checkpoint_id",
     ):
         assert field in inconclusive and inconclusive[field] is None
 
@@ -447,18 +465,19 @@ def test_records_carry_the_comparison_and_explicit_nulls():
 @pytest.mark.parametrize("path", ["promote", "reject-overfit", "reject-margin", "inconclusive"])
 def test_a_record_gives_back_the_inputs_its_gate_run_scored(path):
     decision = _decisions_by_path()[path]
-    checkpoints, baseline, val_set = recorded_inputs(decision.to_record())
+    checkpoints, baseline, val_set, base_model = recorded_inputs(decision.to_record())
     assert checkpoints == decision.checkpoints
     assert baseline == decision.baseline
     assert val_set == decision.val_set
+    assert base_model == decision.base_model == BASE
 
 
 def test_a_record_keeps_failed_and_non_finite_scores():
     checkpoints = (Checkpoint(ITER_200, 200, math.inf), Checkpoint(ITER_400, 400, None, error="boom"))
     record = FidelityGate().evaluate(
-        checkpoints=checkpoints, baseline=Baseline("base", error="lost"), val_set=VAL,
+        checkpoints=checkpoints, baseline=Baseline("base", error="lost"), val_set=VAL, base_model=BASE,
     ).to_record()
-    recorded, baseline, _ = recorded_inputs(record)
+    recorded, baseline, _, _ = recorded_inputs(record)
     assert recorded[0].val_loss == math.inf
     assert recorded[1] == Checkpoint(ITER_400, 400, None, error="boom")
     assert baseline == Baseline("base", error="lost")
@@ -470,11 +489,13 @@ def test_a_record_keeps_failed_and_non_finite_scores():
     {"checkpoints": [{"checkpoint_id": ITER_200, "iteration": 200, "val_loss": "low"}]},
     {"checkpoints": [{"checkpoint_id": "../served/adapters.safetensors", "iteration": 200, "val_loss": 1.0}]},
     {"baseline_val_loss": [8.0]},
+    {"baseline_changed": 1},
     {"val_set_digest": None},
+    {"base_model": ["gemma"]},
 ])
 def test_a_malformed_record_is_refused(damage):
     checkpoints, baseline = _june()
-    record = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL).to_record()
+    record = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE).to_record()
     with pytest.raises(ValueError):
         recorded_inputs({**record, **damage})
 

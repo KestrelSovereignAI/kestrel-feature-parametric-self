@@ -15,6 +15,13 @@ checkpoint N after it, so the training log never scores a saved file. Once
 training ends, the cycle scores every saved checkpoint, the final weights and
 the baseline with ``mlx_lm.lora --test`` on the run's validation set, while that
 set still exists. Each loss the gate compares is a score of the weights it names.
+
+The baseline is whatever was served, on the configured base model, when the run
+started. The cycle re-reads both just before it scores the baseline and again
+before the gate decides. If either changed (the served adapter was swapped or
+quarantined, or the base model was reconfigured), the baseline is no longer the
+one the candidate must beat, so the gate is inconclusive. Changed weights are
+never loaded.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
 
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 
@@ -138,6 +145,31 @@ class ServedAdapter:
         return served_source(Path(self.path).name, self.checkpoint_id)
 
 
+@dataclass(frozen=True)
+class GateBasis:
+    """What a run's candidate is measured against: the base model and the served adapter."""
+
+    base_model: str
+    served: Optional[ServedAdapter]
+
+
+def baseline_change(expected: GateBasis, now: GateBasis) -> Optional[str]:
+    """Why ``now`` is not the basis a run was measured against, or None if it still is."""
+    if now.base_model != expected.base_model:
+        return (
+            f"the configured base model changed from {expected.base_model} "
+            f"to {now.base_model} during this run"
+        )
+    if now.served != expected.served:
+        def label(served: Optional[ServedAdapter]) -> str:
+            return served.source if served is not None else "nothing served"
+        return (
+            f"the served adapter changed from {label(expected.served)} "
+            f"to {label(now.served)} during this run"
+        )
+    return None
+
+
 @dataclass
 class CycleResult:
     """Outcome of one nightly cycle."""
@@ -172,18 +204,23 @@ async def run_nightly_cycle(
     adapter: _TrainerProtocol,
     gate: FidelityGate,
     config: TextLoRAConfig,
-    served: Optional[ServedAdapter] = None,
+    served: Optional[ServedAdapter],
+    basis_now: Callable[[], GateBasis],
     adapter_id: Optional[str] = None,
     poll_interval: float = 2.0,
     max_polls: int = 5400,  # ~3h at 2s; a backstop, not a deadline
 ) -> CycleResult:
     """Run one corpus->train->score->gate cycle. Promotes nothing the gate rejects.
 
-    ``served`` is the adapter currently served, if any. It is the gate's
-    baseline; with nothing served, the baseline is the untuned base. Either is
-    scored on this run's validation set exactly as the run's checkpoints are.
+    ``served`` is the adapter served when the caller started this run, if any.
+    It is the gate's baseline; with nothing served, the baseline is the untuned
+    ``config.base_model``. Either is scored on this run's validation set
+    exactly as the run's checkpoints are. ``basis_now`` reports the current
+    base model and served adapter, so a baseline that changed during the run
+    is refused rather than scored or compared.
     """
     work = Path(work_dir)
+    expected = GateBasis(config.base_model, served)
 
     # A pre-0.3.1 host may have plaintext directly under ``work/corpus/``. Its
     # owner/process cannot be proven after an upgrade, so do NOT delete it here:
@@ -239,7 +276,7 @@ async def run_nightly_cycle(
         val_set = read_val_set(Path(corpus_dir) / "valid.jsonl")
         if val_set is None or val_set.examples == 0:
             # Nothing could be scored: record an inconclusive gate, train nothing.
-            decision = gate.evaluate(checkpoints=(), baseline=None, val_set=val_set)
+            decision = gate.evaluate(checkpoints=(), baseline=None, val_set=val_set, base_model=None)
             return CycleResult(
                 False, reason=decision.summary, gate=decision,
                 corpus_train=stats.train, corpus_valid=stats.valid,
@@ -283,11 +320,14 @@ async def run_nightly_cycle(
                 Path(adapter_dir),
                 saved_checkpoints(_weight_files(adapter_dir), final_iteration=config.iters),
                 served,
+                lambda: baseline_change(expected, basis_now()),
             )
         except _ScoringStillActive as exc:
             return _still_active(str(exc), stats, corpus_dir, legacy_corpus_retained)
 
-        decision = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=val_set)
+        decision = gate.evaluate(
+            checkpoints=checkpoints, baseline=baseline, val_set=val_set, base_model=config.base_model,
+        )
         return CycleResult(
             trained=True,
             promoted=decision.promote,
@@ -342,12 +382,18 @@ class _Scorer:
     scoring_dir: Path
 
     async def score_run(
-        self, adapter_dir: Path, saved: Sequence[Checkpoint], served: Optional[ServedAdapter],
+        self,
+        adapter_dir: Path,
+        saved: Sequence[Checkpoint],
+        served: Optional[ServedAdapter],
+        baseline_changed: Callable[[], Optional[str]],
     ) -> Tuple[Tuple[Checkpoint, ...], Baseline]:
         """Score every saved checkpoint, then the baseline.
 
         Scoring stops at the first failure, which makes the gate inconclusive;
-        whatever follows it is left unscored.
+        whatever follows it is left unscored. ``baseline_changed`` is asked
+        right before the baseline is loaded and again once it is scored; a
+        baseline that changed is marked so, and is not loaded if it already had.
         """
         source = served.source if served is not None else BASE_SOURCE
         if not saved:
@@ -366,11 +412,14 @@ class _Scorer:
             scored.append(checkpoint)
         if failure is not None:
             return tuple(scored), Baseline(source)
+        changed = baseline_changed()
+        if changed is not None:
+            return tuple(scored), Baseline(source, changed=changed)
         if served is None:
             loss, error = await self._score("base", None)
         else:
             loss, error = await self._score("served", (Path(served.path), served.checkpoint_id))
-        return tuple(scored), Baseline(source, loss, error)
+        return tuple(scored), Baseline(source, loss, error, baseline_changed())
 
     def _stage(self) -> Optional[str]:
         """Link this run's validation set as the ``test.jsonl`` every score reads."""

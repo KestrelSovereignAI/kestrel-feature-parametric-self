@@ -14,6 +14,7 @@ from kestrel_sovereign.features.training.types import TrainingState, TrainingSta
 
 from kestrel_feature_parametric_self import (
     FidelityGate,
+    GateBasis,
     GateOutcome,
     GateReason,
     ServedAdapter,
@@ -57,8 +58,15 @@ SNAPSHOT = _snapshot()
 
 
 async def run_nightly_cycle(**kwargs):
-    """Every direct cycle test still supplies the public host snapshot."""
+    """Every direct cycle test still supplies the public host snapshot.
+
+    Unless a test says otherwise, nothing is served and the base model and
+    served adapter stay as they were when the run started.
+    """
     kwargs.setdefault("governed_snapshot", SNAPSHOT)
+    kwargs.setdefault("served", None)
+    basis = GateBasis(kwargs["config"].base_model, kwargs["served"])
+    kwargs.setdefault("basis_now", lambda: basis)
     return await _run_nightly_cycle(**kwargs)
 
 
@@ -175,6 +183,7 @@ async def test_cycle_promotes_when_gate_passes(tmp_path):
     assert result.promoted_checkpoint_id == ITER_400
     assert result.promoted_adapter_path
     assert result.gate.baseline.source == "base" and result.gate.baseline.val_loss == 9.0
+    assert result.gate.to_record()["base_model"] == TextLoRAConfig().base_model
 
 
 async def test_every_saved_checkpoint_and_the_base_are_scored_on_the_runs_val_set(tmp_path):
@@ -375,6 +384,60 @@ async def test_served_checkpoint_missing_on_disk_is_inconclusive(tmp_path):
     assert result.gate.reason is GateReason.BASELINE_EVAL_FAILED
     assert "not on disk" in result.gate.detail
     assert "served" not in adapter.scored
+
+
+async def test_a_served_adapter_quarantined_during_training_is_never_loaded(tmp_path):
+    """Quarantine clears the served pointer; the old baseline is refused, not scored."""
+    db = _db_with(tmp_path, ROWS)
+    served = _served(tmp_path)
+    adapter = _FakeAdapter(served_score=50.0)
+    config = TextLoRAConfig()
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
+        basis_now=lambda: GateBasis(config.base_model, served if adapter.trained_val_bytes is None else None),
+    )
+    assert "served" not in adapter.scored
+    assert result.gate.outcome is GateOutcome.INCONCLUSIVE
+    assert result.gate.reason is GateReason.BASELINE_CHANGED
+    record = result.gate.to_record()
+    assert record["baseline_source"] == f"served:servedrun/{ITER_200}"
+    assert record["baseline_val_loss"] is None
+    assert "to nothing served" in record["baseline_changed"]
+    assert result.promoted is False and result.promoted_checkpoint_id is None
+
+
+async def test_a_baseline_that_changes_while_it_is_scored_is_not_compared(tmp_path):
+    db = _db_with(tmp_path, ROWS)
+    served = _served(tmp_path)
+    adapter = _FakeAdapter(served_score=50.0)
+    config = TextLoRAConfig()
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
+        basis_now=lambda: GateBasis(config.base_model, None if "served" in adapter.scored else served),
+    )
+    assert adapter.scored[-1] == "served"
+    assert result.gate.reason is GateReason.BASELINE_CHANGED
+    assert result.gate.to_record()["baseline_val_loss"] == 50.0  # scored, then refused
+    assert result.promoted is False
+
+
+async def test_a_base_model_reconfigured_during_the_run_is_inconclusive(tmp_path):
+    db = _db_with(tmp_path, ROWS)
+    adapter = _FakeAdapter()
+    config = TextLoRAConfig()
+    trained_on = config.base_model
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0,
+        basis_now=lambda: GateBasis(trained_on if adapter.trained_val_bytes is None else "other/base", None),
+    )
+    assert "base" not in adapter.scored
+    assert result.gate.reason is GateReason.BASELINE_CHANGED
+    assert "base model changed" in result.gate.detail
+    assert result.gate.to_record()["base_model"] == trained_on
+    assert result.promoted is False
 
 
 async def test_empty_validation_split_is_inconclusive_and_trains_nothing(tmp_path):

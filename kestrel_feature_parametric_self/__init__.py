@@ -23,7 +23,7 @@ dispatch is P2b.
 """
 
 from .corpus import CorpusStats, build_corpus
-from .cycle import CycleResult, ServedAdapter, run_nightly_cycle
+from .cycle import CycleResult, GateBasis, ServedAdapter, run_nightly_cycle
 from .feature import ParametricSelfFeature
 from .fidelity import (
     Baseline,
@@ -88,6 +88,7 @@ __all__ = [
     "run_nightly_cycle",
     "CycleResult",
     "ServedAdapter",
+    "GateBasis",
     "ParametricSelfSleepHook",
     "create_parametric_self_sleep_hook",
 ]

@@ -18,7 +18,14 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 
-from kestrel_feature_parametric_self import Baseline, Checkpoint, FidelityGate, ParametricSelfFeature, ValSet
+from kestrel_feature_parametric_self import (
+    Baseline,
+    Checkpoint,
+    FidelityGate,
+    ParametricSelfFeature,
+    TextLoRAConfig,
+    ValSet,
+)
 
 
 def _snapshot():
@@ -124,12 +131,13 @@ def _write_run(candidate, log, files=WEIGHT_FILES):
 
 async def _record_training_gate(
     feature, candidate, scores=IMPROVING_SCORES, *, baseline=("base", 8.977),
-    digest="sha256:" + "cd" * 32, examples=7,
+    digest="sha256:" + "cd" * 32, examples=7, base_model=TextLoRAConfig().base_model,
 ):
     """The gate record the candidate's training run left: every score adopt re-decides from."""
     checkpoints = tuple(Checkpoint(name, int(name[:7]), loss) for name, loss in scores.items())
     record = FidelityGate().evaluate(
         checkpoints=checkpoints, baseline=Baseline(*baseline), val_set=ValSet(digest, examples),
+        base_model=base_model,
     ).to_record()
     await feature._append_run_history({
         "run_id": f"train-{candidate.name}", "trigger": "nightly", "state": "completed",
@@ -803,7 +811,7 @@ async def test_train_now_cancellation_during_history_reservation_recovers():
     never = asyncio.Event()
     original_append = f._append_run_history
 
-    async def _blocked_append(entry):
+    async def _blocked_append(entry, *, strict=False):
         entered.set()
         await never.wait()
 
@@ -883,7 +891,7 @@ async def test_disable_during_manual_record_creation_prevents_runner_launch():
     release = asyncio.Event()
     cycle_calls = []
 
-    async def _blocked_append(entry):
+    async def _blocked_append(entry, *, strict=False):
         entered.set()
         await release.wait()
 
@@ -1220,8 +1228,42 @@ async def test_adopt_with_an_adapter_served_is_inconclusive_not_a_stored_compari
 
     result = await f.parametric_self_adopt(adapter_id="next")
     assert result.status == ToolResultStatus.ERROR
-    assert "baseline_unavailable" in (result.error or "")
+    assert "inconclusive (baseline_changed)" in (result.error or "")
     assert f._active_adapter_path == "/served/old"
+
+
+async def test_adopt_after_the_base_model_changed_is_inconclusive(tmp_path):
+    """The recorded scores were measured on another base model; they do not carry over."""
+    cands = tmp_path / "parametric_self" / "candidates" / "next"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
+    await f.set_config({"base_model": "mlx-community/another-base-4bit"})
+
+    result = await f.parametric_self_adopt(adapter_id="next")
+    assert result.status == ToolResultStatus.ERROR
+    assert "inconclusive (baseline_changed)" in (result.error or "")
+    assert "mlx-community/another-base-4bit" in (result.error or "")
+    assert f._active_adapter_path is None
+    gate = (await f._load_run_history())[-1]["gate"]
+    assert gate["decision"] == "inconclusive"
+    assert gate["base_model"] == TextLoRAConfig().base_model
+
+
+async def test_adopt_refuses_a_record_that_names_no_base_model(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "next"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, base_model=None)
+
+    result = await f.parametric_self_adopt(adapter_id="next")
+    assert result.status == ToolResultStatus.ERROR
+    assert "inconclusive (baseline_changed)" in (result.error or "")
+    assert f._active_adapter_path is None
 
 
 async def test_adopt_uses_a_served_baseline_scored_in_the_candidates_own_gate_run(tmp_path):

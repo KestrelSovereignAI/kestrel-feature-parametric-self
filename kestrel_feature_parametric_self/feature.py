@@ -32,9 +32,11 @@ from kestrel_sdk.tools.result import ToolResult
 
 from .cycle import (
     CycleResult,
+    GateBasis,
     ServedAdapter,
     TrainingShutdownIncomplete,
     TrainingStillActive,
+    baseline_change,
     run_nightly_cycle,
 )
 from .fidelity import (
@@ -148,10 +150,13 @@ class ParametricSelfFeature(Feature):
         # The served checkpoint's val loss when it was promoted. Display only:
         # the gate scores its baseline afresh on every run's validation set.
         self._last_val_loss: Optional[float] = None
-        # This process's most recent fidelity-gate attempt: its record and
-        # whether that record was persisted. Status health comes from it, since
-        # a failed record write may leave no trace of the attempt in history.
+        # This process's most recent fidelity-gate attempt: its run, record and
+        # whether that record was persisted. It stands for that run's history
+        # entry, since a failed record write may leave no trace of it there.
         self._last_gate_attempt: Optional[Dict[str, Any]] = None
+        # The adoption whose gate attempt is in flight, if any. Like the
+        # training run in flight, its pending gate marker is not unresolved.
+        self._adoption_run_id: Optional[str] = None
         # The feature never infers a permissive training policy.  An operator or
         # host must supply this explicit governed-corpus release policy.
         self._governed_corpus_policy = None
@@ -457,10 +462,11 @@ class ParametricSelfFeature(Feature):
         attempt = await self._latest_gate_attempt()
         last_gate = attempt["record"] if attempt is not None else None
         last_gate_persisted = attempt["persisted"] if attempt is not None else None
+        last_gate_unresolved = attempt is not None and attempt["unresolved"]
         # Health is the latest gate attempt's alone: healthy only when it
         # decided its run and that decision is on record. No attempt, an
-        # inconclusive one, or one whose record never landed is not healthy,
-        # whatever an earlier run decided.
+        # unresolved one, an inconclusive one, or one whose record never
+        # landed is not healthy, whatever an earlier run decided.
         gate_healthy = (
             last_gate_persisted is True
             and last_gate is not None
@@ -489,6 +495,9 @@ class ParametricSelfFeature(Feature):
                 "config_rejected": self._gate_config_rejected,
                 "last_decision": last_gate,
                 "last_decision_persisted": last_gate_persisted,
+                "last_attempt_run_id": attempt["run_id"] if attempt is not None else None,
+                # A run that stopped before resolving its gate outcome.
+                "last_attempt_unresolved": last_gate_unresolved,
                 # History only: an earlier decision never makes a newer attempt healthy.
                 "last_recorded_decision": last_recorded_gate,
                 "healthy": gate_healthy,
@@ -510,6 +519,16 @@ class ParametricSelfFeature(Feature):
             confirmation += f" WARNING: persisted {self._inference_use_rejected}"
         if attempt is None:
             confirmation += " Fidelity gate: no decision recorded yet, so not healthy."
+        elif last_gate_unresolved:
+            confirmation += (
+                f" WARNING: run {attempt['run_id']} stopped before its fidelity-gate "
+                "outcome was resolved; promotion is blocked and the gate is not healthy."
+            )
+            if last_recorded_gate is not None:
+                confirmation += (
+                    f" The last recorded decision was {last_recorded_gate.get('decision')} "
+                    f"({last_recorded_gate.get('reason')})."
+                )
         elif not last_gate_persisted:
             decided = (
                 f"{last_gate.get('decision')} ({last_gate.get('reason')})"
@@ -1262,6 +1281,11 @@ class ParametricSelfFeature(Feature):
                 )
                 self._cycle_in_flight = False
                 raise
+            except RunHistoryUnavailable as exc:
+                self._cycle_in_flight = False
+                return ToolResult.failed(
+                    f"Parametric-self training did not start: its run record could not be persisted ({exc})."
+                )
 
             if (
                 not self._manual_runs_enabled
@@ -1296,7 +1320,7 @@ class ParametricSelfFeature(Feature):
                     active = getattr(self, "_active_run", None)
                     if active is not None and active.get("run_id") == active_run["run_id"]:
                         trained = bool(outcome.get("trained", False))
-                        await self._update_run_history(active_run["run_id"], {
+                        await self._finish_run_history(active_run["run_id"], {
                             "state": "completed" if trained else "skipped",
                             "timestamp": _utc_now_iso(),
                             "trained": trained,
@@ -1334,7 +1358,7 @@ class ParametricSelfFeature(Feature):
                 except Exception as exc:
                     active = getattr(self, "_active_run", None)
                     if active is not None and active.get("run_id") == active_run["run_id"]:
-                        await self._update_run_history(active_run["run_id"], {
+                        await self._finish_run_history(active_run["run_id"], {
                             "state": "failed",
                             "timestamp": _utc_now_iso(),
                             "reason": f"training error: {exc}",
@@ -1627,8 +1651,8 @@ class ParametricSelfFeature(Feature):
             # the gate gets nothing to compare and is inconclusive.
             record = await self._training_gate_record(target_path)
             try:
-                checkpoints, recorded_baseline, val_set = (
-                    recorded_inputs(record) if record is not None else ((), None, None)
+                checkpoints, recorded_baseline, val_set, scored_base_model = (
+                    recorded_inputs(record) if record is not None else ((), None, None, None)
                 )
             except ValueError as exc:
                 return ToolResult.failed(
@@ -1650,26 +1674,54 @@ class ParametricSelfFeature(Feature):
                     f"Adapter '{adapter_id}' is quarantined: {lineage_problem}."
                 )
 
-            decision = self._gate.evaluate(
-                checkpoints=checkpoints,
-                baseline=self._adoption_baseline(recorded_baseline),
-                val_set=val_set,
-            )
-            best_loss = decision.best.val_loss if decision.best is not None else None
+            # As for a training run, the attempt's pending gate marker is on
+            # record before the gate decides, so a restart never loses it.
             run_id = uuid.uuid4().hex[:12]
-            recorded = await self._persist_gate_record(run_id, decision.to_record(), new_entry={
-                "timestamp": _utc_now_iso(),
-                "trigger": "adopt",
-                "state": "completed",
-                "trained": False,
-                "promoted": False,
-                "val_loss": best_loss,
-                "checkpoint_id": None,
-                "reason": decision.summary,
-                "corpus_train": 0,
-                "adapter_path": target_path,
-            })
+            self._adoption_run_id = run_id
+            try:
+                try:
+                    await self._append_run_history({
+                        "run_id": run_id,
+                        "timestamp": _utc_now_iso(),
+                        "trigger": "adopt",
+                        "state": "in_progress",
+                        "trained": False,
+                        "promoted": False,
+                        "val_loss": None,
+                        "checkpoint_id": None,
+                        "reason": "adoption in progress",
+                        "corpus_train": 0,
+                        "adapter_path": target_path,
+                        "gate_pending": True,
+                    }, strict=True)
+                except RunHistoryUnavailable as exc:
+                    return ToolResult.failed(
+                        f"Adapter '{adapter_id}' was not adopted: its adoption record could not "
+                        f"be persisted ({exc})."
+                    )
+                # The baseline the recorded scores must still be measured against.
+                basis = self._gate_basis()
+                decision = self._gate.evaluate(
+                    checkpoints=checkpoints,
+                    baseline=self._adoption_baseline(recorded_baseline, scored_base_model, basis),
+                    val_set=val_set,
+                    base_model=scored_base_model,
+                )
+                best_loss = decision.best.val_loss if decision.best is not None else None
+                recorded = await self._persist_gate_record(run_id, decision.to_record(), entry_updates={
+                    "timestamp": _utc_now_iso(),
+                    "state": "completed",
+                    "val_loss": best_loss,
+                    "reason": decision.summary,
+                })
+            finally:
+                self._adoption_run_id = None
             if not recorded:
+                await self._finish_run_history(run_id, {
+                    "state": "failed",
+                    "timestamp": _utc_now_iso(),
+                    "reason": "fidelity-gate record could not be persisted; adoption blocked",
+                })
                 return ToolResult.failed(
                     f"Adapter '{adapter_id}' was not adopted: its fidelity-gate record "
                     "could not be persisted."
@@ -1677,6 +1729,18 @@ class ParametricSelfFeature(Feature):
             if not decision.promote:
                 return ToolResult.failed(
                     f"Adapter '{adapter_id}' was not adopted; {decision.summary}."
+                )
+
+            # The record write awaited storage, and the configuration, served
+            # adapter or quarantine may have changed meanwhile. The candidate
+            # beat the baseline it was scored against only while that holds.
+            blocked = baseline_change(basis, self._gate_basis())
+            if blocked is None and target_path in self._quarantined_adapters:
+                blocked = f"adapter quarantined: {self._quarantined_adapters[target_path]}"
+            if blocked is not None:
+                await self._update_run_history(run_id, {"reason": f"promotion blocked: {blocked}"})
+                return ToolResult.failed(
+                    f"Adapter '{adapter_id}' was not adopted; promotion blocked: {blocked}."
                 )
 
             checkpoint_id = decision.promoted_checkpoint_id
@@ -1709,8 +1773,12 @@ class ParametricSelfFeature(Feature):
     # ------------------------------------------------------------------
 
     def _served_adapter(self) -> Optional[ServedAdapter]:
-        """The served adapter and checkpoint: the gate's baseline when present."""
-        if not self._active_adapter_path:
+        """The served adapter and checkpoint: the gate's baseline when present.
+
+        A quarantined adapter is never the baseline, so it is never loaded to
+        be scored.
+        """
+        if not self._active_adapter_path or self._active_adapter_path in self._quarantined_adapters:
             return None
         # A pointer set before checkpoint-aware promotion served the run's
         # final weights (see _restore_persisted_config).
@@ -1718,20 +1786,37 @@ class ParametricSelfFeature(Feature):
             self._active_adapter_path, self._active_checkpoint_id or FINAL_ADAPTER_FILE,
         )
 
-    def _adoption_baseline(self, recorded: Optional[Baseline]) -> Baseline:
+    def _gate_basis(self) -> GateBasis:
+        """What a candidate is measured against now: the base model and served adapter."""
+        return GateBasis(self._base_config.base_model, self._served_adapter())
+
+    @staticmethod
+    def _adoption_baseline(
+        recorded: Optional[Baseline], scored_base_model: Optional[str], basis: GateBasis,
+    ) -> Baseline:
         """Baseline for adopting a candidate whose validation set is gone.
 
         Only the baseline the candidate's training run scored, on that run's
-        validation set, can stand, and only while it is still the baseline: the
-        same served checkpoint, or the base with nothing served. Otherwise it
-        has no loss, so the gate is inconclusive rather than comparing against
-        a number from another run.
+        validation set, can stand, and only while ``basis`` (what is served now,
+        on the configured base model) still matches it: the same served
+        checkpoint, or the base with nothing served, on the base model those
+        scores were measured on. Otherwise the gate is inconclusive rather
+        than comparing against a number from another run.
         """
-        served = self._served_adapter()
-        source = served.source if served is not None else BASE_SOURCE
-        if recorded is not None and recorded.source == source:
-            return recorded
-        return Baseline(source)
+        source = basis.served.source if basis.served is not None else BASE_SOURCE
+        if recorded is None:
+            return Baseline(source)
+        base_model = basis.base_model
+        if scored_base_model != base_model:
+            return Baseline(source, changed=(
+                f"the candidate's run was scored on base model {scored_base_model}; "
+                f"the configured base model is {base_model}"
+            ))
+        if recorded.source != source:
+            return Baseline(source, changed=(
+                f"the candidate's run was scored against {recorded.source}; the baseline is now {source}"
+            ))
+        return recorded
 
     async def _training_gate_record(self, adapter_path: str) -> Optional[Dict[str, Any]]:
         """The gate record of the training run that produced ``adapter_path``."""
@@ -1780,20 +1865,23 @@ class ParametricSelfFeature(Feature):
         run_id: str,
         record: Dict[str, Any],
         *,
-        new_entry: Optional[Dict[str, Any]] = None,
+        entry_updates: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Durably attach a gate decision to run ``run_id``.
 
-        Appends ``new_entry`` carrying the record, or merges the record into
-        the run's existing entry. Returns False when the write did not happen;
-        the caller must then promote nothing.
+        Merges the record, and any ``entry_updates``, into the run's existing
+        entry in the same write that clears its pending gate marker. Returns
+        False when the write did not happen; the caller must then promote
+        nothing.
         """
         try:
-            if new_entry is not None:
-                await self._append_run_history({**new_entry, "run_id": run_id, "gate": record}, strict=True)
-            else:
-                await self._update_run_history(run_id, {"gate": record}, strict=True)
-        except Exception as exc:  # noqa: BLE001 - any storage failure fails closed
+            await self._update_run_history(run_id, {
+                **(entry_updates or {}),
+                "gate": record,
+                "gate_pending": False,
+                "gate_record_persisted": True,
+            }, strict=True)
+        except RunHistoryUnavailable as exc:
             logger.error(
                 "parametric-self: fidelity-gate record for run %s not persisted; "
                 "promotion blocked: %s", run_id, exc,
@@ -1801,8 +1889,24 @@ class ParametricSelfFeature(Feature):
             persisted = False
         else:
             persisted = True
-        self._last_gate_attempt = {"run_id": run_id, "record": record, "persisted": persisted}
+        self._last_gate_attempt = {
+            "run_id": run_id, "record": record, "persisted": persisted, "unresolved": False,
+        }
         return persisted
+
+    def _gate_resolution(self, run_id: str) -> Dict[str, Any]:
+        """The fields that resolve run ``run_id``'s pending gate marker when it ends.
+
+        ``gate_record_persisted`` is whether this process recorded the run's
+        gate decision, or None when the run ended before the gate decided.
+        """
+        attempt = self._last_gate_attempt
+        persisted = attempt["persisted"] if attempt is not None and attempt["run_id"] == run_id else None
+        return {"gate_pending": False, "gate_record_persisted": persisted}
+
+    async def _finish_run_history(self, run_id: str, updates: Dict[str, Any]) -> None:
+        """Write a run's terminal entry, resolving its pending gate marker."""
+        await self._update_run_history(run_id, {**updates, **self._gate_resolution(run_id)})
 
     async def _apply_promotion(
         self, adapter_path: str, checkpoint_id: Optional[str], val_loss: Optional[float],
@@ -1827,23 +1931,39 @@ class ParametricSelfFeature(Feature):
         return None
 
     async def _latest_gate_attempt(self) -> Optional[Dict[str, Any]]:
-        """The newest fidelity-gate attempt: its ``record`` and whether it ``persisted``.
+        """The newest fidelity-gate attempt: its ``record``, whether it ``persisted``,
+        and whether it is ``unresolved``.
 
-        This process's own latest attempt comes first, because a failed record
-        write can leave history with no trace of it. After a restart, history
-        is the only witness. A run entry with ``gate_record_persisted: false``
-        is an attempt whose record never landed.
+        History is read newest first. This process's own latest attempt stands
+        for its run's entry, because a failed record write can leave history
+        without the record, or without any trace of the run. Every decision
+        this process takes replaces that attempt, so a decided entry for any
+        other run is older than it. Otherwise an entry speaks for itself: a
+        recorded decision; a decision whose record never landed
+        (``gate_record_persisted: false``); or a run whose pending gate marker
+        was never resolved, because it stopped before its terminal entry (a
+        restart, or a failed write). That run may have reached the gate, so it
+        is an unresolved attempt and never healthy. A run that ended before the
+        gate, a rollback, an entry from before gate records, and the training
+        run or adoption in flight now made no attempt and are passed over.
         """
-        if self._last_gate_attempt is not None:
-            return dict(self._last_gate_attempt)
+        tracked = self._last_gate_attempt
+        training_run = self._active_run.get("run_id") if self._active_run else None
+        in_flight = {run for run in (training_run, self._adoption_run_id) if run is not None}
         for entry in reversed(await self._load_run_history()):
-            gate = entry.get("gate")
-            persisted = entry.get("gate_record_persisted")
-            if isinstance(gate, dict):
-                return {"run_id": entry.get("run_id"), "record": gate, "persisted": persisted is not False}
-            if persisted is not None:
-                return {"run_id": entry.get("run_id"), "record": None, "persisted": False}
-        return None
+            run_id = entry.get("run_id")
+            if entry.get("gate_pending") is True and run_id not in in_flight and (
+                tracked is None or run_id != tracked["run_id"]
+            ):
+                return {"run_id": run_id, "record": None, "persisted": False, "unresolved": True}
+            decided = isinstance(entry.get("gate"), dict) or entry.get("gate_record_persisted") is False
+            if tracked is not None and (run_id == tracked["run_id"] or decided):
+                return dict(tracked)
+            if isinstance(entry.get("gate"), dict):
+                return {"run_id": run_id, "record": entry["gate"], "persisted": True, "unresolved": False}
+            if entry.get("gate_record_persisted") is False:
+                return {"run_id": run_id, "record": None, "persisted": False, "unresolved": False}
+        return dict(tracked) if tracked is not None else None
 
     def _resolve_paths(self) -> Tuple[Optional[str], Optional[str]]:
         """Resolve optional reflection DB and required adapter working directory.
@@ -2005,7 +2125,7 @@ class ParametricSelfFeature(Feature):
             # reports this failure rather than leaving an orphaned task warning.
             active_run = getattr(self, "_active_run", None)
             if active_run is not None:
-                await self._update_run_history(active_run["run_id"], {
+                await self._finish_run_history(active_run["run_id"], {
                     "state": "failed",
                     "timestamp": _utc_now_iso(),
                     "reason": f"training error: {exc}",
@@ -2036,6 +2156,9 @@ class ParametricSelfFeature(Feature):
 
         agent_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "name", "agent")
         config = TextLoRAConfig.from_dict(self._base_config.to_dict())
+        # The baseline this run must beat: what is served on this base model now.
+        served = self._served_adapter()
+        basis = GateBasis(config.base_model, served)
 
         # Manual ``train_now`` creates this record before returning started=True;
         # nightly/direct cycles create it here. In either path the same durable
@@ -2046,7 +2169,14 @@ class ParametricSelfFeature(Feature):
             and active_run.get("state") == "in_progress"
             and active_run.get("trigger") == trigger
         ):
-            active_run = await self._begin_active_run(trigger=trigger, work_dir=work_dir)
+            try:
+                active_run = await self._begin_active_run(trigger=trigger, work_dir=work_dir)
+            except RunHistoryUnavailable as exc:
+                return {
+                    "trained": False,
+                    "promoted": False,
+                    "reason": f"training not started: its run record could not be persisted ({exc})",
+                }
         run_id = active_run["run_id"]
         adapter_id = active_run["adapter_id"]
         adapter_path = active_run["adapter_path"]
@@ -2060,7 +2190,8 @@ class ParametricSelfFeature(Feature):
                 adapter=self._adapter,
                 gate=self._gate,
                 config=config,
-                served=self._served_adapter(),
+                served=served,
+                basis_now=self._gate_basis,
                 adapter_id=adapter_id,
             )
             if result.training_active:
@@ -2075,7 +2206,7 @@ class ParametricSelfFeature(Feature):
         except TrainingStillActive:
             raise
         except Exception as exc:
-            await self._update_run_history(run_id, {
+            await self._finish_run_history(run_id, {
                 "state": "failed",
                 "timestamp": _utc_now_iso(),
                 "reason": f"training error: {exc}",
@@ -2106,6 +2237,8 @@ class ParametricSelfFeature(Feature):
             "semantic_checkpoint_id": result.semantic_checkpoint_id,
             "assertion_lineage": [list(pair) for pair in result.assertion_lineage],
             "state": "candidate",
+            # Every score of this candidate was measured on this base model.
+            "base_model": config.base_model,
             "reaches_inference_at_train": active_run.get("reaches_inference_at_train"),
         }
         if receipt is not None and result.corpus_manifest_hash == receipt["manifest_hash"]:
@@ -2125,6 +2258,13 @@ class ParametricSelfFeature(Feature):
             )
             if lifecycle_problem:
                 self._block_promotion(result, f"candidate quarantined: {lifecycle_problem}")
+
+        if result.promoted and result.promoted_adapter_path:
+            # The candidate beat the baseline it was scored against. If that
+            # stopped being the baseline since, the comparison no longer holds.
+            changed = baseline_change(basis, self._gate_basis())
+            if changed is not None:
+                self._block_promotion(result, f"promotion blocked: {changed}")
 
         if result.promoted and result.promoted_adapter_path:
             await self._apply_promotion(
@@ -2156,7 +2296,7 @@ class ParametricSelfFeature(Feature):
             "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
             "reaches_inference": reaches_inference,
         }
-        await self._update_run_history(run_id, {
+        await self._finish_run_history(run_id, {
             "state": "completed",
             "timestamp": _utc_now_iso(),
             "trained": result.trained,
@@ -2165,7 +2305,6 @@ class ParametricSelfFeature(Feature):
             "checkpoint_id": result.promoted_checkpoint_id,
             "reason": result.reason,
             "corpus_train": result.corpus_train,
-            "gate_record_persisted": gate_record_persisted,
             "reaches_inference_at_promotion": reaches_inference if result.promoted else None,
             # Record the served path only on promotion (matches the prior
             # contract); otherwise keep the candidate path for traceability.
@@ -2188,7 +2327,13 @@ class ParametricSelfFeature(Feature):
         result.reason = reason
 
     async def _begin_active_run(self, *, trigger: str, work_dir: str) -> Dict[str, Any]:
-        """Create the durable in-progress record for a training run."""
+        """Create the durable in-progress record for a training run.
+
+        The record carries the run's pending gate marker, which is the only
+        trace a restart has of a run that stopped before resolving its gate.
+        So it must land before the run starts: if it cannot be written, this
+        raises RunHistoryUnavailable and there is no run.
+        """
         run_id = uuid.uuid4().hex[:12]
         adapter_id = uuid.uuid4().hex[:12]
         adapter_path = str(Path(work_dir) / "candidates" / adapter_id)
@@ -2206,21 +2351,30 @@ class ParametricSelfFeature(Feature):
             "reaches_inference_at_train": reaches_inference_at_train,
         }
         self._active_run = dict(active_run)
-        await self._append_run_history({
-            "run_id": run_id,
-            "timestamp": started_at,
-            "started_at": started_at,
-            "trigger": trigger,
-            "state": "in_progress",
-            "trained": False,
-            "promoted": False,
-            "val_loss": None,
-            "reason": "training in progress",
-            "corpus_train": 0,
-            "adapter_id": adapter_id,
-            "adapter_path": adapter_path,
-            "reaches_inference_at_train": reaches_inference_at_train,
-        })
+        try:
+            await self._append_run_history({
+                "run_id": run_id,
+                "timestamp": started_at,
+                "started_at": started_at,
+                "trigger": trigger,
+                "state": "in_progress",
+                "trained": False,
+                "promoted": False,
+                "val_loss": None,
+                "reason": "training in progress",
+                "corpus_train": 0,
+                "adapter_id": adapter_id,
+                "adapter_path": adapter_path,
+                "reaches_inference_at_train": reaches_inference_at_train,
+                # Cleared by the write that records this run's gate decision, or
+                # by its terminal entry. A marker still set after the run stopped
+                # is an unresolved gate attempt, never a healthy one.
+                "gate_pending": True,
+            }, strict=True)
+        except RunHistoryUnavailable:
+            if self._active_run is not None and self._active_run.get("run_id") == run_id:
+                self._active_run = None
+            raise
         return dict(active_run)
 
     async def _interrupt_active_run(
@@ -2237,7 +2391,7 @@ class ParametricSelfFeature(Feature):
         if active_run is None or (run_id is not None and active_run.get("run_id") != run_id):
             return
         try:
-            await self._update_run_history(active_run["run_id"], {
+            await self._finish_run_history(active_run["run_id"], {
                 "state": "interrupted",
                 "timestamp": _utc_now_iso(),
                 "reason": reason,
@@ -2298,7 +2452,9 @@ class ParametricSelfFeature(Feature):
                 if entry.get("retained_corpus_path"):
                     retained_paths.add(entry["retained_corpus_path"])
         for run_id in run_ids:
-            await self._update_run_history(run_id, {
+            # A shutdown-incomplete run stopped inside training or scoring,
+            # before its gate decided.
+            await self._finish_run_history(run_id, {
                 "state": "interrupted",
                 "timestamp": _utc_now_iso(),
                 "reason": reason,
@@ -2341,10 +2497,11 @@ class ParametricSelfFeature(Feature):
     async def _append_run_history(self, entry: Dict[str, Any], *, strict: bool = False) -> None:
         """Append one run record to the durable, capped history list.
 
-        History is best effort, except for a ``strict`` write (a fidelity-gate
-        record), which raises rather than being skipped. Either way the list is
-        rewritten only after it was read intact: a history that cannot be read,
-        or is malformed, is never written over.
+        History is best effort, except for a ``strict`` write (a run's start
+        record or a fidelity-gate record), which raises RunHistoryUnavailable
+        rather than being skipped. Either way the list is rewritten only after
+        it was read intact: a history that cannot be read, or is malformed, is
+        never written over.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
@@ -2365,7 +2522,7 @@ class ParametricSelfFeature(Feature):
             ))
         except Exception as e:  # history is best-effort; never break a cycle
             if strict:
-                raise
+                raise RunHistoryUnavailable(f"parametric-self run history not written: {e}") from e
             logger.warning("Failed to append parametric-self run history (write skipped): %s", e)
 
     async def _update_run_history(
@@ -2380,7 +2537,7 @@ class ParametricSelfFeature(Feature):
         No-ops if the entry is gone (capped out) — falls back to appending so the
         outcome is never silently lost. As with ``_append_run_history``, the
         list is rewritten only after it was read intact, and a ``strict`` write
-        raises on failure instead of logging it.
+        raises RunHistoryUnavailable on failure instead of logging it.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
@@ -2407,7 +2564,7 @@ class ParametricSelfFeature(Feature):
             ))
         except Exception as e:  # history is best-effort; never break a cycle
             if strict:
-                raise
+                raise RunHistoryUnavailable(f"parametric-self run history not written: {e}") from e
             logger.warning("Failed to update parametric-self run history (write skipped): %s", e)
 
     async def _reconcile_stale_runs(self) -> None:

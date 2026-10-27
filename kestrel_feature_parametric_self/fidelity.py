@@ -19,7 +19,9 @@ this order:
 The first failing check sets the decision and its reason. The baseline is the
 currently served adapter, or the untuned base model when nothing is served,
 scored on the same validation set in the same gate run. A loss stored from an
-earlier run is never a baseline.
+earlier run is never a baseline, and neither is one that stopped being the
+baseline (a different served adapter or base model) before the decision.
+Every decision names the base model its scores were measured on.
 
 Every loss the gate compares is a score of the exact weights it names. mlx_lm
 measures its in-training ``Iter N`` validation loss before optimizer step N and
@@ -113,6 +115,7 @@ class Baseline:
     source: str                     # BASE_SOURCE or served_source(...)
     val_loss: Optional[float] = None
     error: Optional[str] = None     # why scoring the baseline failed
+    changed: Optional[str] = None   # why it is no longer the baseline
 
 
 @dataclass(frozen=True)
@@ -184,6 +187,7 @@ class GateReason(str, Enum):
     NO_CHECKPOINT_VAL_LOSS = "no_checkpoint_val_loss"
     FINAL_CHECKPOINT_NO_VAL_LOSS = "final_checkpoint_no_val_loss"
     BASELINE_UNAVAILABLE = "baseline_unavailable"
+    BASELINE_CHANGED = "baseline_changed"
     BASELINE_EVAL_FAILED = "baseline_eval_failed"
     BASELINE_LOSS_INVALID = "baseline_loss_invalid"
 
@@ -203,6 +207,8 @@ GATE_RECORD_FIELDS = (
     "baseline_source",
     "baseline_val_loss",
     "baseline_error",
+    "baseline_changed",
+    "base_model",
     "margin",
     "required_below",
     "overfit_check",
@@ -249,6 +255,7 @@ class GateDecision:
     ratio: Optional[float] = None
     required_below: Optional[float] = None
     val_set: Optional[ValSet] = None
+    base_model: Optional[str] = None    # the base model every score was measured on
 
     @property
     def promote(self) -> bool:
@@ -291,6 +298,8 @@ class GateDecision:
             "baseline_source": baseline.source if baseline else None,
             "baseline_val_loss": _json_number(baseline.val_loss) if baseline else None,
             "baseline_error": baseline.error if baseline else None,
+            "baseline_changed": baseline.changed if baseline else None,
+            "base_model": self.base_model,
             "margin": self.gate.margin,
             "required_below": _json_number(self.required_below),
             "overfit_check": self.gate.overfit_check,
@@ -327,8 +336,8 @@ def _recorded_text(value: Any, field: str) -> Optional[str]:
 
 def recorded_inputs(
     record: Mapping[str, Any],
-) -> Tuple[Tuple[Checkpoint, ...], Optional[Baseline], Optional[ValSet]]:
-    """The checkpoints, baseline and validation set one recorded gate run scored.
+) -> Tuple[Tuple[Checkpoint, ...], Optional[Baseline], Optional[ValSet], Optional[str]]:
+    """The checkpoints, baseline, validation set and base model of one recorded gate run.
 
     The inverse of ``GateDecision.to_record`` for the gate's inputs, so a
     decision can be re-taken from the scores of one gate run. Raises ValueError
@@ -357,6 +366,7 @@ def recorded_inputs(
         source,
         _recorded_loss(record.get("baseline_val_loss"), "baseline_val_loss"),
         _recorded_text(record.get("baseline_error"), "baseline_error"),
+        _recorded_text(record.get("baseline_changed"), "baseline_changed"),
     )
     digest, examples = record.get("val_set_digest"), record.get("val_set_examples")
     if digest is None and examples is None:
@@ -365,7 +375,8 @@ def recorded_inputs(
         val_set = ValSet(digest, examples)
     else:
         raise ValueError(f"val_set_digest={digest!r} / val_set_examples={examples!r} is not a validation set")
-    return tuple(checkpoints), baseline, val_set
+    base_model = _recorded_text(record.get("base_model"), "base_model")
+    return tuple(checkpoints), baseline, val_set, base_model
 
 
 @dataclass(frozen=True)
@@ -416,15 +427,21 @@ class FidelityGate:
         checkpoints: Sequence[Checkpoint],
         baseline: Optional[Baseline],
         val_set: Optional[ValSet],
+        base_model: Optional[str],
     ) -> GateDecision:
-        """Decide whether this run's best checkpoint may be promoted."""
+        """Decide whether this run's best checkpoint may be promoted.
+
+        ``base_model`` is the base model every score was measured on (None
+        when nothing was scored); the decision records it.
+        """
 
         checkpoints = tuple(checkpoints)
 
         def decide(outcome: GateOutcome, reason: GateReason, detail: str, **found: Any) -> GateDecision:
             return GateDecision(
                 outcome, reason, detail, self,
-                checkpoints=checkpoints, baseline=baseline, val_set=val_set, **found,
+                checkpoints=checkpoints, baseline=baseline, val_set=val_set,
+                base_model=base_model, **found,
             )
 
         def inconclusive(reason: GateReason, detail: str, **found: Any) -> GateDecision:
@@ -477,6 +494,12 @@ class FidelityGate:
 
         if baseline is None:
             return inconclusive(GateReason.BASELINE_UNAVAILABLE, "no baseline to compare against", **found)
+        if baseline.changed is not None:
+            return inconclusive(
+                GateReason.BASELINE_CHANGED,
+                f"baseline {baseline.source} is no longer the baseline: {baseline.changed}",
+                **found,
+            )
         if baseline.error is not None:
             return inconclusive(
                 GateReason.BASELINE_EVAL_FAILED,

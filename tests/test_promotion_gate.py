@@ -1,14 +1,15 @@
 """The fidelity gate wired through the feature: records, promotion, health (#30).
 
 Runs the real ``run_nightly_cycle`` and promotion path with a fake trainer that
-writes mlx_lm's files and scores each one, against a host with the full
-governed-corpus surface.
+writes mlx_lm's files and scores each one, against a host whose governed-corpus
+surface accepts exactly what core's ``AsyncStorage`` methods accept.
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import sqlite3
 from pathlib import Path
@@ -18,6 +19,9 @@ from unittest.mock import MagicMock
 import pytest
 from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
+from kestrel_sovereign.knowledge import EpistemicState, OntologyRef, Visibility
+from kestrel_sovereign.knowledge.corpus import GovernedCorpusPolicy
+from kestrel_sovereign.storage.async_storage import AsyncStorage
 
 from kestrel_feature_parametric_self import ParametricSelfFeature, ParametricSelfSleepHook
 from kestrel_feature_parametric_self.fidelity import GATE_RECORD_FIELDS
@@ -31,6 +35,35 @@ WEIGHT_FILES = ("0000100_adapters.safetensors", ITER_200, "0000300_adapters.safe
 JUNE = {"base": 8.977, ITER_200: 1.866, ITER_400: 2.688}
 IMPROVING = {"base": 9.0, ITER_200: 1.5, ITER_400: 1.4}
 IMPROVING_LOG = "Iter 1: Val loss 9.000, x\nIter 200: Val loss 1.500, x\nIter 400: Val loss 1.400, x\n"
+# The host-registered consumer every governed corpus artifact is produced for.
+ARTIFACT_CONSUMER = {
+    "consumer_id": "parametric-self:emma",
+    "consumer_key_id": "consumer-key:emma",
+    "consumer_public_key": "ed25519:" + "ab" * 32,
+    "retention_seconds": 300.0,
+}
+SNAPSHOT_METHOD = "governed_assertion_corpus_snapshot"
+DELTA_METHOD = "governed_assertion_corpus_changes_since"
+
+
+def _policy() -> GovernedCorpusPolicy:
+    return GovernedCorpusPolicy(
+        policy_id="gate-test-policy",
+        policy_version="1",
+        accepted_epistemic_states=(EpistemicState.ASSERTED,),
+        accepted_visibility=(Visibility.PRIVATE,),
+        accepted_privacy_classifications=("normal",),
+        accepted_consent_references=("policy-training-v1",),
+        accepted_grounding_classes=("operator-attested",),
+        accepted_source_kinds=("operator-note",),
+        accepted_ontology_pins=(
+            OntologyRef("https://example.test/ontology", "1.0.0", "sha256:gate-ontology", "semantic-kb-v1"),
+        ),
+        accepted_semantic_capability_versions=(("semantic_maintenance", "1"),),
+    )
+
+
+POLICY = _policy()
 
 
 def _snapshot():
@@ -47,7 +80,7 @@ def _snapshot():
             decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
         ),),
         snapshot_hash="sha256:snapshot:one", tenant_id="tenant:test",
-        policy=SimpleNamespace(digest="sha256:policy"),
+        policy=POLICY,
         checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=4, latest_event_id="event:4"),
         capability_versions={"semantic_maintenance": "1"},
     )
@@ -60,22 +93,36 @@ class _Host:
     that fails leaves nothing behind. ``fail_gate_record_writes`` fails only a
     history write that adds a gate record; ``fail_history_writes`` and
     ``fail_history_reads`` fail every history write or read.
+
+    The corpus methods bind each call against core's own ``AsyncStorage``
+    signature, so a call core would refuse (a missing artifact consumer
+    argument, an unknown keyword) raises TypeError here too. Accepted calls
+    are kept in ``corpus_calls``.
     """
 
     def __init__(self):
         self.snapshot = _snapshot()
         self.nodes = {}
+        self.corpus_calls = []
         self.fail_gate_record_writes = False
         self.fail_history_writes = False
         self.fail_history_reads = False
 
-    async def governed_assertion_corpus_snapshot(self, **_kwargs):
+    def _accept(self, method, *args, **kwargs):
+        inspect.signature(getattr(AsyncStorage, method)).bind(self, *args, **kwargs)
+        if not isinstance(kwargs["policy"], GovernedCorpusPolicy):
+            raise TypeError(f"{method} policy must be a GovernedCorpusPolicy")
+        self.corpus_calls.append((method, kwargs))
+
+    async def governed_assertion_corpus_snapshot(self, **kwargs):
+        self._accept(SNAPSHOT_METHOD, **kwargs)
         return self.snapshot
 
-    async def governed_assertion_corpus_changes_since(self, base, **_kwargs):
+    async def governed_assertion_corpus_changes_since(self, base, **kwargs):
+        self._accept(DELTA_METHOD, base, **kwargs)
         return SimpleNamespace(
             tombstones=(), since_checkpoint=base.checkpoint, checkpoint=self.snapshot.checkpoint,
-            snapshot_hash="sha256:delta", observability=SimpleNamespace(policy_digest="sha256:policy"),
+            snapshot_hash="sha256:delta", observability=SimpleNamespace(policy_digest=POLICY.digest),
         )
 
     @staticmethod
@@ -99,10 +146,12 @@ class _Host:
 class _Trainer:
     """Writes the candidate's mlx_lm files; scores the weights a view links to."""
 
-    def __init__(self, scores=IMPROVING, served_score=5.0, served_error=None):
+    def __init__(self, scores=IMPROVING, served_score=5.0, served_error=None, during_training=None):
         self.scores, self.served_score, self.served_error = scores, served_score, served_error
+        self.during_training = during_training  # awaited while the candidate trains
         self.trained_val_bytes = None
         self.scored_test_bytes = []
+        self.scored_served = False
         self._candidate = None
         self._logs = {}
 
@@ -110,6 +159,8 @@ class _Trainer:
         return True
 
     async def start_training(self, agent_id, config):
+        if self.during_training is not None:
+            await self.during_training()
         self.trained_val_bytes = (Path(config.data_dir) / "valid.jsonl").read_bytes()
         candidate = Path(config.adapter_path)
         self._candidate = candidate.resolve()
@@ -127,6 +178,7 @@ class _Trainer:
             if weights.parent != self._candidate:
                 if self.served_error is not None:
                     raise self.served_error
+                self.scored_served = True
                 loss = self.served_score
             else:
                 loss = self.scores[weights.name]
@@ -159,13 +211,16 @@ def _reflections(tmp_path, rows=5) -> str:
     return db
 
 
-async def _feature(tmp_path, trainer=None, *, rows=5):
+async def _feature(tmp_path, trainer=None, *, rows=5, artifact_consumer=ARTIFACT_CONSUMER):
     host = _Host()
     agent = MagicMock()
     agent.storage = host
     agent.storage_path = _reflections(tmp_path, rows)
     agent.parametric_self_work_dir = str(tmp_path / "work")
-    agent.parametric_self_governed_corpus_policy = SimpleNamespace(digest="sha256:policy")
+    agent.parametric_self_governed_corpus_policy = POLICY
+    agent.parametric_self_governed_artifact_consumer = (
+        dict(artifact_consumer) if artifact_consumer is not None else None
+    )
     agent.semantic_inference_profile = None
     agent.is_test_instance = False
     agent.agent_id = "emma"
@@ -356,19 +411,423 @@ async def test_an_unrecorded_attempt_after_a_promotion_is_not_healthy(tmp_path):
     assert "The last recorded decision was promote (passed)" in restarted_status.confirmation
 
 
-async def test_an_attempt_that_left_no_trace_in_history_is_still_not_healthy(tmp_path):
-    """Neither the gate record nor the terminal entry landed; this process still knows."""
-    feature, host = await _feature(tmp_path)
-    promotion, outcome = await _promote_then_attempt_an_inconclusive_run(
-        feature, host, fail_history_writes=True,
-    )
-    assert (await _last_run(feature))["state"] == "completed"
-    assert (await _last_run(feature))["gate"] == promotion  # history only shows the promotion
+async def test_a_history_outage_starts_no_run_so_no_attempt_goes_unrecorded(tmp_path):
+    """No run record, no run: nothing trains or is scored, and a restart sees what this process sees.
 
-    status = (await feature.parametric_self_status()).data["fidelity_gate"]
-    assert status["healthy"] is False
-    assert status["last_decision"] == outcome["gate"]
-    assert status["last_decision_persisted"] is False
+    Once history is writable again, the next run is recorded as usual.
+    """
+    feature, host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+    served = (feature._active_adapter_path, feature._active_checkpoint_id)
+    history = copy.deepcopy(host.nodes[feature._history_node_id()].properties["runs"])
+    trainer = _Trainer(served_error=RuntimeError("metal device lost"))
+    feature._adapter = trainer
+    feature._training_enabled = True
+    host.fail_history_writes = True
+
+    nightly = await ParametricSelfSleepHook(feature).on_post_consolidation(feature.agent, {})
+    manual = await feature.parametric_self_train_now()
+
+    assert (nightly["trained"], nightly["promoted"]) == (False, False)
+    assert "training not started: its run record could not be persisted" in nightly["reason"]
+    assert SleepMixin._hook_outcome(nightly)[0] is SleepHookStatus.FAILED
+    assert manual.status.value == "error"
+    assert "training did not start: its run record could not be persisted" in (manual.error or "")
+    assert trainer.trained_val_bytes is None and trainer.scored_test_bytes == []
+    assert feature._active_run is None and feature._training_task is None
+    assert feature._cycle_in_flight is False
+    assert (feature._active_adapter_path, feature._active_checkpoint_id) == served
+    assert host.nodes[feature._history_node_id()].properties["runs"] == history
+
+    host.fail_history_writes = False
+    restarted = ParametricSelfFeature(agent=feature.agent)
+    await restarted.initialize()
+    for current in (feature, restarted):
+        gate = (await current.parametric_self_status()).data["fidelity_gate"]
+        assert gate["last_decision"] == promoted["gate"]
+        assert gate["last_attempt_unresolved"] is False
+        assert gate["healthy"] is True
+
+    recovered = await feature._run_training_cycle_locked(trigger="nightly")
+    assert recovered["gate"]["decision"] == "inconclusive"
+    assert recovered["gate_record_persisted"] is True
+    entry = await _last_run(feature)
+    assert (entry["gate_pending"], entry["gate"]) == (False, recovered["gate"])
+    for current in (feature, restarted):
+        gate = (await current.parametric_self_status()).data["fidelity_gate"]
+        assert gate["last_decision"] == recovered["gate"] and gate["healthy"] is False
+
+
+async def test_a_run_that_stopped_before_resolving_its_gate_is_not_healthy_after_restart(tmp_path):
+    """Run start landed; neither the gate record nor the terminal entry did.
+
+    The run's pending gate marker survives, so a restart reports an unresolved
+    attempt rather than falling back to the earlier promotion.
+    """
+    feature, host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+    assert promoted["promoted"] is True
+    feature._adapter = _Trainer(served_error=RuntimeError("metal device lost"))
+    persist = feature._persist_gate_record
+
+    async def _history_fails_from_the_gate_on(*args, **kwargs):
+        host.fail_history_writes = True
+        return await persist(*args, **kwargs)
+
+    feature._persist_gate_record = _history_fails_from_the_gate_on
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+    host.fail_history_writes = False
+    assert outcome["gate_record_persisted"] is False
+    entry = await _last_run(feature)
+    assert entry["run_id"] != promoted.get("run_id")
+    assert (entry["state"], entry["gate_pending"]) == ("in_progress", True)
+    assert (await feature.parametric_self_status()).data["fidelity_gate"]["healthy"] is False
+
+    restarted = ParametricSelfFeature(agent=feature.agent)
+    await restarted.initialize()
+    await restarted._reconcile_stale_runs()  # as loading after a restart does
+    status = await restarted.parametric_self_status()
+    gate = status.data["fidelity_gate"]
+    assert (await _last_run(restarted))["state"] == "interrupted"
+    assert gate["healthy"] is False
+    assert gate["last_attempt_unresolved"] is True
+    assert gate["last_attempt_run_id"] == entry["run_id"]
+    assert gate["last_decision"] is None
+    assert gate["last_recorded_decision"] == promoted["gate"]
+    assert "stopped before its fidelity-gate outcome was resolved" in status.confirmation
+
+
+async def test_a_later_unresolved_run_outranks_this_process_s_last_decision(tmp_path):
+    """The next run lost its terminal entry; status now and after a restart agree."""
+    feature, host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+
+    class _HistoryLostMidRun(_Trainer):
+        async def start_training(self, agent_id, config):
+            host.fail_history_writes = True
+            return TrainingStatus(job_id="train", state=TrainingState.FAILED, progress=0.0, error="oom")
+
+    feature._adapter = _HistoryLostMidRun()
+    await feature._run_training_cycle_locked(trigger="nightly")
+    host.fail_history_writes = False
+    unresolved = await _last_run(feature)
+    assert unresolved["gate_pending"] is True
+
+    restarted = ParametricSelfFeature(agent=feature.agent)
+    await restarted.initialize()
+    for current in (feature, restarted):
+        gate = (await current.parametric_self_status()).data["fidelity_gate"]
+        assert gate["healthy"] is False
+        assert gate["last_attempt_unresolved"] is True
+        assert gate["last_attempt_run_id"] == unresolved["run_id"]
+        assert gate["last_recorded_decision"] == promoted["gate"]
+
+
+async def test_the_gate_record_write_resolves_the_pending_marker(tmp_path):
+    feature, _host = await _feature(tmp_path)
+    seen = {}
+    persist = feature._persist_gate_record
+
+    async def _observe(run_id, record, **kwargs):
+        seen["before"] = (await _last_run(feature))["gate_pending"]
+        persisted = await persist(run_id, record, **kwargs)
+        entry = await _last_run(feature)
+        seen["after"] = (entry["gate_pending"], entry["gate"]["decision"], entry["state"])
+        return persisted
+
+    feature._persist_gate_record = _observe
+    await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert seen == {"before": True, "after": (False, "promote", "in_progress")}
+    entry = await _last_run(feature)
+    assert (entry["gate_pending"], entry["gate_record_persisted"]) == (False, True)
+
+
+async def test_a_run_that_ends_before_the_gate_leaves_health_with_the_last_decision(tmp_path):
+    feature, _host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+
+    class _FailedTraining(_Trainer):
+        async def start_training(self, agent_id, config):
+            return TrainingStatus(job_id="train", state=TrainingState.FAILED, progress=0.0, error="oom")
+
+    feature._adapter = _FailedTraining()
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+    assert outcome["trained"] is False and outcome["gate"] is None
+    entry = await _last_run(feature)
+    assert (entry["gate_pending"], entry["gate_record_persisted"]) == (False, None)
+
+    for current in (feature, ParametricSelfFeature(agent=feature.agent)):
+        if current is not feature:
+            await current.initialize()
+        gate = (await current.parametric_self_status()).data["fidelity_gate"]
+        assert gate["last_decision"] == promoted["gate"] and gate["healthy"] is True
+
+
+async def test_the_run_in_flight_is_not_an_unresolved_attempt(tmp_path):
+    feature, _host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+    seen = {}
+
+    async def _status_mid_run():
+        seen["gate"] = (await feature.parametric_self_status()).data["fidelity_gate"]
+
+    feature._adapter = _Trainer(during_training=_status_mid_run)
+    await feature._run_training_cycle_locked(trigger="nightly")
+    assert seen["gate"]["last_decision"] == promoted["gate"]
+    assert seen["gate"]["last_attempt_unresolved"] is False
+
+
+# ----------------------------------------------------------------------
+# A baseline that changes during the run is never compared (R8)
+# ----------------------------------------------------------------------
+
+async def test_a_served_adapter_quarantined_during_training_is_not_scored_or_compared(tmp_path):
+    feature, _host = await _feature(tmp_path)
+    served = _serve_existing(tmp_path, feature)
+
+    async def _quarantine_served():
+        await feature._quarantine_adapter(str(served), "governed assertion lineage invalidated; rebuild required")
+
+    trainer = _Trainer(served_score=50.0, during_training=_quarantine_served)
+    feature._adapter = trainer
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert trainer.scored_served is False
+    gate = outcome["gate"]
+    assert (gate["decision"], gate["reason"]) == ("inconclusive", "baseline_changed")
+    assert gate["baseline_source"] == f"served:servedrun/{ITER_200}"
+    assert gate["baseline_val_loss"] is None
+    assert outcome["promoted"] is False
+    assert feature._active_adapter_path is None
+    assert str(served) in feature._quarantined_adapters
+
+
+async def test_a_quarantined_pointer_is_never_the_baseline(tmp_path):
+    feature, _host = await _feature(tmp_path)
+    served = _serve_existing(tmp_path, feature)
+    feature._quarantined_adapters[str(served)] = "governed corpus policy updated; rebuild required"
+    trainer = _Trainer()
+    feature._adapter = trainer
+
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert trainer.scored_served is False
+    assert outcome["gate"]["baseline_source"] == "base"
+
+
+async def test_a_baseline_that_changes_after_the_decision_blocks_promotion(tmp_path):
+    """The promote decision stays on record; it is not acted on."""
+    feature, _host = await _feature(tmp_path)
+    persist = feature._persist_gate_record
+
+    async def _reconfigure_after_the_record(*args, **kwargs):
+        persisted = await persist(*args, **kwargs)
+        await feature.set_config({"base_model": "mlx-community/another-base-4bit"})
+        return persisted
+
+    feature._persist_gate_record = _reconfigure_after_the_record
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert outcome["gate"]["decision"] == "promote"
+    assert outcome["promoted"] is False
+    assert "promotion blocked: the configured base model changed" in outcome["reason"]
+    assert feature._active_adapter_path is None
+    entry = await _last_run(feature)
+    assert entry["gate"]["decision"] == "promote" and entry["promoted"] is False
+
+
+async def test_candidate_lineage_names_the_base_model_its_scores_were_measured_on(tmp_path):
+    feature, _host = await _feature(tmp_path, _Trainer(JUNE))
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+    entry = await _last_run(feature)
+    lineage = feature._adapter_lineage[entry["adapter_path"]]
+    assert lineage["base_model"] == outcome["gate"]["base_model"] == feature._base_config.base_model
+
+
+# ----------------------------------------------------------------------
+# Adoption records its attempt and rechecks its baseline like a run does
+# ----------------------------------------------------------------------
+
+async def _adoptable_june_candidate(feature):
+    """Emma's June run, rejected for overfit when trained; adoptable once the ratio is relaxed."""
+    trained = await feature._run_training_cycle_locked(trigger="nightly")
+    assert (trained["gate"]["decision"], trained["gate"]["reason"]) == ("reject", "overfit")
+    await feature.set_config({"gate": {"overfit_ratio": 1.5}})
+    return Path((await _last_run(feature))["adapter_path"])
+
+
+async def test_adoption_promotes_the_best_checkpoint_from_its_own_run_s_scores(tmp_path):
+    feature, _host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+
+    result = await feature.parametric_self_adopt(candidate.name)
+
+    assert result.status.value == "ok"
+    assert (feature._active_adapter_path, feature._active_checkpoint_id) == (str(candidate), ITER_200)
+    entry = await _last_run(feature)
+    assert (entry["trigger"], entry["state"], entry["promoted"]) == ("adopt", "completed", True)
+    assert (entry["gate_pending"], entry["gate_record_persisted"]) == (False, True)
+    assert entry["gate"]["promoted_checkpoint_id"] == ITER_200
+
+
+@pytest.mark.parametrize("change", ["base-model", "candidate-quarantined"])
+async def test_a_change_while_adoption_records_its_gate_blocks_the_adoption(tmp_path, change):
+    """The gate decided promote against the basis it read; that basis did not survive the write."""
+    feature, _host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+    persist = feature._persist_gate_record
+
+    async def _change_during_the_record_write(*args, **kwargs):
+        persisted = await persist(*args, **kwargs)
+        if change == "base-model":
+            await feature.set_config({"base_model": "mlx-community/another-base-4bit"})
+        else:
+            await feature._quarantine_adapter(str(candidate), "governed assertion lineage invalidated")
+        return persisted
+
+    feature._persist_gate_record = _change_during_the_record_write
+    result = await feature.parametric_self_adopt(candidate.name)
+
+    expected = {
+        "base-model": "the configured base model changed",
+        "candidate-quarantined": "adapter quarantined: governed assertion lineage invalidated",
+    }[change]
+    assert result.status.value == "error"
+    assert f"promotion blocked: {expected}" in (result.error or "")
+    assert feature._active_adapter_path is None and feature._active_checkpoint_id is None
+    entry = await _last_run(feature)
+    assert (entry["trigger"], entry["promoted"], entry["checkpoint_id"]) == ("adopt", False, None)
+    assert entry["gate"]["decision"] == "promote"  # the decision stays on record, not acted on
+    assert entry["reason"].startswith(f"promotion blocked: {expected}")
+
+
+async def test_adoption_whose_attempt_cannot_be_recorded_evaluates_nothing(tmp_path):
+    feature, host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+    attempt = feature._last_gate_attempt
+    history = copy.deepcopy(host.nodes[feature._history_node_id()].properties["runs"])
+    host.fail_history_writes = True
+
+    result = await feature.parametric_self_adopt(candidate.name)
+
+    assert result.status.value == "error"
+    assert "its adoption record could not be persisted" in (result.error or "")
+    assert feature._last_gate_attempt == attempt
+    assert host.nodes[feature._history_node_id()].properties["runs"] == history
+    assert feature._active_adapter_path is None
+
+
+@pytest.mark.parametrize("outage", ["gate-record-only", "gate-record-and-terminal"])
+async def test_adoption_whose_gate_record_is_lost_is_not_healthy_after_restart(tmp_path, outage):
+    """After a promotion, an adoption's attempt lands but its gate record does not."""
+    feature, host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+    feature._adapter = _Trainer()
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+    assert promoted["promoted"] is True
+    served = (feature._active_adapter_path, feature._active_checkpoint_id)
+    persist = feature._persist_gate_record
+
+    async def _history_fails_from_the_gate_on(*args, **kwargs):
+        if outage == "gate-record-only":
+            host.fail_gate_record_writes = True
+        else:
+            host.fail_history_writes = True
+        return await persist(*args, **kwargs)
+
+    feature._persist_gate_record = _history_fails_from_the_gate_on
+    result = await feature.parametric_self_adopt(candidate.name)
+    host.fail_gate_record_writes = host.fail_history_writes = False
+
+    assert result.status.value == "error"
+    assert "fidelity-gate record could not be persisted" in (result.error or "")
+    assert (feature._active_adapter_path, feature._active_checkpoint_id) == served
+    entry = await _last_run(feature)
+    assert entry["trigger"] == "adopt" and "gate" not in entry
+    if outage == "gate-record-only":
+        assert (entry["state"], entry["gate_pending"], entry["gate_record_persisted"]) == ("failed", False, False)
+    else:
+        assert (entry["state"], entry["gate_pending"]) == ("in_progress", True)
+
+    restarted = ParametricSelfFeature(agent=feature.agent)
+    await restarted.initialize()
+    await restarted._reconcile_stale_runs()  # as loading after a restart does
+    for current in (feature, restarted):
+        gate = (await current.parametric_self_status()).data["fidelity_gate"]
+        assert gate["healthy"] is False
+        assert gate["last_attempt_run_id"] == entry["run_id"]
+        assert gate["last_recorded_decision"] == promoted["gate"]
+    restarted_gate = (await restarted.parametric_self_status()).data["fidelity_gate"]
+    assert restarted_gate["last_attempt_unresolved"] is (outage == "gate-record-and-terminal")
+
+
+async def test_the_adoption_in_flight_is_not_an_unresolved_attempt(tmp_path):
+    feature, _host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+    trained_gate = (await _last_run(feature))["gate"]
+    persist = feature._persist_gate_record
+    seen = {}
+
+    async def _status_before_the_record(*args, **kwargs):
+        seen["pending"] = (await _last_run(feature))["gate_pending"]
+        seen["gate"] = (await feature.parametric_self_status()).data["fidelity_gate"]
+        return await persist(*args, **kwargs)
+
+    feature._persist_gate_record = _status_before_the_record
+    result = await feature.parametric_self_adopt(candidate.name)
+
+    assert result.status.value == "ok"
+    assert seen["pending"] is True
+    assert seen["gate"]["last_attempt_unresolved"] is False
+    assert seen["gate"]["last_decision"] == trained_gate
+
+
+# ----------------------------------------------------------------------
+# The governed corpus is requested exactly as core accepts it
+# ----------------------------------------------------------------------
+
+async def test_the_artifact_consumer_reaches_the_snapshot_and_the_delta(tmp_path):
+    feature, host = await _feature(tmp_path)
+
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert outcome["promoted"] is True
+    assert [method for method, _ in host.corpus_calls] == [SNAPSHOT_METHOD, DELTA_METHOD]
+    for _method, kwargs in host.corpus_calls:
+        assert kwargs["policy"] is POLICY
+        assert {key: kwargs[key] for key in ARTIFACT_CONSUMER} == ARTIFACT_CONSUMER
+        assert isinstance(kwargs["artifact_id"], str) and kwargs["artifact_id"]
+    # Each produced artifact is registered once, under its own id.
+    assert host.corpus_calls[0][1]["artifact_id"] != host.corpus_calls[1][1]["artifact_id"]
+
+
+async def test_without_an_artifact_consumer_the_corpus_is_refused_and_nothing_trains(tmp_path):
+    trainer = _Trainer()
+    feature, host = await _feature(tmp_path, trainer, artifact_consumer=None)
+
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert outcome == {
+        "trained": False, "promoted": False,
+        "reason": "governed corpus unavailable or semantic maintenance incomplete",
+    }
+    assert host.corpus_calls == []
+    assert trainer.trained_val_bytes is None
+    assert await feature._load_run_history() == []
+    assert feature._active_adapter_path is None
+
+
+@pytest.mark.parametrize("method", [SNAPSHOT_METHOD, DELTA_METHOD])
+def test_the_host_fake_takes_the_artifact_arguments_core_requires(method):
+    required = {
+        name for name, parameter in inspect.signature(getattr(AsyncStorage, method)).parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is inspect.Parameter.empty
+    }
+    assert {"policy", "artifact_id", *ARTIFACT_CONSUMER} <= required
+    with pytest.raises(TypeError):
+        _Host()._accept(method, *(["snapshot"] if method == DELTA_METHOD else []), policy=POLICY,
+                        inference_profile=None)
 
 
 # ----------------------------------------------------------------------
@@ -571,15 +1030,19 @@ async def test_a_failed_read_at_the_terminal_update_never_erases_the_gate_record
 
 
 async def test_run_creation_never_overwrites_malformed_history(tmp_path):
-    feature, host = await _feature(tmp_path)
+    """The run record cannot be written over unread history, so the run never starts."""
+    trainer = _Trainer()
+    feature, host = await _feature(tmp_path, trainer)
     await feature._append_run_history({"run_id": "old", "state": "completed"})
     host.nodes[feature._history_node_id()].properties["runs"] = {"not": "a list"}
 
     outcome = await feature._run_training_cycle_locked(trigger="nightly")
 
     assert host.nodes[feature._history_node_id()].properties["runs"] == {"not": "a list"}
-    assert outcome["gate_record_persisted"] is False
-    assert outcome["promoted"] is False and feature._active_adapter_path is None
+    assert (outcome["trained"], outcome["promoted"]) == (False, False)
+    assert "training not started: its run record could not be persisted" in outcome["reason"]
+    assert trainer.trained_val_bytes is None
+    assert feature._active_run is None and feature._active_adapter_path is None
 
 
 @pytest.mark.parametrize("runs", [{"not": "a list"}, [{"run_id": "old"}, "not a record"], "not json"])

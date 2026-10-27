@@ -66,6 +66,13 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
   checkpoint, or the untuned base (`--test` with no adapter) when nothing is
   served. It is scored the same way, on the same validation set, in the same
   run; a stored loss is never a baseline.
+- The baseline is whatever was served, on the configured base model, when the
+  run started. The cycle checks both again just before it scores the baseline,
+  and again before the gate decides. If either changed (the served adapter was
+  quarantined or replaced, or the base model was reconfigured), the decision is
+  `inconclusive` (`baseline_changed`). The changed weights are never loaded. If
+  the baseline changes after a promote decision is recorded, that promotion is
+  blocked.
 - Order of checks: inconclusive inputs, then overfit, then margin; the first
   failure decides. Config keys, overridable through `set_config({"gate": {...}})`
   and persisted:
@@ -75,19 +82,30 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
     greater. Equality passes.
   - `gate.overfit_check` (default `true`).
 - `inconclusive` (no validation set, an empty one, a non-finite loss, no
-  checkpoints, a checkpoint or baseline that cannot be scored) blocks
-  promotion and is never reported healthy by `parametric-self-status` or the
-  sleep hook.
-- Every decision writes a record (best/final checkpoint ids and losses, every
-  checkpoint's score, baseline source and loss, margin, ratio, validation-set
-  digest, decision and reason, explicit nulls) into run history **before** any
-  promotion. If that write fails, nothing is promoted. Status health comes from
-  the latest gate attempt alone: an attempt whose record did not persist is not
-  healthy, whatever an earlier run decided. A history write never replaces
-  history it could not read intact.
+  checkpoints, a checkpoint or baseline that cannot be scored, a baseline that
+  changed during the run) blocks promotion and is never reported healthy by
+  `parametric-self-status` or the sleep hook.
+- Every decision writes a record into run history **before** any promotion.
+  The record holds the best/final checkpoint ids and losses, every
+  checkpoint's score, the baseline source and loss, why the baseline could not
+  be used, and the base model every score was measured on. It also holds the
+  margin, the ratio, the validation-set digest, and the decision and reason.
+  Missing values are explicit nulls. If that write fails, nothing is promoted.
+  A history write never replaces history it could not read intact.
+- Status health comes from the latest gate attempt alone. An attempt that was
+  inconclusive, or whose record did not persist, is not healthy, whatever an
+  earlier run decided. Each training run's and adoption's history entry
+  carries a pending gate marker from the moment it starts. If that entry
+  cannot be written, the run or adoption does not start, so no gate attempt
+  can go unrecorded. The marker is cleared by the same write that records the
+  gate decision, or by the terminal entry. A run that stopped with the marker
+  still set (a restart or a failed write) may have reached the gate, so it is
+  an unresolved attempt and is never healthy.
 - Adopt re-takes the gate on the scores the candidate's own training run
-  recorded, because its validation set is gone; if the baseline has changed
-  since, the result is inconclusive. Rollback restores the checkpoint an
+  recorded, because its validation set is gone. If the baseline or the base
+  model has changed since, the result is `inconclusive`. If either changes, or
+  the candidate is quarantined, while the decision is being recorded, nothing
+  is adopted, as for a training run. Rollback restores the checkpoint an
   adapter was promoted with, at its promoted score. Quarantined adapters are
   never re-scored, adopted or rolled back to.
 
