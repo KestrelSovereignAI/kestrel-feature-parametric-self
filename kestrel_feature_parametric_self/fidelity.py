@@ -120,10 +120,15 @@ class Baseline:
 
 @dataclass(frozen=True)
 class ValSet:
-    """Identity of the validation set every score in one gate run used."""
+    """Identity of the validation set every score in one gate run used.
+
+    mlx_lm scores only full batches of ``batch_size`` examples and refuses a
+    set smaller than one batch, so the batch size is part of what was scored.
+    """
 
     digest: str                     # "sha256:<hex>" of the validation file's bytes
     examples: int
+    batch_size: int                 # examples per scoring batch
 
 
 def served_source(adapter_id: str, checkpoint_id: str) -> str:
@@ -181,6 +186,7 @@ class GateReason(str, Enum):
     MARGIN = "margin"
     VAL_SET_MISSING = "val_set_missing"
     VAL_SET_EMPTY = "val_set_empty"
+    VAL_SET_TOO_SMALL = "val_set_too_small"
     NO_CHECKPOINTS = "no_checkpoints"
     CANDIDATE_EVAL_FAILED = "candidate_eval_failed"
     CANDIDATE_LOSS_INVALID = "candidate_loss_invalid"
@@ -216,6 +222,7 @@ GATE_RECORD_FIELDS = (
     "ratio",
     "val_set_digest",
     "val_set_examples",
+    "val_set_batch_size",
     "promoted_checkpoint_id",
 )
 
@@ -307,6 +314,7 @@ class GateDecision:
             "ratio": _json_number(self.ratio),
             "val_set_digest": val_set.digest if val_set else None,
             "val_set_examples": val_set.examples if val_set else None,
+            "val_set_batch_size": val_set.batch_size if val_set else None,
             "promoted_checkpoint_id": self.promoted_checkpoint_id,
         }
 
@@ -334,9 +342,11 @@ def _recorded_text(value: Any, field: str) -> Optional[str]:
     raise ValueError(f"{field}={value!r} is not text")
 
 
-def recorded_inputs(
-    record: Mapping[str, Any],
-) -> Tuple[Tuple[Checkpoint, ...], Optional[Baseline], Optional[ValSet], Optional[str]]:
+# The checkpoints, baseline, validation set and base model one gate run scored.
+RecordedGateInputs = Tuple[Tuple[Checkpoint, ...], Optional[Baseline], Optional[ValSet], Optional[str]]
+
+
+def recorded_inputs(record: Mapping[str, Any]) -> RecordedGateInputs:
     """The checkpoints, baseline, validation set and base model of one recorded gate run.
 
     The inverse of ``GateDecision.to_record`` for the gate's inputs, so a
@@ -368,13 +378,20 @@ def recorded_inputs(
         _recorded_text(record.get("baseline_error"), "baseline_error"),
         _recorded_text(record.get("baseline_changed"), "baseline_changed"),
     )
-    digest, examples = record.get("val_set_digest"), record.get("val_set_examples")
-    if digest is None and examples is None:
+    digest, examples, batch_size = (
+        record.get("val_set_digest"), record.get("val_set_examples"), record.get("val_set_batch_size"),
+    )
+    if digest is None and examples is None and batch_size is None:
         val_set = None
-    elif isinstance(digest, str) and isinstance(examples, int) and not isinstance(examples, bool):
-        val_set = ValSet(digest, examples)
+    elif isinstance(digest, str) and all(
+        isinstance(count, int) and not isinstance(count, bool) for count in (examples, batch_size)
+    ):
+        val_set = ValSet(digest, examples, batch_size)
     else:
-        raise ValueError(f"val_set_digest={digest!r} / val_set_examples={examples!r} is not a validation set")
+        raise ValueError(
+            f"val_set_digest={digest!r} / val_set_examples={examples!r} / "
+            f"val_set_batch_size={batch_size!r} is not a validation set"
+        )
     base_model = _recorded_text(record.get("base_model"), "base_model")
     return tuple(checkpoints), baseline, val_set, base_model
 
@@ -451,6 +468,12 @@ class FidelityGate:
             return inconclusive(GateReason.VAL_SET_MISSING, "no validation set; nothing was scored")
         if val_set.examples <= 0:
             return inconclusive(GateReason.VAL_SET_EMPTY, "validation set is empty; nothing was scored")
+        if val_set.examples < val_set.batch_size:
+            return inconclusive(
+                GateReason.VAL_SET_TOO_SMALL,
+                f"validation set has {val_set.examples} example(s), fewer than one scoring batch "
+                f"of {val_set.batch_size}; nothing was scored",
+            )
         if not checkpoints:
             return inconclusive(GateReason.NO_CHECKPOINTS, "the run saved no checkpoints")
 

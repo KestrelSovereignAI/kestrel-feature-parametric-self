@@ -45,6 +45,8 @@ from .fidelity import (
     FINAL_ADAPTER_FILE,
     Baseline,
     FidelityGate,
+    GateDecision,
+    RecordedGateInputs,
     is_usable_loss,
     parse_final_val_loss,
     parse_latest_iter,
@@ -95,6 +97,19 @@ def _as_bool(value: Any) -> bool:
             "", "false", "0", "no", "off", "none",
         )
     return bool(value)
+
+
+def _recorded_score(
+    record: Optional[Mapping[str, Any]], which: str,
+) -> Tuple[Optional[str], Optional[float]]:
+    """The ``best`` or ``final`` checkpoint a gate record names, and its usable score."""
+    if record is None:
+        return None, None
+    checkpoint_id, loss = record.get(f"{which}_checkpoint_id"), record.get(f"{which}_val_loss")
+    return (
+        checkpoint_id if isinstance(checkpoint_id, str) else None,
+        loss if is_usable_loss(loss) else None,
+    )
 
 
 class ParametricSelfFeature(Feature):
@@ -453,7 +468,7 @@ class ParametricSelfFeature(Feature):
         # on disk with no served pointer; expose those so the operator knows they
         # are adoptable via `!parametric-self-adopt` rather than appearing lost.
         recoverable = (
-            [a["adapter_id"] for a in self._scan_candidates() if a["recoverable"]]
+            [a["adapter_id"] for a in await self._scan_candidates() if a["recoverable"]]
             if self._active_adapter_path is None
             else []
         )
@@ -1051,57 +1066,85 @@ class ParametricSelfFeature(Feature):
             return None
         return Path(work_dir) / "candidates"
 
-    def _scan_candidates(self) -> List[Dict[str, Any]]:
-        """Scan the candidates dir for staged adapters with parsed val_loss.
+    async def _scan_candidates(self) -> List[Dict[str, Any]]:
+        """Scan the candidates dir for staged adapters and their recorded scores.
+
+        A score comes from a durable record, never from a training log:
+        ``checkpoint_id``/``val_loss`` are the served checkpoint and its score,
+        else the checkpoint the adapter was promoted with at its promoted
+        score, else the best checkpoint its training run's gate scored;
+        ``final_checkpoint_id``/``final_val_loss`` are that run's final
+        weights. Each is None when no record holds it.
 
         Each entry carries ``served`` (is this the currently-served adapter),
         ``in_progress`` (this candidate belongs to the run currently training),
-        and ``recoverable`` (a valid candidate — parseable val_loss — while NO
-        adapter is served yet; the lifecycle state where a *completed* run left a
-        candidate on disk but no served pointer, adoptable via
-        ``parametric-self-adopt``). An in-progress candidate is never recoverable:
-        its parsed ``val_loss`` is an intermediate snapshot, not a terminal
-        result, so it must not be presented as adoptable (issue #17).
+        ``adoption`` (what ``parametric-self-adopt`` would decide now: the gate
+        re-taken on the recorded scores, or why it cannot be), and
+        ``recoverable`` (NO adapter is served and that adoption would promote:
+        the lifecycle state where a *completed* run left a valid candidate on
+        disk but no served pointer). An in-progress candidate has no recorded
+        score yet and is never recoverable (issue #17). A quarantined one is
+        never re-decided.
         """
         candidates = self._candidates_dir()
+        if not candidates or not candidates.is_dir():
+            return []
+        history = await self._load_run_history()
+        basis = self._gate_basis()
         served = self._active_adapter_path
         active_id = self._active_run.get("adapter_id") if self._active_run else None
         adapters: List[Dict[str, Any]] = []
-        if candidates and candidates.is_dir():
-            for d in sorted(candidates.iterdir()):
-                if not d.is_dir():
-                    continue
-                val_loss = None
-                log = d / "train.log"
-                if log.is_file():
-                    try:
-                        val_loss = parse_final_val_loss(log.read_text())
-                    except Exception:
-                        val_loss = None
-                in_progress = active_id is not None and d.name == active_id
-                manifest, manifest_problem = self._manifest_lineage(str(d))
-                receipt_problem = (
-                    self._persisted_receipt_problem(str(d), manifest)
-                    if manifest is not None else None
-                )
-                lineage_state = self._adapter_lineage.get(str(d), {}).get(
-                    "state", "candidate" if manifest is not None else "untracked"
-                )
-                quarantined_reason = self._quarantined_adapters.get(str(d))
-                adapters.append({
-                    "adapter_id": d.name,
-                    "path": str(d),
-                    "val_loss": val_loss,
-                    "served": str(d) == str(served) if served else False,
-                    "in_progress": in_progress,
-                    "recoverable": (
-                        served is None and val_loss is not None and not in_progress
-                        and manifest is not None and not quarantined_reason
-                        and receipt_problem is None
-                    ),
-                    "lineage_state": lineage_state,
-                    "quarantined_reason": quarantined_reason or manifest_problem or receipt_problem,
-                })
+        for d in sorted(candidates.iterdir()):
+            if not d.is_dir():
+                continue
+            path = str(d)
+            is_served = served is not None and path == str(served)
+            in_progress = active_id is not None and d.name == active_id
+            manifest, manifest_problem = self._manifest_lineage(path)
+            receipt_problem = (
+                self._persisted_receipt_problem(path, manifest)
+                if manifest is not None else None
+            )
+            lineage_state = self._adapter_lineage.get(path, {}).get(
+                "state", "candidate" if manifest is not None else "untracked"
+            )
+            quarantined_reason = self._quarantined_adapters.get(path)
+
+            record = self._training_gate_record(history, path)
+            best_id, best_loss = _recorded_score(record, "best")
+            final_id, final_loss = _recorded_score(record, "final")
+            if is_served:
+                checkpoint_id, val_loss = self._active_checkpoint_id or FINAL_ADAPTER_FILE, self._last_val_loss
+            else:
+                checkpoint_id, val_loss = self._promotion(path, history) or (best_id, best_loss)
+
+            adoption: Optional[str] = None
+            recoverable = False
+            if not (
+                is_served or in_progress or quarantined_reason
+                or manifest is None or receipt_problem is not None
+            ):
+                inputs, inputs_problem = self._recorded_gate_inputs(d, record)
+                if inputs_problem is not None:
+                    adoption = f"refused: {inputs_problem}"
+                else:
+                    decision = self._adoption_decision(inputs, basis)
+                    adoption = decision.summary
+                    recoverable = served is None and decision.promote
+            adapters.append({
+                "adapter_id": d.name,
+                "path": path,
+                "checkpoint_id": checkpoint_id,
+                "val_loss": val_loss,
+                "final_checkpoint_id": final_id,
+                "final_val_loss": final_loss,
+                "served": is_served,
+                "in_progress": in_progress,
+                "adoption": adoption,
+                "recoverable": recoverable,
+                "lineage_state": lineage_state,
+                "quarantined_reason": quarantined_reason or manifest_problem or receipt_problem,
+            })
         return adapters
 
     # ------------------------------------------------------------------
@@ -1149,14 +1192,14 @@ class ParametricSelfFeature(Feature):
 
     @tool(
         name="parametric-self-adapters",
-        description="List candidate parametric-self adapters on disk with their val_loss, marking which is currently served",
+        description="List candidate parametric-self adapters on disk with their recorded checkpoint scores, marking which is currently served and which can be adopted",
         category=ToolCategory.SYSTEM,
         command_prefix="!parametric-self-adapters",
     )
     async def parametric_self_adapters(self) -> ToolResult:
-        """List staged candidate adapters, their val_loss, and the served one."""
+        """List staged candidate adapters, their recorded scores, and the served one."""
         served = self._active_adapter_path
-        adapters = self._scan_candidates()
+        adapters = await self._scan_candidates()
         recoverable = [a["adapter_id"] for a in adapters if a["recoverable"]]
         if not adapters:
             return ToolResult.ok(
@@ -1168,12 +1211,17 @@ class ParametricSelfFeature(Feature):
             if a["served"]:
                 mark = " (served)"
             elif a.get("in_progress"):
-                mark = " (in progress — training, val_loss is intermediate)"
+                mark = " (in progress — training, not yet scored)"
             elif a["recoverable"]:
                 mark = " (recoverable — adopt with !parametric-self-adopt)"
+            elif a["adoption"]:
+                mark = f" (adopt: {a['adoption']})"
             else:
                 mark = ""
-            lines.append(f"  {a['adapter_id']}  val_loss={a['val_loss']}{mark}")
+            lines.append(
+                f"  {a['adapter_id']}  {a['checkpoint_id']}@{a['val_loss']}"
+                f" final={a['final_checkpoint_id']}@{a['final_val_loss']}{mark}"
+            )
         if recoverable:
             lines.append(
                 f"No adapter is served; {len(recoverable)} valid candidate(s) can be "
@@ -1534,7 +1582,7 @@ class ParametricSelfFeature(Feature):
                 return ToolResult.failed(f"Adapter '{name}' is quarantined: {quarantined}.")
             # Roll back to exactly the checkpoint that was promoted, never to
             # whatever weights the run happened to end on.
-            promotion = await self._promotion(target_path)
+            promotion = self._promotion(target_path, await self._load_run_history())
             if promotion is None:
                 return ToolResult.failed(
                     f"Adapter '{name}' was never promoted, so there is nothing to roll back to; "
@@ -1646,26 +1694,12 @@ class ParametricSelfFeature(Feature):
                 # candidate is neither re-verified nor re-scored here.
                 return ToolResult.failed(f"Adapter '{adapter_id}' is quarantined: {quarantined}.")
 
-            # The only scores of these checkpoint files are the ones their
-            # training run measured on its validation set. With no such record
-            # the gate gets nothing to compare and is inconclusive.
-            record = await self._training_gate_record(target_path)
-            try:
-                checkpoints, recorded_baseline, val_set, scored_base_model = (
-                    recorded_inputs(record) if record is not None else ((), None, None, None)
-                )
-            except ValueError as exc:
-                return ToolResult.failed(
-                    f"Adapter '{adapter_id}' has a malformed fidelity-gate record ({exc}); "
-                    "refusing to serve it."
-                )
-            missing = next(
-                (c.checkpoint_id for c in checkpoints if not (target / c.checkpoint_id).is_file()), None,
+            inputs, inputs_problem = self._recorded_gate_inputs(
+                target, self._training_gate_record(await self._load_run_history(), target_path),
             )
-            if missing is not None:
+            if inputs_problem is not None:
                 return ToolResult.failed(
-                    f"Adapter '{adapter_id}' checkpoint {missing} is no longer on disk; "
-                    "refusing to serve it."
+                    f"Adapter '{adapter_id}' {inputs_problem}; refusing to serve it."
                 )
 
             lineage_problem = await self._verify_adapter_lineage(target_path)
@@ -1701,19 +1735,24 @@ class ParametricSelfFeature(Feature):
                     )
                 # The baseline the recorded scores must still be measured against.
                 basis = self._gate_basis()
-                decision = self._gate.evaluate(
-                    checkpoints=checkpoints,
-                    baseline=self._adoption_baseline(recorded_baseline, scored_base_model, basis),
-                    val_set=val_set,
-                    base_model=scored_base_model,
-                )
+                decision = self._adoption_decision(inputs, basis)
                 best_loss = decision.best.val_loss if decision.best is not None else None
-                recorded = await self._persist_gate_record(run_id, decision.to_record(), entry_updates={
-                    "timestamp": _utc_now_iso(),
-                    "state": "completed",
-                    "val_loss": best_loss,
-                    "reason": decision.summary,
-                })
+                try:
+                    recorded = await self._persist_gate_record(run_id, decision.to_record(), entry_updates={
+                        "timestamp": _utc_now_iso(),
+                        "state": "completed",
+                        "val_loss": best_loss,
+                        "reason": decision.summary,
+                    })
+                except asyncio.CancelledError:
+                    # Nothing was adopted. The gate marker stays as the
+                    # cancelled record write left it.
+                    await self._finish_run_history(run_id, {
+                        "state": "interrupted",
+                        "timestamp": _utc_now_iso(),
+                        "reason": "adoption interrupted while its fidelity-gate record was written",
+                    })
+                    raise
             finally:
                 self._adoption_run_id = None
             if not recorded:
@@ -1818,9 +1857,12 @@ class ParametricSelfFeature(Feature):
             ))
         return recorded
 
-    async def _training_gate_record(self, adapter_path: str) -> Optional[Dict[str, Any]]:
-        """The gate record of the training run that produced ``adapter_path``."""
-        for entry in reversed(await self._load_run_history()):
+    @staticmethod
+    def _training_gate_record(
+        history: List[Dict[str, Any]], adapter_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        """The gate record, in ``history``, of the training run that produced ``adapter_path``."""
+        for entry in reversed(history):
             gate = entry.get("gate")
             if (
                 entry.get("adapter_path") == adapter_path
@@ -1830,7 +1872,40 @@ class ParametricSelfFeature(Feature):
                 return gate
         return None
 
-    async def _promotion(self, adapter_path: str) -> Optional[Tuple[str, Optional[float]]]:
+    @staticmethod
+    def _recorded_gate_inputs(
+        candidate: Path, record: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[RecordedGateInputs], Optional[str]]:
+        """The gate inputs a candidate's training run recorded, or why they cannot be used.
+
+        The only scores of a candidate's checkpoint files are the ones its
+        training run measured on its validation set. With no such record the
+        inputs are empty, and a gate re-taken on them is inconclusive.
+        """
+        try:
+            inputs = recorded_inputs(record) if record is not None else ((), None, None, None)
+        except ValueError as exc:
+            return None, f"has a malformed fidelity-gate record ({exc})"
+        missing = next(
+            (c.checkpoint_id for c in inputs[0] if not (candidate / c.checkpoint_id).is_file()), None,
+        )
+        if missing is not None:
+            return None, f"checkpoint {missing} is no longer on disk"
+        return inputs, None
+
+    def _adoption_decision(self, inputs: RecordedGateInputs, basis: GateBasis) -> GateDecision:
+        """The fidelity gate re-taken on a candidate's recorded scores, against ``basis``."""
+        checkpoints, recorded_baseline, val_set, scored_base_model = inputs
+        return self._gate.evaluate(
+            checkpoints=checkpoints,
+            baseline=self._adoption_baseline(recorded_baseline, scored_base_model, basis),
+            val_set=val_set,
+            base_model=scored_base_model,
+        )
+
+    def _promotion(
+        self, adapter_path: str, history: List[Dict[str, Any]],
+    ) -> Optional[Tuple[str, Optional[float]]]:
         """The checkpoint ``adapter_path`` was promoted with, and its promoted score.
 
         None if it was never promoted. The score is the one the promoting gate
@@ -1840,7 +1915,7 @@ class ParametricSelfFeature(Feature):
         if isinstance(lineage.get("promoted_checkpoint_id"), str):
             loss = lineage.get("promoted_val_loss")
             return lineage["promoted_checkpoint_id"], loss if is_usable_loss(loss) else None
-        for entry in reversed(await self._load_run_history()):
+        for entry in reversed(history):
             if not (entry.get("promoted") and entry.get("adapter_path") == adapter_path):
                 continue
             if "checkpoint_id" not in entry:
@@ -1873,7 +1948,14 @@ class ParametricSelfFeature(Feature):
         entry in the same write that clears its pending gate marker. Returns
         False when the write did not happen; the caller must then promote
         nothing.
+
+        The attempt becomes this process's latest before the write is awaited,
+        with ``persisted`` None until the write returns. If the write is
+        cancelled, it stays None: whether the record landed is unknown, so the
+        run's history entry, not this process, says what the attempt was.
         """
+        attempt = {"run_id": run_id, "record": record, "persisted": None, "unresolved": False}
+        self._last_gate_attempt = attempt
         try:
             await self._update_run_history(run_id, {
                 **(entry_updates or {}),
@@ -1889,20 +1971,24 @@ class ParametricSelfFeature(Feature):
             persisted = False
         else:
             persisted = True
-        self._last_gate_attempt = {
-            "run_id": run_id, "record": record, "persisted": persisted, "unresolved": False,
-        }
+        self._last_gate_attempt = {**attempt, "persisted": persisted}
         return persisted
 
     def _gate_resolution(self, run_id: str) -> Dict[str, Any]:
         """The fields that resolve run ``run_id``'s pending gate marker when it ends.
 
         ``gate_record_persisted`` is whether this process recorded the run's
-        gate decision, or None when the run ended before the gate decided.
+        gate decision, or None when the run ended before the gate decided. A
+        run that ended while its record write was outstanding (a cancellation)
+        resolves nothing: its marker stays as that write left it, pending if
+        the record never landed and cleared with the record if it did.
         """
         attempt = self._last_gate_attempt
-        persisted = attempt["persisted"] if attempt is not None and attempt["run_id"] == run_id else None
-        return {"gate_pending": False, "gate_record_persisted": persisted}
+        if attempt is None or attempt["run_id"] != run_id:
+            return {"gate_pending": False, "gate_record_persisted": None}
+        if attempt["persisted"] is None:
+            return {}
+        return {"gate_pending": False, "gate_record_persisted": attempt["persisted"]}
 
     async def _finish_run_history(self, run_id: str, updates: Dict[str, Any]) -> None:
         """Write a run's terminal entry, resolving its pending gate marker."""
@@ -1937,17 +2023,23 @@ class ParametricSelfFeature(Feature):
         History is read newest first. This process's own latest attempt stands
         for its run's entry, because a failed record write can leave history
         without the record, or without any trace of the run. Every decision
-        this process takes replaces that attempt, so a decided entry for any
-        other run is older than it. Otherwise an entry speaks for itself: a
-        recorded decision; a decision whose record never landed
+        this process takes replaces that attempt before its record write, so a
+        decided entry for any other run is older than it. An attempt whose
+        record write has not returned (in flight, or cancelled) stands for
+        nothing: whether its record landed is unknown, so history alone
+        speaks, as it does after a restart. Otherwise an entry speaks for
+        itself: a recorded decision; a decision whose record never landed
         (``gate_record_persisted: false``); or a run whose pending gate marker
         was never resolved, because it stopped before its terminal entry (a
-        restart, or a failed write). That run may have reached the gate, so it
-        is an unresolved attempt and never healthy. A run that ended before the
-        gate, a rollback, an entry from before gate records, and the training
-        run or adoption in flight now made no attempt and are passed over.
+        restart, or a failed write) or while its record was being written.
+        That run may have reached the gate, so it is an unresolved attempt and
+        never healthy. A run that ended before the gate, a rollback, an entry
+        from before gate records, and the training run or adoption in flight
+        now made no attempt and are passed over.
         """
         tracked = self._last_gate_attempt
+        if tracked is not None and tracked["persisted"] is None:
+            tracked = None
         training_run = self._active_run.get("run_id") if self._active_run else None
         in_flight = {run for run in (training_run, self._adoption_run_id) if run is not None}
         for entry in reversed(await self._load_run_history()):
@@ -2452,8 +2544,9 @@ class ParametricSelfFeature(Feature):
                 if entry.get("retained_corpus_path"):
                     retained_paths.add(entry["retained_corpus_path"])
         for run_id in run_ids:
-            # A shutdown-incomplete run stopped inside training or scoring,
-            # before its gate decided.
+            # Its gate marker resolves from what this process knows of the
+            # run's gate attempt: none if it stopped in training or scoring,
+            # left as written if it stopped while its gate record was written.
             await self._finish_run_history(run_id, {
                 "state": "interrupted",
                 "timestamp": _utc_now_iso(),

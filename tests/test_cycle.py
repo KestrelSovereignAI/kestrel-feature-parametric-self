@@ -32,8 +32,17 @@ IMPROVING = {"base": 9.0, ITER_200: 1.5, ITER_400: 1.4}
 OVERFIT = {"base": 9.0, ITER_200: 1.5, ITER_400: 9.9}
 # Emma's June run (#11): base 8.977, iter 200 1.866, iter 400 2.688.
 JUNE = {"base": 8.977, ITER_200: 1.866, ITER_400: 2.688}
-# Five grounded insights plus the governed example give a one-row validation split.
-ROWS = [(str(i), "failure", f"Lesson {i}", f"Do thing {i}.", "") for i in range(5)]
+# Seventy grounded insights plus the governed example give a four-row
+# validation split: one scoring batch at the default batch size.
+ROWS = [(str(i), "failure", f"Lesson {i}", f"Do thing {i}.", "") for i in range(70)]
+
+
+def _mlx_refusal(dataset: Path, batch_size: int):
+    """mlx_lm's refusal of a dataset smaller than one batch, or None."""
+    rows = sum(1 for line in dataset.read_text().splitlines() if line.strip())
+    if rows < batch_size:
+        return f"Dataset must have at least batch_size={batch_size} examples but only has {rows}."
+    return None
 
 
 def _snapshot():
@@ -115,6 +124,9 @@ class _FakeAdapter:
 
     async def start_training(self, agent_id, config):
         self.trained_val_bytes = (Path(config.data_dir) / "valid.jsonl").read_bytes()
+        refusal = _mlx_refusal(Path(config.data_dir) / "valid.jsonl", config.batch_size)
+        if refusal is not None:
+            return TrainingStatus(job_id="train", state=TrainingState.FAILED, progress=0.0, error=refusal)
         candidate = Path(config.adapter_path)
         candidate.mkdir(parents=True, exist_ok=True)
         self._candidate = candidate.resolve()
@@ -136,6 +148,9 @@ class _FakeAdapter:
             key = weights.name if weights.parent == self._candidate else "served"
         if self._eval_error is not None and self._misbehaves(key):
             raise self._eval_error
+        refusal = _mlx_refusal(Path(config.data_dir) / "test.jsonl", config.batch_size)
+        if refusal is not None:
+            return TrainingStatus(job_id="eval-refused", state=TrainingState.FAILED, progress=0.0, error=refusal)
         self.evaluations.append({
             "key": key, "weights": weights, "adapter_config": adapter_config, "log_dir": log_dir,
             "test_bytes": (Path(config.data_dir) / "test.jsonl").read_bytes(),
@@ -454,6 +469,41 @@ async def test_empty_validation_split_is_inconclusive_and_trains_nothing(tmp_pat
     assert result.gate.outcome is GateOutcome.INCONCLUSIVE
     assert result.gate.reason is GateReason.VAL_SET_EMPTY
     assert result.reason.startswith("fidelity gate inconclusive")
+
+
+@pytest.mark.parametrize("rows", [5, 40], ids=["one-row", "three-rows"])
+async def test_a_validation_split_smaller_than_one_batch_is_inconclusive_and_trains_nothing(tmp_path, rows):
+    """mlx_lm cannot score fewer examples than one batch, so nothing is trained or scored."""
+    db = _db_with(tmp_path, ROWS[:rows])
+    adapter = _FakeAdapter()
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+    )
+    assert 0 < result.corpus_valid < TextLoRAConfig().batch_size
+    assert result.trained is False and result.promoted is False
+    assert adapter.trained_val_bytes is None
+    assert adapter.scored == []
+    assert result.gate.outcome is GateOutcome.INCONCLUSIVE
+    assert result.gate.reason is GateReason.VAL_SET_TOO_SMALL
+    record = result.gate.to_record()
+    assert (record["val_set_examples"], record["val_set_batch_size"]) == (result.corpus_valid, 4)
+
+
+async def test_the_fake_trainer_refuses_a_set_smaller_than_one_batch_as_mlx_lm_does(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "valid.jsonl").write_text('{"text": "one"}\n' * 3)
+    (corpus / "test.jsonl").write_text('{"text": "one"}\n' * 3)
+    config = TextLoRAConfig(data_dir=str(corpus), adapter_path=str(tmp_path / "adapter"))
+    adapter = _FakeAdapter()
+
+    trained = await adapter.start_training("emma", config)
+    scored = await adapter.start_evaluation("emma", config, log_dir=str(tmp_path / "log"))
+
+    for status in (trained, scored):
+        assert status.state is TrainingState.FAILED
+        assert status.error == "Dataset must have at least batch_size=4 examples but only has 3."
 
 
 async def test_cycle_noop_when_trainer_unavailable(tmp_path):

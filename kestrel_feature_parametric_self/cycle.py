@@ -273,9 +273,10 @@ async def run_nightly_cycle(
                 assertion_lineage=stats.assertion_lineage,
             )
 
-        val_set = read_val_set(Path(corpus_dir) / "valid.jsonl")
-        if val_set is None or val_set.examples == 0:
-            # Nothing could be scored: record an inconclusive gate, train nothing.
+        val_set = read_val_set(Path(corpus_dir) / "valid.jsonl", batch_size=config.batch_size)
+        if val_set is None or val_set.examples < val_set.batch_size:
+            # Nothing could be scored (mlx_lm refuses a set smaller than one
+            # batch): record an inconclusive gate, train nothing.
             decision = gate.evaluate(checkpoints=(), baseline=None, val_set=val_set, base_model=None)
             return CycleResult(
                 False, reason=decision.summary, gate=decision,
@@ -463,7 +464,7 @@ class _Scorer:
         return loss, None
 
 
-def read_val_set(path: Path) -> Optional[ValSet]:
+def read_val_set(path: Path, *, batch_size: int) -> Optional[ValSet]:
     """Identify the validation file every score in this run is computed on."""
     try:
         data = path.read_bytes()
@@ -472,6 +473,7 @@ def read_val_set(path: Path) -> Optional[ValSet]:
     return ValSet(
         digest="sha256:" + hashlib.sha256(data).hexdigest(),
         examples=sum(1 for line in data.splitlines() if line.strip()),
+        batch_size=batch_size,
     )
 
 

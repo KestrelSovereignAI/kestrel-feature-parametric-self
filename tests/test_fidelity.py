@@ -52,7 +52,7 @@ JUNE_FILES = (
     "0000100_adapters.safetensors", ITER_200, "0000300_adapters.safetensors", ITER_400,
     FINAL_ADAPTER_FILE,
 )
-VAL = ValSet(digest="sha256:" + "ab" * 32, examples=75)
+VAL = ValSet(digest="sha256:" + "ab" * 32, examples=75, batch_size=4)
 BASE = "mlx-community/gemma-4-31b-it-4bit"
 
 
@@ -213,9 +213,28 @@ def test_inconclusive_when_val_set_missing():
 def test_inconclusive_when_val_set_empty():
     checkpoints, baseline = _june()
     decision = FidelityGate().evaluate(
-        checkpoints=checkpoints, baseline=baseline, val_set=ValSet(VAL.digest, 0), base_model=BASE,
+        checkpoints=checkpoints, baseline=baseline, val_set=ValSet(VAL.digest, 0, 4), base_model=BASE,
     )
     _assert_inconclusive(decision, GateReason.VAL_SET_EMPTY)
+
+
+@pytest.mark.parametrize("examples", [1, 3])
+def test_inconclusive_when_val_set_is_smaller_than_one_scoring_batch(examples):
+    """mlx_lm refuses to score a set smaller than one batch, so nothing could be scored."""
+    checkpoints, baseline = _june()
+    decision = FidelityGate().evaluate(
+        checkpoints=checkpoints, baseline=baseline, val_set=ValSet(VAL.digest, examples, 4), base_model=BASE,
+    )
+    _assert_inconclusive(decision, GateReason.VAL_SET_TOO_SMALL)
+    assert f"{examples} example(s), fewer than one scoring batch of 4" in decision.detail
+
+
+def test_one_full_scoring_batch_is_enough():
+    checkpoints, baseline = _june()
+    decision = FidelityGate(overfit_check=False).evaluate(
+        checkpoints=checkpoints, baseline=baseline, val_set=ValSet(VAL.digest, 4, 4), base_model=BASE,
+    )
+    assert decision.promoted_checkpoint_id == ITER_200
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, 0.0, -1.0], ids=["nan", "inf", "zero", "negative"])
@@ -446,6 +465,7 @@ def test_records_carry_the_comparison_and_explicit_nulls():
     assert promote["required_below"] == margin_threshold(8.977, 0.02)
     assert promote["ratio"] == pytest.approx(1.4405, abs=1e-4)
     assert promote["val_set_digest"] == VAL.digest and promote["val_set_examples"] == 75
+    assert promote["val_set_batch_size"] == 4
     assert promote["base_model"] == BASE and promote["baseline_changed"] is None
     assert promote["promoted_checkpoint_id"] == ITER_200
     assert promote["checkpoints"] == [
@@ -457,7 +477,8 @@ def test_records_carry_the_comparison_and_explicit_nulls():
     for field in (
         "best_checkpoint_id", "best_val_loss", "final_checkpoint_id", "final_val_loss",
         "baseline_source", "baseline_val_loss", "baseline_error", "baseline_changed",
-        "required_below", "ratio", "val_set_digest", "val_set_examples", "promoted_checkpoint_id",
+        "required_below", "ratio", "val_set_digest", "val_set_examples", "val_set_batch_size",
+        "promoted_checkpoint_id",
     ):
         assert field in inconclusive and inconclusive[field] is None
 
@@ -491,6 +512,8 @@ def test_a_record_keeps_failed_and_non_finite_scores():
     {"baseline_val_loss": [8.0]},
     {"baseline_changed": 1},
     {"val_set_digest": None},
+    {"val_set_batch_size": None},
+    {"val_set_batch_size": True},
     {"base_model": ["gemma"]},
 ])
 def test_a_malformed_record_is_refused(damage):

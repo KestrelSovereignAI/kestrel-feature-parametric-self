@@ -115,6 +115,14 @@ ITER_200 = "0000200_adapters.safetensors"
 ITER_400 = "0000400_adapters.safetensors"
 WEIGHT_FILES = ("0000100_adapters.safetensors", ITER_200, "0000300_adapters.safetensors", ITER_400, "adapters.safetensors")
 JUNE_LOG = "Iter 1: Val loss 8.977, x\nIter 200: Val loss 1.866, x\nIter 400: Val loss 2.688, x\n"
+# The same curve as mlx-lm 0.32's training UI prints it (cli_ui.TrainUI): no "Val loss" line.
+JUNE_LOG_MLX_032 = (
+    "     1    val 8.977    41.20s\n"
+    "   200    val 1.866    40.10s\n"
+    "  save  0000200_adapters.safetensors\n"
+    "   400    val 2.688    40.00s\n"
+    "  save  0000400_adapters.safetensors\n"
+)
 IMPROVING_LOG = "Iter 1: Val loss 8.977, x\nIter 200: Val loss 1.866, x\nIter 400: Val loss 1.800, x\n"
 # What the candidate's training run scored each checkpoint file at.
 JUNE_SCORES = {ITER_200: 1.866, ITER_400: 2.688}
@@ -136,7 +144,7 @@ async def _record_training_gate(
     """The gate record the candidate's training run left: every score adopt re-decides from."""
     checkpoints = tuple(Checkpoint(name, int(name[:7]), loss) for name, loss in scores.items())
     record = FidelityGate().evaluate(
-        checkpoints=checkpoints, baseline=Baseline(*baseline), val_set=ValSet(digest, examples),
+        checkpoints=checkpoints, baseline=Baseline(*baseline), val_set=ValSet(digest, examples, 4),
         base_model=base_model,
     ).to_record()
     await feature._append_run_history({
@@ -175,19 +183,22 @@ async def test_history_lists_runs_most_recent_first():
 async def test_adapters_lists_candidates_and_marks_served(tmp_path):
     work = tmp_path / "parametric_self"
     cands = work / "candidates"
-    for name, loss in (("aaa111", "Val loss 2.601"), ("bbb222", "Val loss 3.100")):
-        d = cands / name
-        d.mkdir(parents=True)
-        (d / "train.log").write_text(f"Iter 400: {loss}\n")
+    for name in ("aaa111", "bbb222"):
+        _write_run(cands / name, "Iter 400: Val loss 3.100\n")
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
-    f._active_adapter_path = str(cands / "aaa111")
+    f._active_adapter_path, f._active_checkpoint_id, f._last_val_loss = str(cands / "aaa111"), ITER_200, 2.601
+    await _record_training_gate(f, cands / "bbb222", JUNE_SCORES)
 
     result = await f.parametric_self_adapters()
     assert result.status == ToolResultStatus.OK
     by_id = {a["adapter_id"]: a for a in result.data["adapters"]}
     assert by_id["aaa111"]["served"] is True
     assert by_id["bbb222"]["served"] is False
-    assert by_id["aaa111"]["val_loss"] == pytest.approx(2.601)
+    # The served adapter shows its served checkpoint and score; every other
+    # candidate the scores its training run's gate recorded. Never the log.
+    assert (by_id["aaa111"]["checkpoint_id"], by_id["aaa111"]["val_loss"]) == (ITER_200, 2.601)
+    assert (by_id["bbb222"]["checkpoint_id"], by_id["bbb222"]["val_loss"]) == (ITER_200, 1.866)
+    assert (by_id["bbb222"]["final_checkpoint_id"], by_id["bbb222"]["final_val_loss"]) == (ITER_400, 2.688)
 
 
 # ----------------------------------------------------------------------
@@ -1159,6 +1170,110 @@ async def test_status_keeps_untracked_candidates_non_serving(tmp_path):
     assert result.data["recoverable_adapters"] == []
 
 
+@pytest.mark.parametrize("log", [JUNE_LOG, JUNE_LOG_MLX_032], ids=["mlx-lm-0.31", "mlx-lm-0.32"])
+async def test_recovery_surface_offers_what_adopt_promotes_from_recorded_scores(tmp_path, log):
+    """Whatever the training log looks like, status lists the candidate adopt
+    would promote, at the score its iter-200 file recorded, not the final one."""
+    cands = tmp_path / "parametric_self" / "candidates" / "june"
+    _write_run(cands, log)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, JUNE_SCORES)
+    await f.set_config({"gate": {"overfit_ratio": 1.5}})
+
+    assert (await f.parametric_self_status()).data["recoverable_adapters"] == ["june"]
+    listing = await f.parametric_self_adapters()
+    assert listing.data["recoverable_adapters"] == ["june"]
+    listed = listing.data["adapters"][0]
+    assert listed["recoverable"] is True
+    assert (listed["checkpoint_id"], listed["val_loss"]) == (ITER_200, 1.866)
+    assert (listed["final_checkpoint_id"], listed["final_val_loss"]) == (ITER_400, 2.688)
+    assert listed["adoption"].startswith("fidelity gate promote (passed)")
+
+    adopted = await f.parametric_self_adopt(adapter_id="june")
+    assert adopted.status == ToolResultStatus.OK
+    assert (adopted.data["served_checkpoint"], adopted.data["served_val_loss"]) == (ITER_200, 1.866)
+    served = (await f.parametric_self_adapters()).data["adapters"][0]
+    assert served["served"] is True and served["recoverable"] is False
+    assert (served["checkpoint_id"], served["val_loss"]) == (ITER_200, 1.866)
+
+
+@pytest.mark.parametrize("log", [JUNE_LOG, JUNE_LOG_MLX_032], ids=["mlx-lm-0.31", "mlx-lm-0.32"])
+async def test_recovery_surface_withholds_a_candidate_adopt_rejects(tmp_path, log):
+    """Under the default gate the overfit June run is shown with its recorded
+    scores and why adoption would reject it, and is not offered as recoverable."""
+    cands = tmp_path / "parametric_self" / "candidates" / "june"
+    _write_run(cands, log)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, JUNE_SCORES)
+
+    assert (await f.parametric_self_status()).data["recoverable_adapters"] == []
+    listed = (await f.parametric_self_adapters()).data["adapters"][0]
+    assert listed["recoverable"] is False
+    assert (listed["checkpoint_id"], listed["val_loss"]) == (ITER_200, 1.866)
+    assert (listed["final_checkpoint_id"], listed["final_val_loss"]) == (ITER_400, 2.688)
+    assert listed["adoption"].startswith("fidelity gate reject (overfit)")
+
+    adopted = await f.parametric_self_adopt(adapter_id="june")
+    assert adopted.status == ToolResultStatus.ERROR
+    assert "fidelity gate reject (overfit)" in (adopted.error or "")
+
+
+async def test_recovery_surface_shows_no_score_for_a_candidate_without_a_gate_record(tmp_path):
+    """A logged loss is not a score: with no gate record nothing is shown or offered."""
+    cands = tmp_path / "parametric_self" / "candidates" / "legacy"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+
+    listed = (await f.parametric_self_adapters()).data["adapters"][0]
+    assert listed["recoverable"] is False
+    assert listed["checkpoint_id"] is None and listed["val_loss"] is None
+    assert listed["final_checkpoint_id"] is None and listed["final_val_loss"] is None
+    assert listed["adoption"].startswith("fidelity gate inconclusive (val_set_missing)")
+    assert (await f.parametric_self_status()).data["recoverable_adapters"] == []
+
+
+async def test_recovery_surface_withholds_a_candidate_whose_recorded_checkpoint_is_gone(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "pruned"
+    _write_run(cands, IMPROVING_LOG, files=(ITER_200,))
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
+
+    listed = (await f.parametric_self_adapters()).data["adapters"][0]
+    assert listed["recoverable"] is False
+    assert listed["adoption"] == f"refused: checkpoint {ITER_400} is no longer on disk"
+    assert (await f.parametric_self_status()).data["recoverable_adapters"] == []
+
+
+async def test_recovery_surface_never_redecides_a_quarantined_candidate(tmp_path):
+    cands = tmp_path / "parametric_self" / "candidates" / "bad"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands)
+    f._quarantined_adapters[str(cands)] = "governed assertion lineage invalidated; rebuild required"
+
+    class _NoScoring(FidelityGate):
+        def evaluate(self, **_kwargs):
+            raise AssertionError("a quarantined candidate is not re-decided")
+
+    f._gate = _NoScoring()
+    listed = (await f.parametric_self_adapters()).data["adapters"][0]
+    assert listed["recoverable"] is False
+    assert listed["adoption"] is None
+    assert listed["quarantined_reason"] == "governed assertion lineage invalidated; rebuild required"
+    assert (listed["checkpoint_id"], listed["val_loss"]) == (ITER_400, 1.800)
+    assert (await f.parametric_self_status()).data["recoverable_adapters"] == []
+
+
 async def test_adopt_persists_served_and_appends_adopt_history(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "ded33cd017d9"
     _write_run(cands, IMPROVING_LOG)
@@ -1496,6 +1611,8 @@ async def test_active_candidate_marked_in_progress_not_recoverable(tmp_path):
     by_id = {a["adapter_id"]: a for a in result.data["adapters"]}
     assert by_id["abc123def456"]["in_progress"] is True
     assert by_id["abc123def456"]["recoverable"] is False
+    assert by_id["abc123def456"]["val_loss"] is None  # nothing scored yet
+    assert by_id["abc123def456"]["adoption"] is None
     assert result.data["recoverable_adapters"] == []
 
 

@@ -32,7 +32,7 @@ tools:
     description: Recent training runs (ts, trigger, corpus, val_loss, promoted)
     command: "!parametric-self-history"
   - name: parametric-self-adapters
-    description: Candidate adapters on disk with val_loss; marks served/in-progress/recoverable state
+    description: Candidate adapters on disk with their recorded checkpoint scores; marks served/in-progress/recoverable state
     command: "!parametric-self-adapters"
   - name: parametric-self-progress
     description: Active training run progress, including run_id, adapter_id, iter, and intermediate val_loss

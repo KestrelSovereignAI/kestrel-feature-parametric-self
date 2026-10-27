@@ -7,11 +7,13 @@ surface accepts exactly what core's ``AsyncStorage`` methods accept.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import inspect
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -19,7 +21,15 @@ from unittest.mock import MagicMock
 import pytest
 from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
-from kestrel_sovereign.knowledge import EpistemicState, OntologyRef, Visibility
+from kestrel_sovereign.knowledge import (
+    EpistemicState,
+    GovernedArtifactError,
+    GovernedArtifactKind,
+    GovernedArtifactLineage,
+    GovernedArtifactRegistration,
+    OntologyRef,
+    Visibility,
+)
 from kestrel_sovereign.knowledge.corpus import GovernedCorpusPolicy
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
@@ -36,14 +46,20 @@ JUNE = {"base": 8.977, ITER_200: 1.866, ITER_400: 2.688}
 IMPROVING = {"base": 9.0, ITER_200: 1.5, ITER_400: 1.4}
 IMPROVING_LOG = "Iter 1: Val loss 9.000, x\nIter 200: Val loss 1.500, x\nIter 400: Val loss 1.400, x\n"
 # The host-registered consumer every governed corpus artifact is produced for.
+# Core takes its Ed25519 public key as raw lowercase hex.
 ARTIFACT_CONSUMER = {
     "consumer_id": "parametric-self:emma",
     "consumer_key_id": "consumer-key:emma",
-    "consumer_public_key": "ed25519:" + "ab" * 32,
+    "consumer_public_key": "ab" * 32,
     "retention_seconds": 300.0,
 }
 SNAPSHOT_METHOD = "governed_assertion_corpus_snapshot"
 DELTA_METHOD = "governed_assertion_corpus_changes_since"
+# The artifact kind core registers for each corpus method's product.
+ARTIFACT_KINDS = {
+    SNAPSHOT_METHOD: GovernedArtifactKind.CORPUS_MANIFEST,
+    DELTA_METHOD: GovernedArtifactKind.FUTURE_CORPUS_CANDIDATE,
+}
 
 
 def _policy() -> GovernedCorpusPolicy:
@@ -79,7 +95,7 @@ def _snapshot():
             assertion=assertion, content_hash="sha256:revision:one", source_occurrences=(),
             decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
         ),),
-        snapshot_hash="sha256:snapshot:one", tenant_id="tenant:test",
+        snapshot_hash=hashlib.sha256(b"snapshot:one").hexdigest(), tenant_id="tenant:test",
         policy=POLICY,
         checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=4, latest_event_id="event:4"),
         capability_versions={"semantic_maintenance": "1"},
@@ -96,14 +112,18 @@ class _Host:
 
     The corpus methods bind each call against core's own ``AsyncStorage``
     signature, so a call core would refuse (a missing artifact consumer
-    argument, an unknown keyword) raises TypeError here too. Accepted calls
-    are kept in ``corpus_calls``.
+    argument, an unknown keyword) raises TypeError here too. Each product is
+    then registered through core's ``GovernedArtifactRegistration``, so
+    producer arguments core would refuse (a malformed artifact id or consumer
+    key, a non-positive retention) raise here too. Accepted calls are kept in
+    ``corpus_calls`` and their registrations in ``registrations``.
     """
 
     def __init__(self):
         self.snapshot = _snapshot()
         self.nodes = {}
         self.corpus_calls = []
+        self.registrations = []
         self.fail_gate_record_writes = False
         self.fail_history_writes = False
         self.fail_history_reads = False
@@ -114,16 +134,47 @@ class _Host:
             raise TypeError(f"{method} policy must be a GovernedCorpusPolicy")
         self.corpus_calls.append((method, kwargs))
 
+    def _register(self, method, product, lineage, **kwargs):
+        """Register ``product`` for the calling consumer, refusing what core refuses."""
+        retention = kwargs["retention_seconds"]
+        if not isinstance(retention, (int, float)) or isinstance(retention, bool) or retention <= 0:
+            raise ValueError("retention_seconds must be positive")
+        self.registrations.append(GovernedArtifactRegistration(
+            artifact_id=kwargs["artifact_id"],
+            kind=ARTIFACT_KINDS[method],
+            tenant_id=self.snapshot.tenant_id,
+            consumer_id=kwargs["consumer_id"],
+            consumer_key_id=kwargs["consumer_key_id"],
+            consumer_public_key=kwargs["consumer_public_key"],
+            checkpoint_generation=product.checkpoint.generation,
+            policy_pin=kwargs["policy"].digest,
+            capability_pins={
+                name: hashlib.sha256(f"{name}:{version}".encode()).hexdigest()
+                for name, version in self.snapshot.capability_versions.items()
+            },
+            lineage=tuple(GovernedArtifactLineage(*pair) for pair in lineage),
+            retention_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=retention)).isoformat(),
+            artifact_digest=product.snapshot_hash,
+        ))
+
     async def governed_assertion_corpus_snapshot(self, **kwargs):
         self._accept(SNAPSHOT_METHOD, **kwargs)
+        lineage = [
+            (example.assertion.assertion_id, example.assertion.revision_id)
+            for example in self.snapshot.examples
+        ]
+        self._register(SNAPSHOT_METHOD, self.snapshot, lineage, **kwargs)
         return self.snapshot
 
     async def governed_assertion_corpus_changes_since(self, base, **kwargs):
         self._accept(DELTA_METHOD, base, **kwargs)
-        return SimpleNamespace(
+        delta = SimpleNamespace(
             tombstones=(), since_checkpoint=base.checkpoint, checkpoint=self.snapshot.checkpoint,
-            snapshot_hash="sha256:delta", observability=SimpleNamespace(policy_digest=POLICY.digest),
+            snapshot_hash=hashlib.sha256(b"delta").hexdigest(),
+            observability=SimpleNamespace(policy_digest=POLICY.digest),
         )
+        self._register(DELTA_METHOD, delta, (), **kwargs)
+        return delta
 
     @staticmethod
     def _gates(node):
@@ -143,8 +194,19 @@ class _Host:
         return copy.deepcopy(self.nodes.get(node_id))
 
 
+def _mlx_refusal(dataset: Path, batch_size: int):
+    """mlx_lm's refusal of a dataset smaller than one batch, or None."""
+    rows = sum(1 for line in dataset.read_text().splitlines() if line.strip())
+    if rows < batch_size:
+        return f"Dataset must have at least batch_size={batch_size} examples but only has {rows}."
+    return None
+
+
 class _Trainer:
-    """Writes the candidate's mlx_lm files; scores the weights a view links to."""
+    """Writes the candidate's mlx_lm files; scores the weights a view links to.
+
+    Like mlx_lm, it refuses to train on or score a dataset smaller than one batch.
+    """
 
     def __init__(self, scores=IMPROVING, served_score=5.0, served_error=None, during_training=None):
         self.scores, self.served_score, self.served_error = scores, served_score, served_error
@@ -162,6 +224,9 @@ class _Trainer:
         if self.during_training is not None:
             await self.during_training()
         self.trained_val_bytes = (Path(config.data_dir) / "valid.jsonl").read_bytes()
+        refusal = _mlx_refusal(Path(config.data_dir) / "valid.jsonl", config.batch_size)
+        if refusal is not None:
+            return TrainingStatus(job_id="train", state=TrainingState.FAILED, progress=0.0, error=refusal)
         candidate = Path(config.adapter_path)
         self._candidate = candidate.resolve()
         for name in [*self.scores, "adapters.safetensors"]:
@@ -182,6 +247,9 @@ class _Trainer:
                 loss = self.served_score
             else:
                 loss = self.scores[weights.name]
+        refusal = _mlx_refusal(Path(config.data_dir) / "test.jsonl", config.batch_size)
+        if refusal is not None:
+            return TrainingStatus(job_id="eval-refused", state=TrainingState.FAILED, progress=0.0, error=refusal)
         self.scored_test_bytes.append((Path(config.data_dir) / "test.jsonl").read_bytes())
         job_id = f"eval-{len(self._logs)}"
         self._logs[job_id] = f"Testing\nTest loss {loss:.3f}, Test ppl 1.0.\n"
@@ -194,8 +262,13 @@ class _Trainer:
         return self._logs.get(job_id, "")
 
 
-def _reflections(tmp_path, rows=5) -> str:
-    """Grounded insights; with the governed example they give a validation row."""
+# Seventy grounded insights plus the governed example give a four-row
+# validation split: one scoring batch at the default batch size.
+ROWS = 70
+
+
+def _reflections(tmp_path, rows=ROWS) -> str:
+    """Grounded insights; with the governed example they form the run's corpus."""
     db = str(tmp_path / "cog.db")
     con = sqlite3.connect(db)
     con.execute(
@@ -211,7 +284,7 @@ def _reflections(tmp_path, rows=5) -> str:
     return db
 
 
-async def _feature(tmp_path, trainer=None, *, rows=5, artifact_consumer=ARTIFACT_CONSUMER):
+async def _feature(tmp_path, trainer=None, *, rows=ROWS, artifact_consumer=ARTIFACT_CONSUMER):
     host = _Host()
     agent = MagicMock()
     agent.storage = host
@@ -361,6 +434,25 @@ async def test_inconclusive_run_is_not_healthy_on_status_or_the_sleep_hook(tmp_p
     status = await feature.parametric_self_status()
     assert status.data["fidelity_gate"]["healthy"] is False
     assert "WARNING: the last fidelity-gate decision was inconclusive (val_set_empty)" in status.confirmation
+
+
+async def test_a_validation_set_smaller_than_one_batch_is_recorded_inconclusive(tmp_path):
+    """A young corpus (here one validation row) is recorded as a gate that scored nothing."""
+    trainer = _Trainer()
+    feature, _host = await _feature(tmp_path, trainer, rows=5)
+    feature._training_enabled = True
+
+    outcome = await ParametricSelfSleepHook(feature).on_post_consolidation(feature.agent, {})
+
+    assert (outcome["gate"]["decision"], outcome["gate"]["reason"]) == ("inconclusive", "val_set_too_small")
+    assert (outcome["gate"]["val_set_examples"], outcome["gate"]["val_set_batch_size"]) == (1, 4)
+    assert outcome["gate_record_persisted"] is True
+    assert trainer.trained_val_bytes is None and trainer.scored_test_bytes == []
+    assert SleepMixin._hook_outcome(outcome)[0] is SleepHookStatus.FAILED
+    assert (await _last_run(feature))["gate"] == outcome["gate"]
+    status = await feature.parametric_self_status()
+    assert status.data["fidelity_gate"]["healthy"] is False
+    assert "inconclusive (val_set_too_small)" in status.confirmation
 
 
 async def test_no_gate_decision_yet_is_not_reported_healthy(tmp_path):
@@ -578,6 +670,98 @@ async def test_the_run_in_flight_is_not_an_unresolved_attempt(tmp_path):
     assert seen["gate"]["last_attempt_unresolved"] is False
 
 
+def _hang_the_next_gate_record_write(host, *, lands):
+    """The next history write that adds a gate record never returns.
+
+    When ``lands``, the record is stored before the write hangs. Either way
+    the writer cannot tell whether it landed. Returns an event that is set
+    once the write hangs.
+    """
+    hanging = asyncio.Event()
+    add_node = host.add_node
+
+    async def _add_node(node):
+        if (
+            not hanging.is_set()
+            and node.node_id.startswith("parametric_self_runs:")
+            and host._gates(node) > host._gates(host.nodes.get(node.node_id))
+        ):
+            if lands:
+                await add_node(node)
+            hanging.set()
+            await asyncio.Event().wait()
+        await add_node(node)
+
+    host.add_node = _add_node
+    return hanging
+
+
+async def _restarted(feature):
+    restarted = ParametricSelfFeature(agent=feature.agent)
+    await restarted.initialize()
+    await restarted._reconcile_stale_runs()  # as loading after a restart does
+    return restarted
+
+
+@pytest.mark.parametrize("lands", [False, True], ids=["record-lost", "record-landed"])
+async def test_sleep_cancelled_while_the_gate_record_is_written_never_restores_an_older_health(tmp_path, lands):
+    """After a promotion, sleep is cancelled while an inconclusive run's record is written.
+
+    The run cannot tell whether its record landed, so its terminal entry
+    resolves nothing. History alone says what the attempt was, and status
+    reads the same now and after a restart.
+    """
+    feature, host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+    assert promoted["promoted"] is True
+    feature._adapter = _Trainer(served_error=RuntimeError("metal device lost"))
+    feature._training_enabled = True
+    hanging = _hang_the_next_gate_record_write(host, lands=lands)
+
+    sleep = asyncio.create_task(ParametricSelfSleepHook(feature).on_post_consolidation(feature.agent, {}))
+    await hanging.wait()
+    sleep.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sleep
+
+    assert feature._active_run is None and feature._cycle_in_flight is False
+    entry = await _last_run(feature)
+    assert entry["state"] == "interrupted"
+    if lands:
+        assert (entry["gate_pending"], entry["gate_record_persisted"]) == (False, True)
+        assert (entry["gate"]["decision"], entry["gate"]["reason"]) == ("inconclusive", "baseline_eval_failed")
+    else:
+        assert entry["gate_pending"] is True and "gate" not in entry
+    for current in (feature, await _restarted(feature)):
+        status = await current.parametric_self_status()
+        gate = status.data["fidelity_gate"]
+        assert gate["healthy"] is False
+        assert gate["last_attempt_run_id"] == entry["run_id"]
+        assert gate["last_attempt_unresolved"] is not lands
+        assert gate["last_decision"] == (entry["gate"] if lands else None)
+        assert gate["last_recorded_decision"] == (entry["gate"] if lands else promoted["gate"])
+        if not lands:
+            assert "stopped before its fidelity-gate outcome was resolved" in status.confirmation
+
+
+async def test_a_gate_record_write_in_flight_leaves_health_with_the_last_decision(tmp_path):
+    """Until the write returns, the attempt it records is not this process's to report."""
+    feature, host = await _feature(tmp_path)
+    promoted = await feature._run_training_cycle_locked(trigger="nightly")
+    feature._adapter = _Trainer(served_error=RuntimeError("metal device lost"))
+    hanging = _hang_the_next_gate_record_write(host, lands=False)
+
+    run = asyncio.create_task(feature._run_training_cycle(trigger="nightly"))
+    await hanging.wait()
+    gate = (await feature.parametric_self_status()).data["fidelity_gate"]
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    assert gate["last_decision"] == promoted["gate"]
+    assert gate["last_attempt_unresolved"] is False
+
+
 # ----------------------------------------------------------------------
 # A baseline that changes during the run is never compared (R8)
 # ----------------------------------------------------------------------
@@ -783,6 +967,35 @@ async def test_the_adoption_in_flight_is_not_an_unresolved_attempt(tmp_path):
     assert seen["gate"]["last_decision"] == trained_gate
 
 
+@pytest.mark.parametrize("lands", [False, True], ids=["record-lost", "record-landed"])
+async def test_adoption_cancelled_while_its_gate_record_is_written_adopts_nothing(tmp_path, lands):
+    """The adoption is interrupted, and status reads the same now and after a restart."""
+    feature, host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+    hanging = _hang_the_next_gate_record_write(host, lands=lands)
+
+    adoption = asyncio.create_task(feature.parametric_self_adopt(candidate.name))
+    await hanging.wait()
+    adoption.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adoption
+
+    assert feature._active_adapter_path is None and feature._active_checkpoint_id is None
+    assert feature._cycle_in_flight is False and feature._adoption_run_id is None
+    entry = await _last_run(feature)
+    assert (entry["trigger"], entry["state"], entry["promoted"]) == ("adopt", "interrupted", False)
+    assert entry["gate_pending"] is (not lands)
+    if lands:
+        assert entry["gate"]["decision"] == "promote"  # decided and recorded, never acted on
+    for current in (feature, await _restarted(feature)):
+        gate = (await current.parametric_self_status()).data["fidelity_gate"]
+        assert current._active_adapter_path is None
+        assert gate["last_attempt_run_id"] == entry["run_id"]
+        assert gate["last_attempt_unresolved"] is not lands
+        assert gate["last_decision"] == (entry["gate"] if lands else None)
+        assert gate["healthy"] is lands
+
+
 # ----------------------------------------------------------------------
 # The governed corpus is requested exactly as core accepts it
 # ----------------------------------------------------------------------
@@ -800,6 +1013,35 @@ async def test_the_artifact_consumer_reaches_the_snapshot_and_the_delta(tmp_path
         assert isinstance(kwargs["artifact_id"], str) and kwargs["artifact_id"]
     # Each produced artifact is registered once, under its own id.
     assert host.corpus_calls[0][1]["artifact_id"] != host.corpus_calls[1][1]["artifact_id"]
+    assert [(r.kind, r.artifact_id) for r in host.registrations] == [
+        (ARTIFACT_KINDS[method], kwargs["artifact_id"]) for method, kwargs in host.corpus_calls
+    ]
+    for registration in host.registrations:
+        assert (registration.consumer_id, registration.consumer_key_id, registration.consumer_public_key) == (
+            ARTIFACT_CONSUMER["consumer_id"], ARTIFACT_CONSUMER["consumer_key_id"],
+            ARTIFACT_CONSUMER["consumer_public_key"],
+        )
+
+
+@pytest.mark.parametrize("refused", [
+    {"consumer_public_key": "ed25519:" + "ab" * 32},
+    {"consumer_public_key": "AB" * 32},
+    {"retention_seconds": 0.0},
+], ids=["prefixed-key", "uppercase-key", "no-retention"])
+async def test_a_consumer_core_cannot_register_gets_no_corpus_and_nothing_trains(tmp_path, refused):
+    trainer = _Trainer()
+    feature, host = await _feature(tmp_path, trainer, artifact_consumer={**ARTIFACT_CONSUMER, **refused})
+
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert outcome == {
+        "trained": False, "promoted": False,
+        "reason": "governed corpus unavailable or semantic maintenance incomplete",
+    }
+    assert [method for method, _ in host.corpus_calls] == [SNAPSHOT_METHOD]
+    assert host.registrations == []
+    assert trainer.trained_val_bytes is None
+    assert await feature._load_run_history() == []
 
 
 async def test_without_an_artifact_consumer_the_corpus_is_refused_and_nothing_trains(tmp_path):
@@ -828,6 +1070,19 @@ def test_the_host_fake_takes_the_artifact_arguments_core_requires(method):
     with pytest.raises(TypeError):
         _Host()._accept(method, *(["snapshot"] if method == DELTA_METHOD else []), policy=POLICY,
                         inference_profile=None)
+
+
+@pytest.mark.parametrize("method", [SNAPSHOT_METHOD, DELTA_METHOD])
+def test_the_host_fake_registers_with_core_s_registration_model(method):
+    host = _Host()
+    producer = {"artifact_id": "7f1c1f8e-3a52-4c3e-9d0a-2b1f6c9e4a11", **ARTIFACT_CONSUMER}
+    host._register(method, host.snapshot, (), policy=POLICY, **producer)
+    assert [registration.kind for registration in host.registrations] == [ARTIFACT_KINDS[method]]
+    with pytest.raises(GovernedArtifactError, match="consumer_public_key"):
+        host._register(method, host.snapshot, (), policy=POLICY,
+                       **{**producer, "consumer_public_key": "ed25519:" + "ab" * 32})
+    with pytest.raises(GovernedArtifactError, match="artifact_id"):
+        host._register(method, host.snapshot, (), policy=POLICY, **{**producer, "artifact_id": "artifact-1"})
 
 
 # ----------------------------------------------------------------------

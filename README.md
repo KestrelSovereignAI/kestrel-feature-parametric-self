@@ -81,15 +81,18 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
   - `gate.overfit_ratio` (default `1.20`): reject when `final / best` is
     greater. Equality passes.
   - `gate.overfit_check` (default `true`).
-- `inconclusive` (no validation set, an empty one, a non-finite loss, no
+- `inconclusive` (no validation set, an empty one, one smaller than a single
+  `batch_size` batch, which mlx_lm cannot score, a non-finite loss, no
   checkpoints, a checkpoint or baseline that cannot be scored, a baseline that
   changed during the run) blocks promotion and is never reported healthy by
-  `parametric-self-status` or the sleep hook.
+  `parametric-self-status` or the sleep hook. A run whose validation set is
+  too small to score trains nothing.
 - Every decision writes a record into run history **before** any promotion.
   The record holds the best/final checkpoint ids and losses, every
   checkpoint's score, the baseline source and loss, why the baseline could not
   be used, and the base model every score was measured on. It also holds the
-  margin, the ratio, the validation-set digest, and the decision and reason.
+  margin, the ratio, the validation-set digest, size and scoring batch size,
+  and the decision and reason.
   Missing values are explicit nulls. If that write fails, nothing is promoted.
   A history write never replaces history it could not read intact.
 - Status health comes from the latest gate attempt alone. An attempt that was
@@ -98,9 +101,13 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
   carries a pending gate marker from the moment it starts. If that entry
   cannot be written, the run or adoption does not start, so no gate attempt
   can go unrecorded. The marker is cleared by the same write that records the
-  gate decision, or by the terminal entry. A run that stopped with the marker
-  still set (a restart or a failed write) may have reached the gate, so it is
-  an unresolved attempt and is never healthy.
+  gate decision, or by the terminal entry. A run or adoption that is cancelled
+  while its gate record is being written cannot tell whether the record
+  landed. Its terminal entry leaves the marker as that write left it, and
+  status reads that attempt from history, as it would after a restart. A run
+  that stopped with the marker still set (a restart, a failed write, or a
+  cancelled record write) may have reached the gate, so it is an unresolved
+  attempt and is never healthy.
 - Adopt re-takes the gate on the scores the candidate's own training run
   recorded, because its validation set is gone. If the baseline or the base
   model has changed since, the result is `inconclusive`. If either changes, or
@@ -108,6 +115,13 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
   is adopted, as for a training run. Rollback restores the checkpoint an
   adapter was promoted with, at its promoted score. Quarantined adapters are
   never re-scored, adopted or rolled back to.
+- `parametric-self-adapters` and `parametric-self-status` never read a
+  training log for a score. Each candidate shows its served or promoted
+  checkpoint and score, or else the best and final checkpoint scores its
+  training run's gate recorded. A candidate is listed as recoverable only when
+  nothing is served and adopt, re-taking the gate on those recorded scores,
+  would promote it. For any other candidate that is not served, in progress or
+  quarantined, the listing shows what adopt would decide.
 
 ## Inference use
 
