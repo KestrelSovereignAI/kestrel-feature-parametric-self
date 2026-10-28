@@ -21,7 +21,10 @@ started. The cycle re-reads both just before it scores the baseline and again
 before the gate decides. If either changed (the served adapter was swapped or
 quarantined, or the base model was reconfigured), the baseline is no longer the
 one the candidate must beat, so the gate is inconclusive. Changed weights are
-never loaded.
+never loaded. A served adapter is also the baseline only while it passes the
+feature's serve-time governed-lineage check, run just before it is loaded; one
+that fails it is not loaded, and the gate is inconclusive rather than falling
+back to the base.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence, Tuple
 
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 
@@ -206,6 +209,7 @@ async def run_nightly_cycle(
     config: TextLoRAConfig,
     served: Optional[ServedAdapter],
     basis_now: Callable[[], GateBasis],
+    verify_served: Callable[[ServedAdapter], Awaitable[Optional[str]]],
     adapter_id: Optional[str] = None,
     poll_interval: float = 2.0,
     max_polls: int = 5400,  # ~3h at 2s; a backstop, not a deadline
@@ -217,7 +221,9 @@ async def run_nightly_cycle(
     ``config.base_model``. Either is scored on this run's validation set
     exactly as the run's checkpoints are. ``basis_now`` reports the current
     base model and served adapter, so a baseline that changed during the run
-    is refused rather than scored or compared.
+    is refused rather than scored or compared. ``verify_served`` runs the
+    serve-time governed-lineage check on the served adapter just before it is
+    loaded, and returns why it may not be the baseline, or None if it may.
     """
     work = Path(work_dir)
     expected = GateBasis(config.base_model, served)
@@ -322,6 +328,7 @@ async def run_nightly_cycle(
                 saved_checkpoints(_weight_files(adapter_dir), final_iteration=config.iters),
                 served,
                 lambda: baseline_change(expected, basis_now()),
+                verify_served,
             )
         except _ScoringStillActive as exc:
             return _still_active(str(exc), stats, corpus_dir, legacy_corpus_retained)
@@ -388,6 +395,7 @@ class _Scorer:
         saved: Sequence[Checkpoint],
         served: Optional[ServedAdapter],
         baseline_changed: Callable[[], Optional[str]],
+        verify_served: Callable[[ServedAdapter], Awaitable[Optional[str]]],
     ) -> Tuple[Tuple[Checkpoint, ...], Baseline]:
         """Score every saved checkpoint, then the baseline.
 
@@ -395,6 +403,9 @@ class _Scorer:
         whatever follows it is left unscored. ``baseline_changed`` is asked
         right before the baseline is loaded and again once it is scored; a
         baseline that changed is marked so, and is not loaded if it already had.
+        A served baseline that is still the baseline must then pass
+        ``verify_served``, and the basis is asked again after that check;
+        one that fails is marked changed and never loaded.
         """
         source = served.source if served is not None else BASE_SOURCE
         if not saved:
@@ -414,6 +425,8 @@ class _Scorer:
         if failure is not None:
             return tuple(scored), Baseline(source)
         changed = baseline_changed()
+        if changed is None and served is not None:
+            changed = await verify_served(served) or baseline_changed()
         if changed is not None:
             return tuple(scored), Baseline(source, changed=changed)
         if served is None:

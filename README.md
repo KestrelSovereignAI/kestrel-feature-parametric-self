@@ -73,6 +73,13 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
   `inconclusive` (`baseline_changed`). The changed weights are never loaded. If
   the baseline changes after a promote decision is recorded, that promotion is
   blocked.
+- A served adapter is the baseline only while it passes the governed-lineage
+  check that verifies it for serving at restart and on status. The cycle runs
+  that check against a fresh governed snapshot just before it loads the
+  adapter, so a revocation between runs is caught without a status call. If
+  the check fails, or cannot run because the snapshot is unavailable, the
+  adapter is quarantined and its weights are never loaded. The decision is
+  then `inconclusive` (`baseline_changed`); it never falls back to the base.
 - Order of checks: inconclusive inputs, then overfit, then margin; the first
   failure decides. Config keys, overridable through `set_config({"gate": {...}})`
   and persisted:
@@ -82,11 +89,13 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
     greater. Equality passes.
   - `gate.overfit_check` (default `true`).
 - `inconclusive` (no validation set, an empty one, one smaller than a single
-  `batch_size` batch, which mlx_lm cannot score, a non-finite loss, no
-  checkpoints, a checkpoint or baseline that cannot be scored, a baseline that
-  changed during the run) blocks promotion and is never reported healthy by
-  `parametric-self-status` or the sleep hook. A run whose validation set is
-  too small to score trains nothing.
+  `batch_size` batch, which mlx_lm cannot score, a missing or non-finite loss
+  for any checkpoint, whatever `gate.overfit_check` says, no checkpoints, a
+  checkpoint or baseline that cannot be scored, a baseline that changed during
+  the run or a served adapter whose lineage check failed) blocks promotion and
+  is never reported healthy by `parametric-self-status` or the sleep hook.
+  This holds for adopt too: a recorded run with one unscored checkpoint is not
+  adopted. A run whose validation set is too small to score trains nothing.
 - Every decision writes a record into run history **before** any promotion.
   The record holds the best/final checkpoint ids and losses, every
   checkpoint's score, the baseline source and loss, why the baseline could not
@@ -110,7 +119,8 @@ about identity drift**; the behavioural fidelity exam (epic #1) is the real gate
   attempt and is never healthy.
 - Adopt re-takes the gate on the scores the candidate's own training run
   recorded, because its validation set is gone. If the baseline or the base
-  model has changed since, the result is `inconclusive`. If either changes, or
+  model has changed since, or a served baseline fails its governed-lineage
+  check, the result is `inconclusive`. If either changes, or
   the candidate is quarantined, while the decision is being recorded, nothing
   is adopted, as for a training run. Rollback restores the checkpoint an
   adapter was promoted with, at its promoted score. Quarantined adapters are

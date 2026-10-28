@@ -189,9 +189,8 @@ class GateReason(str, Enum):
     VAL_SET_TOO_SMALL = "val_set_too_small"
     NO_CHECKPOINTS = "no_checkpoints"
     CANDIDATE_EVAL_FAILED = "candidate_eval_failed"
+    CANDIDATE_LOSS_MISSING = "candidate_loss_missing"
     CANDIDATE_LOSS_INVALID = "candidate_loss_invalid"
-    NO_CHECKPOINT_VAL_LOSS = "no_checkpoint_val_loss"
-    FINAL_CHECKPOINT_NO_VAL_LOSS = "final_checkpoint_no_val_loss"
     BASELINE_UNAVAILABLE = "baseline_unavailable"
     BASELINE_CHANGED = "baseline_changed"
     BASELINE_EVAL_FAILED = "baseline_eval_failed"
@@ -485,10 +484,17 @@ class FidelityGate:
                 f"checkpoint {failed[0].checkpoint_id} could not be scored: {failed[0].error}",
                 final=final,
             )
-        invalid = [
-            checkpoint for checkpoint in checkpoints
-            if checkpoint.val_loss is not None and not is_usable_loss(checkpoint.val_loss)
-        ]
+        # An unscored checkpoint could have been the best, or the final one the
+        # overfit check needs, so every checkpoint must have a loss.
+        unscored = [checkpoint for checkpoint in checkpoints if checkpoint.val_loss is None]
+        if unscored:
+            return inconclusive(
+                GateReason.CANDIDATE_LOSS_MISSING,
+                f"checkpoint {unscored[0].checkpoint_id} has no validation loss, so there is "
+                "no best checkpoint",
+                final=final,
+            )
+        invalid = [checkpoint for checkpoint in checkpoints if not is_usable_loss(checkpoint.val_loss)]
         if invalid:
             return inconclusive(
                 GateReason.CANDIDATE_LOSS_INVALID,
@@ -496,24 +502,10 @@ class FidelityGate:
                 "a usable loss is finite and positive",
                 final=final,
             )
-        scored = [checkpoint for checkpoint in checkpoints if checkpoint.val_loss is not None]
-        if not scored:
-            return inconclusive(
-                GateReason.NO_CHECKPOINT_VAL_LOSS,
-                "no checkpoint has a validation loss, so there is no best checkpoint",
-                final=final,
-            )
         # Lowest loss wins; on a tie the earlier (less trained) checkpoint does.
-        best = min(scored, key=lambda checkpoint: (checkpoint.val_loss, checkpoint.iteration))
-        ratio = loss_ratio(final.val_loss, best.val_loss) if final.val_loss is not None else None
+        best = min(checkpoints, key=lambda checkpoint: (checkpoint.val_loss, checkpoint.iteration))
+        ratio = loss_ratio(final.val_loss, best.val_loss)
         found = {"best": best, "final": final, "ratio": ratio}
-        if self.overfit_check and final.val_loss is None:
-            return inconclusive(
-                GateReason.FINAL_CHECKPOINT_NO_VAL_LOSS,
-                f"final checkpoint {final.checkpoint_id} has no validation loss, so overfit "
-                "cannot be checked",
-                **found,
-            )
 
         if baseline is None:
             return inconclusive(GateReason.BASELINE_UNAVAILABLE, "no baseline to compare against", **found)
@@ -565,7 +557,6 @@ class FidelityGate:
             GateOutcome.PROMOTE, GateReason.PASSED,
             f"best checkpoint {best.checkpoint_id} val {_fmt(best.val_loss)} beats "
             f"{baseline.source} val {_fmt(baseline.val_loss)} by more than {self.margin * 100:g}% "
-            f"(needs < {required_below:.3f})"
-            + (f"; final/best {ratio:.3f}x" if ratio is not None else ""),
+            f"(needs < {required_below:.3f}); final/best {ratio:.3f}x",
             **found,
         )

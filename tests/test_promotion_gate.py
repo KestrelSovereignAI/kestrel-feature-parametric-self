@@ -82,9 +82,10 @@ def _policy() -> GovernedCorpusPolicy:
 POLICY = _policy()
 
 
-def _snapshot():
+def _snapshot(name="one", generation=4):
+    """A verified snapshot holding one governed assertion, ``assertion:<name>``."""
     assertion = SimpleNamespace(
-        assertion_id="assertion:one", revision_id="revision:one",
+        assertion_id=f"assertion:{name}", revision_id=f"revision:{name}",
         subject=SimpleNamespace(value="https://example.test/agent"),
         predicate=SimpleNamespace(value="https://example.test/lesson"),
         object=SimpleNamespace(lexical_form="governed lesson"),
@@ -92,12 +93,15 @@ def _snapshot():
     return SimpleNamespace(
         verified=True,
         examples=(SimpleNamespace(
-            assertion=assertion, content_hash="sha256:revision:one", source_occurrences=(),
+            assertion=assertion, content_hash=f"sha256:revision:{name}", source_occurrences=(),
             decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
         ),),
-        snapshot_hash=hashlib.sha256(b"snapshot:one").hexdigest(), tenant_id="tenant:test",
+        snapshot_hash=hashlib.sha256(f"snapshot:{name}:{generation}".encode()).hexdigest(),
+        tenant_id="tenant:test",
         policy=POLICY,
-        checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=4, latest_event_id="event:4"),
+        checkpoint=SimpleNamespace(
+            tenant_id="tenant:test", generation=generation, latest_event_id=f"event:{generation}",
+        ),
         capability_versions={"semantic_maintenance": "1"},
     )
 
@@ -108,7 +112,8 @@ class _Host:
     Nodes are copied in and out, as a serializing store would, so a write
     that fails leaves nothing behind. ``fail_gate_record_writes`` fails only a
     history write that adds a gate record; ``fail_history_writes`` and
-    ``fail_history_reads`` fail every history write or read.
+    ``fail_history_reads`` fail every history write or read;
+    ``fail_snapshots`` fails every governed snapshot request.
 
     The corpus methods bind each call against core's own ``AsyncStorage``
     signature, so a call core would refuse (a missing artifact consumer
@@ -127,6 +132,7 @@ class _Host:
         self.fail_gate_record_writes = False
         self.fail_history_writes = False
         self.fail_history_reads = False
+        self.fail_snapshots = False
 
     def _accept(self, method, *args, **kwargs):
         inspect.signature(getattr(AsyncStorage, method)).bind(self, *args, **kwargs)
@@ -159,6 +165,8 @@ class _Host:
 
     async def governed_assertion_corpus_snapshot(self, **kwargs):
         self._accept(SNAPSHOT_METHOD, **kwargs)
+        if self.fail_snapshots:
+            raise OSError("semantic maintenance incomplete")
         lineage = [
             (example.assertion.assertion_id, example.assertion.revision_id)
             for example in self.snapshot.examples
@@ -316,7 +324,18 @@ def _persisted_config(host, feature):
     return node.properties["config"] if node is not None else {}
 
 
+async def _serve_promoted(feature):
+    """Serve the candidate a real run promoted, with its governed lineage receipt."""
+    trainer = feature._adapter
+    feature._adapter = _Trainer()
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+    assert outcome["promoted"] is True
+    feature._adapter = trainer
+    return Path(feature._active_adapter_path)
+
+
 def _serve_existing(tmp_path, feature, name="servedrun", checkpoint=ITER_200):
+    """Point at weights with no governed lineage, as only a quarantine test may."""
     served = tmp_path / "work" / "candidates" / name
     served.mkdir(parents=True)
     (served / checkpoint).write_bytes(b"served weights")
@@ -784,7 +803,8 @@ async def test_a_served_adapter_quarantined_during_training_is_not_scored_or_com
     assert gate["baseline_val_loss"] is None
     assert outcome["promoted"] is False
     assert feature._active_adapter_path is None
-    assert str(served) in feature._quarantined_adapters
+    # Its quarantine stands as it was: a quarantined adapter is not re-verified.
+    assert feature._quarantined_adapters[str(served)] == "governed assertion lineage invalidated; rebuild required"
 
 
 async def test_a_quarantined_pointer_is_never_the_baseline(tmp_path):
@@ -819,6 +839,65 @@ async def test_a_baseline_that_changes_after_the_decision_blocks_promotion(tmp_p
     assert feature._active_adapter_path is None
     entry = await _last_run(feature)
     assert entry["gate"]["decision"] == "promote" and entry["promoted"] is False
+
+
+# ----------------------------------------------------------------------
+# The served adapter is the baseline only while its lineage holds (pin (a))
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("failure", ["revoked", "unverifiable"])
+async def test_a_served_adapter_whose_lineage_fails_is_never_scored_or_compared(tmp_path, failure):
+    """Between two runs, with no status call: the run checks the served adapter itself.
+
+    Revoked: its source assertion left the governed snapshot. Unverifiable:
+    the governed snapshot its check needs cannot be read. Either way it is
+    quarantined, its weights are never loaded, and the gate is inconclusive
+    against it, with no fallback to the base.
+    """
+    trainer = _Trainer(served_score=5.0)
+    feature, host = await _feature(tmp_path, trainer)
+    served = await _serve_promoted(feature)
+    if failure == "revoked":
+        host.snapshot = _snapshot("two", generation=5)
+    else:
+        async def _corpus_goes_down():
+            host.fail_snapshots = True
+        trainer.during_training = _corpus_goes_down
+
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert trainer.scored_served is False
+    gate = outcome["gate"]
+    assert (gate["decision"], gate["reason"]) == ("inconclusive", "baseline_changed")
+    assert gate["baseline_source"] == f"served:{served.name}/{ITER_400}"
+    assert gate["baseline_val_loss"] is None
+    assert "failed its governed-lineage check and was quarantined" in gate["baseline_changed"]
+    assert outcome["promoted"] is False and outcome["gate_record_persisted"] is True
+    assert (await _last_run(feature))["gate"] == gate
+    assert feature._active_adapter_path is None
+    assert str(served) in feature._quarantined_adapters
+    assert _persisted_config(host, feature)["active_adapter_path"] is None
+    status = await feature.parametric_self_status()
+    assert status.data["fidelity_gate"]["healthy"] is False
+
+
+async def test_a_served_adapter_s_lineage_check_leaves_the_candidate_its_own_snapshot(tmp_path):
+    """The served adapter is checked against a fresh snapshot, which may be at a
+    later checkpoint than the one it trained on; the candidate's pre-promotion
+    check still reads the delta from the snapshot the candidate trained on."""
+    trainer = _Trainer(served_score=5.0)
+    feature, host = await _feature(tmp_path, trainer)
+    served = await _serve_promoted(feature)
+    host.snapshot = _snapshot("one", generation=5)  # still holds the served adapter's assertion
+    host.corpus_calls.clear()
+
+    outcome = await feature._run_training_cycle_locked(trigger="nightly")
+
+    assert trainer.scored_served is True
+    assert outcome["gate"]["baseline_source"] == f"served:{served.name}/{ITER_400}"
+    assert outcome["promoted"] is True
+    assert [method for method, _kwargs in host.corpus_calls] == [SNAPSHOT_METHOD, SNAPSHOT_METHOD, DELTA_METHOD]
+    assert str(served) not in feature._quarantined_adapters
 
 
 async def test_candidate_lineage_names_the_base_model_its_scores_were_measured_on(tmp_path):
@@ -996,6 +1075,38 @@ async def test_adoption_cancelled_while_its_gate_record_is_written_adopts_nothin
         assert gate["healthy"] is lands
 
 
+async def test_adoption_cancelled_during_the_served_adapter_s_lineage_check_adopts_nothing(tmp_path):
+    """The gate never decided: the attempt is cleared, and nothing is adopted or quarantined."""
+    feature, host = await _feature(tmp_path, _Trainer(JUNE))
+    candidate = await _adoptable_june_candidate(feature)
+    served = await _serve_promoted(feature)
+    checking = asyncio.Event()
+    requests = []
+    read_snapshot = host.governed_assertion_corpus_snapshot
+
+    async def _hang_the_served_adapter_s_check(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 2:  # the candidate's own check, then the served adapter's
+            checking.set()
+            await asyncio.Event().wait()
+        return await read_snapshot(**kwargs)
+
+    host.governed_assertion_corpus_snapshot = _hang_the_served_adapter_s_check
+    adoption = asyncio.create_task(feature.parametric_self_adopt(candidate.name))
+    await checking.wait()
+    adoption.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adoption
+
+    assert feature._active_adapter_path == str(served)
+    assert str(served) not in feature._quarantined_adapters
+    assert feature._cycle_in_flight is False and feature._adoption_run_id is None
+    entry = await _last_run(feature)
+    assert (entry["trigger"], entry["state"], entry["promoted"]) == ("adopt", "interrupted", False)
+    assert (entry["gate_pending"], entry["gate_record_persisted"]) == (False, None)
+    assert "gate" not in entry
+
+
 # ----------------------------------------------------------------------
 # The governed corpus is requested exactly as core accepts it
 # ----------------------------------------------------------------------
@@ -1092,7 +1203,7 @@ def test_the_host_fake_registers_with_core_s_registration_model(method):
 async def test_record_digest_is_the_val_set_both_scores_used(tmp_path):
     trainer = _Trainer(served_score=5.0)
     feature, _host = await _feature(tmp_path, trainer)
-    _serve_existing(tmp_path, feature)
+    served = await _serve_promoted(feature)
 
     await feature._run_training_cycle_locked(trigger="nightly")
 
@@ -1100,7 +1211,7 @@ async def test_record_digest_is_the_val_set_both_scores_used(tmp_path):
     assert gate["val_set_digest"] == "sha256:" + hashlib.sha256(trainer.trained_val_bytes).hexdigest()
     # Both candidate checkpoints and the served adapter, on that one set.
     assert trainer.scored_test_bytes == [trainer.trained_val_bytes] * 3
-    assert gate["baseline_source"] == f"served:servedrun/{ITER_200}"
+    assert gate["baseline_source"] == f"served:{served.name}/{ITER_400}"
 
 
 @pytest.mark.parametrize("served", [True, False], ids=["served-baseline", "base-baseline"])
@@ -1108,7 +1219,7 @@ async def test_a_stale_stored_baseline_loss_is_ignored(tmp_path, served):
     """A stored 1.0 would reject the 1.4 candidate on margin; the gate never reads it."""
     feature, _host = await _feature(tmp_path, _Trainer(served_score=5.0))
     if served:
-        _serve_existing(tmp_path, feature)
+        await _serve_promoted(feature)
     feature._last_val_loss = 1.0
 
     outcome = await feature._run_training_cycle_locked(trigger="nightly")

@@ -46,7 +46,7 @@ def _snapshot():
     )
 
 
-def _write_governed_manifest(candidate):
+def _write_governed_manifest(candidate, assertion_id="assertion:test"):
     raw = {
         "schema_version": 1, "corpus_policy_version": "parametric-self-corpus-v1",
         "policy_digest": "sha256:policy", "snapshot_hash": "sha256:snapshot",
@@ -54,7 +54,7 @@ def _write_governed_manifest(candidate):
         "capability_versions": {"semantic_maintenance": "1"},
         "counts": {"total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1},
         "examples": [{"example_id": "example:1", "source": "governed_assertion", "split": "train", "lineage": {
-            "assertion_id": "assertion:test", "revision_id": "revision:test", "content_hash": "sha256:test",
+            "assertion_id": assertion_id, "revision_id": "revision:test", "content_hash": "sha256:test",
             "source_occurrence_ids": [], "eligibility": "included",
         }}],
     }
@@ -127,6 +127,14 @@ IMPROVING_LOG = "Iter 1: Val loss 8.977, x\nIter 200: Val loss 1.866, x\nIter 40
 # What the candidate's training run scored each checkpoint file at.
 JUNE_SCORES = {ITER_200: 1.866, ITER_400: 2.688}
 IMPROVING_SCORES = {ITER_200: 1.866, ITER_400: 1.800}
+
+
+def _serve_governed(feature, served, assertion_id="assertion:test") -> None:
+    """Serve ``served`` at iter 200 with the governed lineage receipt it was trained under."""
+    _write_run(served, IMPROVING_LOG)
+    _write_governed_manifest(served, assertion_id)
+    _stamp_adapter_receipt(feature, served)
+    feature._active_adapter_path, feature._active_checkpoint_id = str(served), ITER_200
 
 
 def _write_run(candidate, log, files=WEIGHT_FILES):
@@ -1315,6 +1323,47 @@ async def test_adopt_promotes_the_best_checkpoint_when_overfit_check_is_relaxed(
     assert f._active_checkpoint_id == ITER_200
 
 
+@pytest.mark.parametrize("gate_config", [
+    {}, {"overfit_check": False}, {"overfit_ratio": 1.5},
+], ids=["default", "overfit_check_off", "ratio_1.50"])
+@pytest.mark.parametrize("scores", [
+    {ITER_200: None, ITER_400: 2.688}, {ITER_200: 1.866, ITER_400: None},
+], ids=["intermediate_missing", "final_missing"])
+async def test_adopt_with_a_missing_recorded_score_is_inconclusive_and_unhealthy(tmp_path, gate_config, scores):
+    """A June record that lost one checkpoint's score is never adopted, under any gate config:
+    the unscored file could have been the best, so the scored one must not win by default."""
+    cands = tmp_path / "parametric_self" / "candidates" / "june"
+    _write_run(cands, JUNE_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, scores)
+    if gate_config:
+        await f.set_config({"gate": gate_config})
+
+    status = await f.parametric_self_status()
+    assert status.data["recoverable_adapters"] == []
+    listed = (await f.parametric_self_adapters()).data["adapters"][0]
+    assert listed["recoverable"] is False
+    assert listed["adoption"].startswith("fidelity gate inconclusive (candidate_loss_missing)")
+
+    result = await f.parametric_self_adopt(adapter_id="june")
+    assert result.status == ToolResultStatus.ERROR
+    assert "fidelity gate inconclusive (candidate_loss_missing)" in (result.error or "")
+    assert f._active_adapter_path is None and f._active_checkpoint_id is None
+    runs = await f._load_run_history()
+    assert runs[-1]["trigger"] == "adopt" and runs[-1]["promoted"] is False
+    gate = runs[-1]["gate"]
+    assert (gate["decision"], gate["reason"]) == ("inconclusive", "candidate_loss_missing")
+    assert gate["best_checkpoint_id"] is None and gate["promoted_checkpoint_id"] is None
+    assert gate["ratio"] is None
+
+    status = (await f.parametric_self_status()).data
+    assert status["served_adapter"] is None
+    assert status["fidelity_gate"]["last_decision"] == gate
+    assert status["fidelity_gate"]["healthy"] is False
+
+
 async def test_adopt_without_a_recorded_val_set_is_inconclusive(tmp_path):
     cands = tmp_path / "parametric_self" / "candidates" / "legacy"
     _write_run(cands, IMPROVING_LOG)
@@ -1338,13 +1387,48 @@ async def test_adopt_with_an_adapter_served_is_inconclusive_not_a_stored_compari
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, cands)
     await _record_training_gate(f, cands)
-    f._active_adapter_path, f._active_checkpoint_id = "/served/old", ITER_200
+    served = tmp_path / "parametric_self" / "candidates" / "old"
+    _serve_governed(f, served)
     f._last_val_loss = 50.0  # a stored loss that would let the candidate through
 
     result = await f.parametric_self_adopt(adapter_id="next")
     assert result.status == ToolResultStatus.ERROR
     assert "inconclusive (baseline_changed)" in (result.error or "")
-    assert f._active_adapter_path == "/served/old"
+    assert "scored against base" in (result.error or "")
+    assert f._active_adapter_path == str(served)
+    assert str(served) not in f._quarantined_adapters
+
+
+async def test_adopt_against_a_served_adapter_whose_lineage_fails_is_inconclusive(tmp_path):
+    """The served adapter is the baseline only while its governed lineage holds.
+
+    Here its source assertion has left the governed snapshot. Its recorded
+    score would let the candidate through; instead the served adapter is
+    quarantined and the decision is inconclusive, with no fallback to the base.
+    """
+    cands = tmp_path / "parametric_self" / "candidates" / "next"
+    _write_run(cands, IMPROVING_LOG)
+    _write_governed_manifest(cands)
+    f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
+    _stamp_adapter_receipt(f, cands)
+    await _record_training_gate(f, cands, baseline=(f"served:old/{ITER_200}", 2.5))
+    served = tmp_path / "parametric_self" / "candidates" / "old"
+    _serve_governed(f, served, assertion_id="assertion:erased")
+
+    result = await f.parametric_self_adopt(adapter_id="next")
+    assert result.status == ToolResultStatus.ERROR
+    assert "inconclusive (baseline_changed)" in (result.error or "")
+    assert "failed its governed-lineage check" in (result.error or "")
+    assert f._active_adapter_path is None
+    assert f._quarantined_adapters[str(served)] == (
+        "governed assertion lineage no longer current; rebuild required"
+    )
+    entry = (await f._load_run_history())[-1]
+    assert (entry["trigger"], entry["promoted"], entry["gate_record_persisted"]) == ("adopt", False, True)
+    gate = entry["gate"]
+    assert (gate["decision"], gate["reason"]) == ("inconclusive", "baseline_changed")
+    assert gate["baseline_source"] == f"served:old/{ITER_200}"
+    assert gate["baseline_val_loss"] is None
 
 
 async def test_adopt_after_the_base_model_changed_is_inconclusive(tmp_path):
@@ -1389,7 +1473,7 @@ async def test_adopt_uses_a_served_baseline_scored_in_the_candidates_own_gate_ru
     f = await _feature(_FakeStorage(), storage_path=str(tmp_path / "kestrel_prime.db"))
     _stamp_adapter_receipt(f, cands)
     await _record_training_gate(f, cands, baseline=(f"served:old/{ITER_200}", 2.5))
-    f._active_adapter_path, f._active_checkpoint_id = "/served/old", ITER_200
+    _serve_governed(f, tmp_path / "parametric_self" / "candidates" / "old")
 
     result = await f.parametric_self_adopt(adapter_id="next")
     assert result.status == ToolResultStatus.OK

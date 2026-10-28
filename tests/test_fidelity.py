@@ -265,17 +265,44 @@ def test_inconclusive_when_there_are_no_checkpoints():
     _assert_inconclusive(decision, GateReason.NO_CHECKPOINTS)
 
 
-def test_inconclusive_when_no_checkpoint_has_a_val_loss():
-    checkpoints, baseline = _run((100, None), (200, None))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
-    _assert_inconclusive(decision, GateReason.NO_CHECKPOINT_VAL_LOSS)
+MISSING_LOSS_GATES = [
+    FidelityGate(), FidelityGate(overfit_check=False), FidelityGate(overfit_ratio=1.50),
+]
+MISSING_LOSS_GATE_IDS = ["default", "overfit_check_off", "ratio_1.50"]
+
+
+@pytest.mark.parametrize("gate", MISSING_LOSS_GATES, ids=MISSING_LOSS_GATE_IDS)
+@pytest.mark.parametrize("losses", [
+    (None, 2.688), (1.866, None), (None, None), (1.866, None, 2.688),
+], ids=["intermediate", "final", "all", "middle"])
+def test_inconclusive_when_any_checkpoint_has_no_val_loss(gate, losses):
+    """An unscored checkpoint could have been the best; nothing is promoted, whatever the config."""
+    checkpoints, baseline = _run(*((100 * (i + 1), loss) for i, loss in enumerate(losses)), baseline_loss=8.977)
+    decision = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
+    _assert_inconclusive(decision, GateReason.CANDIDATE_LOSS_MISSING)
     assert decision.best is None
+    assert decision.ratio is None
+    unscored = next(c for c in checkpoints if c.val_loss is None)
+    assert unscored.checkpoint_id in decision.detail
+    record = decision.to_record()
+    assert record["best_checkpoint_id"] is None
+    assert record["final_checkpoint_id"] == checkpoints[-1].checkpoint_id
+    assert record["promoted_checkpoint_id"] is None
 
 
-def test_inconclusive_when_the_final_checkpoint_was_not_scored():
-    checkpoints, baseline = _run((200, 2.0), (300, None))
-    decision = FidelityGate().evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE)
-    _assert_inconclusive(decision, GateReason.FINAL_CHECKPOINT_NO_VAL_LOSS)
+@pytest.mark.parametrize("gate", MISSING_LOSS_GATES, ids=MISSING_LOSS_GATE_IDS)
+def test_a_june_record_missing_its_iter_200_score_replays_inconclusive(gate):
+    """The scored iter-400 file must not win just because iter 200's score was lost."""
+    checkpoints, baseline = _june()
+    record = gate.evaluate(checkpoints=checkpoints, baseline=baseline, val_set=VAL, base_model=BASE).to_record()
+    record["checkpoints"][0]["val_loss"] = None
+    replayed, recorded_baseline, val_set, base_model = recorded_inputs(record)
+    assert replayed == (Checkpoint(ITER_200, 200, None), Checkpoint(ITER_400, 400, 2.688))
+    decision = gate.evaluate(
+        checkpoints=replayed, baseline=recorded_baseline, val_set=val_set, base_model=base_model,
+    )
+    _assert_inconclusive(decision, GateReason.CANDIDATE_LOSS_MISSING)
+    assert ITER_200 in decision.detail
 
 
 def test_inconclusive_when_the_base_was_not_scored():

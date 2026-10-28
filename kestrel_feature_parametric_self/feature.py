@@ -1079,7 +1079,9 @@ class ParametricSelfFeature(Feature):
         Each entry carries ``served`` (is this the currently-served adapter),
         ``in_progress`` (this candidate belongs to the run currently training),
         ``adoption`` (what ``parametric-self-adopt`` would decide now: the gate
-        re-taken on the recorded scores, or why it cannot be), and
+        re-taken on the recorded scores, or why it cannot be; this listing
+        changes nothing, so it takes a served adapter as last verified, and
+        adopt runs that adapter's governed-lineage check itself), and
         ``recoverable`` (NO adapter is served and that adoption would promote:
         the lifecycle state where a *completed* run left a valid candidate on
         disk but no served pointer). An in-progress candidate has no recorded
@@ -1128,7 +1130,7 @@ class ParametricSelfFeature(Feature):
                 if inputs_problem is not None:
                     adoption = f"refused: {inputs_problem}"
                 else:
-                    decision = self._adoption_decision(inputs, basis)
+                    decision = self._adoption_decision(inputs, basis, None)
                     adoption = decision.summary
                     recoverable = served is None and decision.promote
             adapters.append({
@@ -1735,9 +1737,10 @@ class ParametricSelfFeature(Feature):
                     )
                 # The baseline the recorded scores must still be measured against.
                 basis = self._gate_basis()
-                decision = self._adoption_decision(inputs, basis)
-                best_loss = decision.best.val_loss if decision.best is not None else None
                 try:
+                    served_problem = await self._served_lineage_problem(basis.served)
+                    decision = self._adoption_decision(inputs, basis, served_problem)
+                    best_loss = decision.best.val_loss if decision.best is not None else None
                     recorded = await self._persist_gate_record(run_id, decision.to_record(), entry_updates={
                         "timestamp": _utc_now_iso(),
                         "state": "completed",
@@ -1745,12 +1748,13 @@ class ParametricSelfFeature(Feature):
                         "reason": decision.summary,
                     })
                 except asyncio.CancelledError:
-                    # Nothing was adopted. The gate marker stays as the
-                    # cancelled record write left it.
+                    # Nothing was adopted. A gate marker whose record write was
+                    # cancelled stays as that write left it; one cancelled
+                    # before the gate decided is cleared.
                     await self._finish_run_history(run_id, {
                         "state": "interrupted",
                         "timestamp": _utc_now_iso(),
-                        "reason": "adoption interrupted while its fidelity-gate record was written",
+                        "reason": "adoption interrupted before its fidelity-gate record was confirmed",
                     })
                     raise
             finally:
@@ -1829,9 +1833,35 @@ class ParametricSelfFeature(Feature):
         """What a candidate is measured against now: the base model and served adapter."""
         return GateBasis(self._base_config.base_model, self._served_adapter())
 
+    async def _served_lineage_problem(self, served: Optional[ServedAdapter]) -> Optional[str]:
+        """Why ``served`` may not be the gate's baseline, or None if it may.
+
+        The served adapter is the baseline only while it passes the same
+        governed-lineage check that verifies it for serving at restart and on
+        status. A failed check quarantines it, so its weights are never loaded
+        and there is no fallback to the base. The check reads a fresh governed
+        snapshot, as status does after a restart. The cached snapshot belongs
+        to the candidate and is the base of its own pre-promotion check, so it
+        is set aside meanwhile.
+        """
+        if served is None:
+            return None
+        candidate_snapshot = self._live_corpus_snapshot
+        self._live_corpus_snapshot = None
+        try:
+            problem = await self._verify_adapter_lineage(served.path)
+        finally:
+            self._live_corpus_snapshot = candidate_snapshot
+        if problem is None:
+            return None
+        return f"it failed its governed-lineage check and was quarantined: {problem}"
+
     @staticmethod
     def _adoption_baseline(
-        recorded: Optional[Baseline], scored_base_model: Optional[str], basis: GateBasis,
+        recorded: Optional[Baseline],
+        scored_base_model: Optional[str],
+        basis: GateBasis,
+        served_problem: Optional[str],
     ) -> Baseline:
         """Baseline for adopting a candidate whose validation set is gone.
 
@@ -1839,10 +1869,14 @@ class ParametricSelfFeature(Feature):
         validation set, can stand, and only while ``basis`` (what is served now,
         on the configured base model) still matches it: the same served
         checkpoint, or the base with nothing served, on the base model those
-        scores were measured on. Otherwise the gate is inconclusive rather
-        than comparing against a number from another run.
+        scores were measured on. A served adapter must also have passed its
+        governed-lineage check; ``served_problem`` is why it did not. Otherwise
+        the gate is inconclusive rather than comparing against a number from
+        another run or an adapter that may not be served.
         """
         source = basis.served.source if basis.served is not None else BASE_SOURCE
+        if served_problem is not None:
+            return Baseline(source, changed=served_problem)
         if recorded is None:
             return Baseline(source)
         base_model = basis.base_model
@@ -1893,12 +1927,16 @@ class ParametricSelfFeature(Feature):
             return None, f"checkpoint {missing} is no longer on disk"
         return inputs, None
 
-    def _adoption_decision(self, inputs: RecordedGateInputs, basis: GateBasis) -> GateDecision:
+    def _adoption_decision(
+        self, inputs: RecordedGateInputs, basis: GateBasis, served_problem: Optional[str],
+    ) -> GateDecision:
         """The fidelity gate re-taken on a candidate's recorded scores, against ``basis``."""
         checkpoints, recorded_baseline, val_set, scored_base_model = inputs
         return self._gate.evaluate(
             checkpoints=checkpoints,
-            baseline=self._adoption_baseline(recorded_baseline, scored_base_model, basis),
+            baseline=self._adoption_baseline(
+                recorded_baseline, scored_base_model, basis, served_problem,
+            ),
             val_set=val_set,
             base_model=scored_base_model,
         )
@@ -2284,6 +2322,7 @@ class ParametricSelfFeature(Feature):
                 config=config,
                 served=served,
                 basis_now=self._gate_basis,
+                verify_served=self._served_lineage_problem,
                 adapter_id=adapter_id,
             )
             if result.training_active:

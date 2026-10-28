@@ -66,16 +66,22 @@ def _snapshot():
 SNAPSHOT = _snapshot()
 
 
+async def _lineage_holds(served):
+    return None
+
+
 async def run_nightly_cycle(**kwargs):
     """Every direct cycle test still supplies the public host snapshot.
 
-    Unless a test says otherwise, nothing is served and the base model and
-    served adapter stay as they were when the run started.
+    Unless a test says otherwise, nothing is served, the base model and
+    served adapter stay as they were when the run started, and a served
+    adapter passes its governed-lineage check.
     """
     kwargs.setdefault("governed_snapshot", SNAPSHOT)
     kwargs.setdefault("served", None)
     basis = GateBasis(kwargs["config"].base_model, kwargs["served"])
     kwargs.setdefault("basis_now", lambda: basis)
+    kwargs.setdefault("verify_served", _lineage_holds)
     return await _run_nightly_cycle(**kwargs)
 
 
@@ -420,6 +426,95 @@ async def test_a_served_adapter_quarantined_during_training_is_never_loaded(tmp_
     assert record["baseline_val_loss"] is None
     assert "to nothing served" in record["baseline_changed"]
     assert result.promoted is False and result.promoted_checkpoint_id is None
+
+
+async def test_a_served_adapter_that_fails_its_lineage_check_is_never_loaded(tmp_path):
+    """No fallback to the base: the gate is inconclusive against the served adapter."""
+    db = _db_with(tmp_path, ROWS)
+    served = _served(tmp_path)
+    adapter = _FakeAdapter(served_score=50.0)
+    checked = []
+
+    async def _revoked(adapter_to_check):
+        checked.append(adapter_to_check)
+        return "it failed its governed-lineage check and was quarantined: lineage revoked"
+
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+        served=served, verify_served=_revoked,
+    )
+    assert checked == [served]
+    assert "served" not in adapter.scored and "base" not in adapter.scored
+    assert result.gate.outcome is GateOutcome.INCONCLUSIVE
+    assert result.gate.reason is GateReason.BASELINE_CHANGED
+    record = result.gate.to_record()
+    assert record["baseline_source"] == f"served:servedrun/{ITER_200}"
+    assert record["baseline_val_loss"] is None
+    assert "governed-lineage check" in record["baseline_changed"]
+    assert result.promoted is False and result.promoted_checkpoint_id is None
+
+
+async def test_a_served_adapter_is_checked_just_before_it_is_loaded(tmp_path):
+    """After its candidate checkpoints are scored, and only while it is still the baseline."""
+    db = _db_with(tmp_path, ROWS)
+    served = _served(tmp_path)
+    adapter = _FakeAdapter(served_score=50.0)
+    scored_when_checked = []
+
+    async def _holds(_served_adapter):
+        scored_when_checked.append(list(adapter.scored))
+        return None
+
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
+        served=served, verify_served=_holds,
+    )
+    assert scored_when_checked == [[ITER_200, ITER_400]]
+    assert adapter.scored[-1] == "served"
+    assert result.gate.to_record()["baseline_val_loss"] == 50.0
+
+
+async def test_a_served_adapter_that_already_changed_is_not_checked(tmp_path):
+    """A quarantined adapter is never re-verified: its quarantine stands as it is."""
+    db = _db_with(tmp_path, ROWS)
+    served = _served(tmp_path)
+    adapter = _FakeAdapter()
+    config = TextLoRAConfig()
+
+    async def _must_not_run(_served_adapter):
+        raise AssertionError("a baseline that changed is not verified")
+
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
+        basis_now=lambda: GateBasis(config.base_model, None), verify_served=_must_not_run,
+    )
+    assert result.gate.reason is GateReason.BASELINE_CHANGED
+    assert "served" not in adapter.scored
+
+
+async def test_a_baseline_changed_during_its_lineage_check_is_not_loaded(tmp_path):
+    db = _db_with(tmp_path, ROWS)
+    served = _served(tmp_path)
+    adapter = _FakeAdapter()
+    config = TextLoRAConfig()
+    current = {"served": served}
+
+    async def _swapped_meanwhile(_served_adapter):
+        current["served"] = None
+        return None
+
+    result = await run_nightly_cycle(
+        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
+        basis_now=lambda: GateBasis(config.base_model, current["served"]),
+        verify_served=_swapped_meanwhile,
+    )
+    assert result.gate.reason is GateReason.BASELINE_CHANGED
+    assert "to nothing served" in result.gate.detail
+    assert "served" not in adapter.scored
 
 
 async def test_a_baseline_that_changes_while_it_is_scored_is_not_compared(tmp_path):
