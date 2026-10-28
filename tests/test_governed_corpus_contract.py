@@ -186,7 +186,7 @@ async def test_adapter_without_manifest_is_never_served(tmp_path):
     candidate = Path(tmp_path / "work" / "candidates" / "candidate")
     candidate.parent.mkdir(parents=True)
     candidate.mkdir()
-    (candidate / "train.log").write_text("Val loss 1.2\n")
+    (candidate / "train.log").write_text("Iter 1: Val loss 9.0, x\nIter 400: Val loss 1.2, x\n")
     outcome = await feature.parametric_self_adopt(candidate.name)
     assert outcome.status.value == "error"
     assert "quarantined" in (outcome.error or "")
@@ -197,7 +197,7 @@ async def test_untracked_candidate_with_valid_manifest_is_inspection_only_not_ad
     feature = await _feature(host, tmp_path)
     candidate = tmp_path / "work" / "candidates" / "untracked"
     candidate.mkdir(parents=True)
-    (candidate / "train.log").write_text("Val loss 1.2\n")
+    (candidate / "train.log").write_text("Iter 1: Val loss 9.0, x\nIter 400: Val loss 1.2, x\n")
     build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=host.snapshot, manifest_dir=str(candidate))
 
     outcome = await feature.parametric_self_adopt("untracked")

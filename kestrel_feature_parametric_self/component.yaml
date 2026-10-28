@@ -32,7 +32,7 @@ tools:
     description: Recent training runs (ts, trigger, corpus, val_loss, promoted)
     command: "!parametric-self-history"
   - name: parametric-self-adapters
-    description: Candidate adapters on disk with val_loss; marks served/in-progress/recoverable state
+    description: Candidate adapters on disk with their recorded checkpoint scores; marks served/in-progress/recoverable state
     command: "!parametric-self-adapters"
   - name: parametric-self-progress
     description: Active training run progress, including run_id, adapter_id, iter, and intermediate val_loss
@@ -73,6 +73,12 @@ config:
   # value until one of those routes exists (inference_use.py). Read from the
   # feature's persisted config at load and reported by parametric-self-status.
   inference_use: "off"
+  # Loss-based promotion gate (fidelity.py). Relative to the served adapter, or
+  # the untuned base when nothing is served, on the run's own validation set.
+  gate:
+    margin: 0.02          # promote only if best < baseline * (1 - margin)
+    overfit_ratio: 1.20   # reject when final / best exceeds this
+    overfit_check: true
 
 # Tags for discovery
 tags:

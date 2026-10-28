@@ -16,16 +16,35 @@ P1 adds the text-native training path: ``TextLoRAConfig``, the reflection-derive
 corpus builder, and ``LocalMLXAdapter`` (Apple-Silicon MLX LoRA).
 
 P2a adds the nightly orchestration behind a default-OFF gate: the ``FidelityGate``
-(held-out val-loss promotion check), ``run_nightly_cycle`` (corpus→train→gate),
+(relative held-out val-loss promotion check on the run's best checkpoint),
+``run_nightly_cycle`` (corpus→train→score→gate),
 and ``ParametricSelfSleepHook`` (the sleep-cycle wrapper). Core sleep-hook
 dispatch is P2b.
 """
 
 from .corpus import CorpusStats, build_corpus
-from .cycle import CycleResult, run_nightly_cycle
+from .cycle import CycleResult, GateBasis, ServedAdapter, run_nightly_cycle
 from .feature import ParametricSelfFeature
-from .fidelity import FidelityGate, GateDecision, parse_final_val_loss, parse_latest_iter
-from .local_mlx_adapter import LocalMLXAdapter, TrainerUnavailableError, build_lora_argv
+from .fidelity import (
+    Baseline,
+    Checkpoint,
+    FidelityGate,
+    GateDecision,
+    GateOutcome,
+    GateReason,
+    ValSet,
+    parse_final_val_loss,
+    parse_latest_iter,
+    parse_test_loss,
+    recorded_inputs,
+    saved_checkpoints,
+)
+from .local_mlx_adapter import (
+    LocalMLXAdapter,
+    TrainerUnavailableError,
+    build_eval_argv,
+    build_lora_argv,
+)
 from .release_evidence import (
     CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     ExternalReleaseEvidenceEnvelope,
@@ -46,6 +65,7 @@ __all__ = [
     "LocalMLXAdapter",
     "TrainerUnavailableError",
     "build_lora_argv",
+    "build_eval_argv",
     "CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST",
     "ExternalReleaseEvidenceEnvelope",
     "ExternalReleaseEvidenceError",
@@ -55,10 +75,20 @@ __all__ = [
     "ParametricSelfKiteErasureHook",
     "FidelityGate",
     "GateDecision",
+    "GateOutcome",
+    "GateReason",
+    "Checkpoint",
+    "Baseline",
+    "ValSet",
+    "saved_checkpoints",
+    "recorded_inputs",
     "parse_final_val_loss",
     "parse_latest_iter",
+    "parse_test_loss",
     "run_nightly_cycle",
     "CycleResult",
+    "ServedAdapter",
+    "GateBasis",
     "ParametricSelfSleepHook",
     "create_parametric_self_sleep_hook",
 ]

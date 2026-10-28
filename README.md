@@ -49,6 +49,90 @@ revision, missing manifest, or unverifiable host capability quarantines the
 affected candidate or served adapter until it is rebuilt. This is intentionally
 a visible no-op rather than a fallback to ungoverned factual training.
 
+## Promotion gate
+
+The loss gate decides whether a trained candidate may be promoted. It measures
+validation loss, which is fit to the agent's own data only. **It says nothing
+about identity drift**; the behavioural fidelity exam (epic #1) is the real gate.
+
+- Training saves a checkpoint every `save_every` steps. When it ends, every
+  saved checkpoint file, including the final weights, is scored with
+  `mlx_lm.lora --test` on the run's whole validation set. The gate picks the
+  **best** checkpoint by that score, never the final one by default, and every
+  decision names checkpoint ids. The in-training `Iter N` validation loss is
+  progress only: mlx_lm measures it one optimizer step before it saves
+  checkpoint N, so it never describes a saved file.
+- The gate is **relative**. The baseline is the served adapter's promoted
+  checkpoint, or the untuned base (`--test` with no adapter) when nothing is
+  served. It is scored the same way, on the same validation set, in the same
+  run; a stored loss is never a baseline.
+- The baseline is whatever was served, on the configured base model, when the
+  run started. The cycle checks both again just before it scores the baseline,
+  and again before the gate decides. If either changed (the served adapter was
+  quarantined or replaced, or the base model was reconfigured), the decision is
+  `inconclusive` (`baseline_changed`). The changed weights are never loaded. If
+  the baseline changes after a promote decision is recorded, that promotion is
+  blocked.
+- A served adapter is the baseline only while it passes the governed-lineage
+  check that verifies it for serving at restart and on status. The cycle runs
+  that check against a fresh governed snapshot just before it loads the
+  adapter, so a revocation between runs is caught without a status call. If
+  the check fails, or cannot run because the snapshot is unavailable, the
+  adapter is quarantined and its weights are never loaded. The decision is
+  then `inconclusive` (`baseline_changed`); it never falls back to the base.
+- Order of checks: inconclusive inputs, then overfit, then margin; the first
+  failure decides. Config keys, overridable through `set_config({"gate": {...}})`
+  and persisted:
+  - `gate.margin` (default `0.02`): promote only if
+    `best < baseline × (1 − margin)`. Equality fails.
+  - `gate.overfit_ratio` (default `1.20`): reject when `final / best` is
+    greater. Equality passes.
+  - `gate.overfit_check` (default `true`).
+- `inconclusive` (no validation set, an empty one, one smaller than a single
+  `batch_size` batch, which mlx_lm cannot score, a missing or non-finite loss
+  for any checkpoint, whatever `gate.overfit_check` says, no checkpoints, a
+  checkpoint or baseline that cannot be scored, a baseline that changed during
+  the run or a served adapter whose lineage check failed) blocks promotion and
+  is never reported healthy by `parametric-self-status` or the sleep hook.
+  This holds for adopt too: a recorded run with one unscored checkpoint is not
+  adopted. A run whose validation set is too small to score trains nothing.
+- Every decision writes a record into run history **before** any promotion.
+  The record holds the best/final checkpoint ids and losses, every
+  checkpoint's score, the baseline source and loss, why the baseline could not
+  be used, and the base model every score was measured on. It also holds the
+  margin, the ratio, the validation-set digest, size and scoring batch size,
+  and the decision and reason.
+  Missing values are explicit nulls. If that write fails, nothing is promoted.
+  A history write never replaces history it could not read intact.
+- Status health comes from the latest gate attempt alone. An attempt that was
+  inconclusive, or whose record did not persist, is not healthy, whatever an
+  earlier run decided. Each training run's and adoption's history entry
+  carries a pending gate marker from the moment it starts. If that entry
+  cannot be written, the run or adoption does not start, so no gate attempt
+  can go unrecorded. The marker is cleared by the same write that records the
+  gate decision, or by the terminal entry. A run or adoption that is cancelled
+  while its gate record is being written cannot tell whether the record
+  landed. Its terminal entry leaves the marker as that write left it, and
+  status reads that attempt from history, as it would after a restart. A run
+  that stopped with the marker still set (a restart, a failed write, or a
+  cancelled record write) may have reached the gate, so it is an unresolved
+  attempt and is never healthy.
+- Adopt re-takes the gate on the scores the candidate's own training run
+  recorded, because its validation set is gone. If the baseline or the base
+  model has changed since, or a served baseline fails its governed-lineage
+  check, the result is `inconclusive`. If either changes, or
+  the candidate is quarantined, while the decision is being recorded, nothing
+  is adopted, as for a training run. Rollback restores the checkpoint an
+  adapter was promoted with, at its promoted score. Quarantined adapters are
+  never re-scored, adopted or rolled back to.
+- `parametric-self-adapters` and `parametric-self-status` never read a
+  training log for a score. Each candidate shows its served or promoted
+  checkpoint and score, or else the best and final checkpoint scores its
+  training run's gate recorded. A candidate is listed as recoverable only when
+  nothing is served and adopt, re-taking the gate on those recorded scores,
+  would promote it. For any other candidate that is not served, in progress or
+  quarantined, the listing shows what adopt would decide.
+
 ## Inference use
 
 `inference_use` decides whether an adapter may influence a live turn. One

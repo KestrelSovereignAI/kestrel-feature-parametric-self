@@ -17,9 +17,18 @@ from kestrel_feature_parametric_self import (
 from kestrel_feature_parametric_self.cycle import TrainingShutdownIncomplete
 
 
+def _trained(decision, *, persisted=True, promoted=False):
+    return {
+        "trained": True, "promoted": promoted,
+        "reason": f"fidelity gate {decision}",
+        "gate": {"decision": decision, "reason": "x"},
+        "gate_record_persisted": persisted,
+    }
+
+
 async def test_wrapper_delegates_to_feature():
     feature = MagicMock()
-    feature.on_post_consolidation = AsyncMock(return_value={"trained": True, "promoted": True})
+    feature.on_post_consolidation = AsyncMock(return_value=_trained("promote", promoted=True))
     hook = ParametricSelfSleepHook(feature)
 
     out = await hook.on_post_consolidation(MagicMock(), {"episodes_created": 2})
@@ -28,6 +37,33 @@ async def test_wrapper_delegates_to_feature():
     assert out["promoted"] is True
     assert out["success"] is True
     assert out["skipped"] is False
+
+
+async def test_a_gate_rejection_is_a_healthy_decided_run():
+    feature = MagicMock()
+    feature.on_post_consolidation = AsyncMock(return_value=_trained("reject"))
+    out = await ParametricSelfSleepHook(feature).on_post_consolidation(MagicMock(), {})
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.SUCCESS
+
+
+@pytest.mark.parametrize("outcome", [
+    _trained("inconclusive"),
+    _trained("promote", persisted=False),
+    {"trained": True, "promoted": True, "reason": "trained without a gate decision"},
+    {
+        "trained": False, "promoted": False,
+        "reason": "fidelity gate inconclusive (val_set_empty): validation set is empty",
+        "gate": {"decision": "inconclusive", "reason": "val_set_empty"},
+        "gate_record_persisted": True,
+    },
+], ids=["inconclusive", "record-not-persisted", "no-gate", "inconclusive-before-training"])
+async def test_an_undecided_or_unrecorded_gate_is_never_a_healthy_sleep_hook(outcome):
+    feature = MagicMock()
+    feature.on_post_consolidation = AsyncMock(return_value=outcome)
+    out = await ParametricSelfSleepHook(feature).on_post_consolidation(MagicMock(), {})
+    assert out["success"] is False
+    assert out["skipped"] is False
+    assert SleepMixin._hook_outcome(out)[0] is SleepHookStatus.FAILED
 
 
 async def test_wrapper_swallows_training_errors():
