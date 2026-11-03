@@ -8,8 +8,9 @@ source (``REFLECTION_SOURCE_KIND``), so they carry the same consent, source and
 exclusion decisions as every other example.  A reflection is admitted only
 when its provenance names the session(s) it was derived from and the snapshot's
 policy can exclude sessions; otherwise it is left out, never admitted by
-default.  The durable sidecar records lineage hashes and identifiers, never
-prompt/answer text.
+default, and counted under its own reason, ``UNRESOLVED_PROVENANCE``, beside the
+policy's per-reason exclusion counts.  The durable sidecar records lineage
+hashes, identifiers and counts, never prompt/answer text.
 """
 
 from __future__ import annotations
@@ -17,12 +18,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from kestrel_sovereign.knowledge import SourceReferenceKind
+
 
 REFLECTION_SOURCE_KIND = "agent_reflection"
+# Why a reflection is left out when it cannot be resolved to the sessions it
+# was derived from.  Distinct from every policy exclusion reason core reports.
+UNRESOLVED_PROVENANCE = "unresolved_provenance"
 CORPUS_POLICY_VERSION = "parametric-self-corpus-v2"
 MANIFEST_FILENAME = "corpus_manifest.json"
 
@@ -40,7 +47,9 @@ class CorpusStats:
     valid: int
     from_insights: int
     from_facts: int
-    insights_unresolved: int
+    # Per-reason counts of what was left out: core's policy reasons, plus
+    # ``UNRESOLVED_PROVENANCE`` for reflections this module left out.
+    excluded: Mapping[str, int]
     out_dir: str
     manifest_path: str
     manifest_hash: str
@@ -78,13 +87,7 @@ def _human_term(value: object) -> str:
 
 
 def _reflection_sessions(sources: tuple[Any, ...]) -> tuple[str, ...] | None:
-    """The sessions a reflection was derived from, or None if one source names none.
-
-    Called only under a policy that can exclude sessions; every core with such
-    a policy also names sessions in source provenance.
-    """
-    from kestrel_sovereign.knowledge import SourceReferenceKind
-
+    """The sessions a reflection was derived from, or None if one source names none."""
     sessions: set[str] = set()
     for source in sources:
         if getattr(source, "source_kind", None) != REFLECTION_SOURCE_KIND:
@@ -168,6 +171,26 @@ def _governed_examples(snapshot: Any) -> tuple[list[dict[str, Any]], int]:
             }
         )
     return examples, unresolved_reflections
+
+
+def _excluded_counts(snapshot: Any, unresolved_provenance: int) -> dict[str, int]:
+    """Per-reason exclusion counts: core's policy reasons, then unresolved provenance.
+
+    Core reports, without content, how many assertions its policy left out
+    for each reason.  A count is reported even when every candidate was left
+    out, so a corpus emptied by exclusion is never mistaken for an empty one.
+    """
+    policy_excluded = getattr(getattr(snapshot, "observability", None), "excluded", None)
+    if (
+        not isinstance(policy_excluded, Mapping)
+        or UNRESOLVED_PROVENANCE in policy_excluded
+        or any(
+            not isinstance(reason, str) or not reason or type(count) is not int or count < 0
+            for reason, count in policy_excluded.items()
+        )
+    ):
+        raise GovernedCorpusRequiredError("governed_corpus_snapshot_metadata_invalid")
+    return {**dict(sorted(policy_excluded.items())), UNRESOLVED_PROVENANCE: unresolved_provenance}
 
 
 def _split_examples(examples: Iterable[dict[str, Any]], valid_every: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -261,6 +284,7 @@ def build_corpus(
     if valid_every < 0:
         raise ValueError("valid_every must be non-negative")
     all_examples, unresolved_reflections = _governed_examples(governed_snapshot)
+    excluded = _excluded_counts(governed_snapshot, unresolved_reflections)
     checkpoint = getattr(governed_snapshot, "checkpoint", None)
     policy = getattr(governed_snapshot, "policy", None)
     policy_digest = getattr(policy, "digest", None)
@@ -307,7 +331,7 @@ def build_corpus(
             "total": len(all_examples), "train": len(train), "valid": len(valid),
             "reflection": reflections,
             "governed_assertion": len(all_examples) - reflections,
-            "reflection_unresolved": unresolved_reflections,
+            "excluded": excluded,
         },
         "examples": manifest_examples,
     }
@@ -322,7 +346,7 @@ def build_corpus(
     return CorpusStats(
         total=len(all_examples), train=len(train), valid=len(valid),
         from_insights=reflections, from_facts=len(all_examples) - reflections,
-        insights_unresolved=unresolved_reflections, out_dir=str(out),
+        excluded=excluded, out_dir=str(out),
         manifest_path=str(manifest_path), manifest_hash=manifest_hash,
         semantic_checkpoint_generation=generation,
         semantic_checkpoint_id=getattr(checkpoint, "latest_event_id", None),

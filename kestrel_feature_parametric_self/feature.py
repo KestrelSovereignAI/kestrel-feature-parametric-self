@@ -23,7 +23,6 @@ import json
 import logging
 import uuid
 from collections.abc import Mapping
-from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -314,49 +313,16 @@ class ParametricSelfFeature(Feature):
 
     @staticmethod
     def _coerce_policy(value: Any):
-        """Accept only the public policy value or its canonical mapping.
-
-        Imports are deliberately runtime-only: non-MLX Linux hosts can still
-        install/import this feature, and an older host is reported as a visible
-        unavailable capability rather than failing package import.
-        """
+        """Accept only the public policy value or its canonical mapping."""
         if value is None or hasattr(value, "digest"):
             return value
         if not isinstance(value, dict):
             raise ValueError("governed_corpus_policy must be a public policy or mapping")
-        from kestrel_sovereign.knowledge import GovernedCorpusPolicy, OntologyRef
+        from kestrel_sovereign.knowledge import GovernedCorpusPolicy
 
         # Core's own restore keeps every policy field, exclusion sets included,
         # and refuses a field it does not know.
-        restore = getattr(GovernedCorpusPolicy, "from_mapping", None)
-        if callable(restore):
-            return restore(value)
-        # A core without ``from_mapping`` predates corpus exclusions, so its
-        # policy has only the fields rebuilt below.  Any other field (an
-        # exclusion set, say) is refused, never silently dropped.
-        unknown = set(value) - {field.name for field in fields(GovernedCorpusPolicy)} - {"schema_version"}
-        if unknown:
-            raise ValueError(
-                f"governed_corpus_policy has fields this core cannot apply: {sorted(unknown)}"
-            )
-        pins = tuple(OntologyRef.from_mapping(item) for item in value["accepted_ontology_pins"])
-        capabilities = tuple(
-            (str(item["name"]), str(item["version"]))
-            for item in value["accepted_semantic_capability_versions"]
-        )
-        return GovernedCorpusPolicy(
-            policy_id=value["policy_id"], policy_version=value["policy_version"],
-            accepted_epistemic_states=tuple(value["accepted_epistemic_states"]),
-            accepted_visibility=tuple(value["accepted_visibility"]),
-            accepted_privacy_classifications=tuple(value["accepted_privacy_classifications"]),
-            accepted_consent_references=tuple(value["accepted_consent_references"]),
-            accepted_grounding_classes=tuple(value["accepted_grounding_classes"]),
-            accepted_source_kinds=tuple(value["accepted_source_kinds"]),
-            accepted_ontology_pins=pins,
-            accepted_semantic_capability_versions=capabilities,
-            allow_inferred=bool(value.get("allow_inferred", False)),
-            accepted_derivation_profiles=tuple(value.get("accepted_derivation_profiles", ())),
-        )
+        return GovernedCorpusPolicy.from_mapping(value)
 
     # ------------------------------------------------------------------
     # Per-agent config persistence (graph node, mirrors the sovereign base)
@@ -1200,10 +1166,15 @@ class ParametricSelfFeature(Feature):
                 f" baseline={gate.get('baseline_source')}@{gate.get('baseline_val_loss')}"
                 if isinstance(gate, dict) else ""
             )
+            excluded = r.get("corpus_excluded")
+            left_out = (
+                " excluded=" + ",".join(f"{reason}:{count}" for reason, count in excluded.items())
+                if isinstance(excluded, dict) and excluded else ""
+            )
             lines.append(
                 f"  {r.get('timestamp', '?')} [{r.get('trigger', '?')}] "
                 f"state={state} trained={r.get('trained')} promoted={r.get('promoted')} "
-                f"val_loss={r.get('val_loss')} corpus={r.get('corpus_train')}{comparison} "
+                f"val_loss={r.get('val_loss')} corpus={r.get('corpus_train')}{left_out}{comparison} "
                 f"— {r.get('reason', '')}".rstrip()
             )
         return ToolResult.ok(confirmation="\n".join(lines), data={"runs": recent})
@@ -2437,6 +2408,7 @@ class ParametricSelfFeature(Feature):
             "gate_record_persisted": gate_record_persisted,
             "corpus_train": result.corpus_train,
             "corpus_valid": result.corpus_valid,
+            "corpus_excluded": result.corpus_excluded,
             "corpus_manifest_hash": result.corpus_manifest_hash,
             "semantic_checkpoint_generation": result.semantic_checkpoint_generation,
             "reaches_inference": reaches_inference,
@@ -2450,6 +2422,7 @@ class ParametricSelfFeature(Feature):
             "checkpoint_id": result.promoted_checkpoint_id,
             "reason": result.reason,
             "corpus_train": result.corpus_train,
+            "corpus_excluded": result.corpus_excluded,
             "reaches_inference_at_promotion": reaches_inference if result.promoted else None,
             # Record the served path only on promotion (matches the prior
             # contract); otherwise keep the candidate path for traceability.

@@ -64,6 +64,7 @@ def _snapshot(rows=ROWS):
         tenant_id="tenant:test",
         checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
         capability_versions={"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 
@@ -586,6 +587,7 @@ async def test_cycle_noop_on_empty_corpus(tmp_path):
             tenant_id="tenant:test",
             checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
             capability_versions={"semantic_maintenance": "1"},
+            observability=SimpleNamespace(excluded={}),
         ),
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,

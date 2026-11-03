@@ -49,20 +49,28 @@ arrive only as governed assertions whose source kind is
 source and exclusion rules apply to them as to every other example. A
 reflection is admitted only when every reflection source names the session(s)
 it was derived from and the snapshot's policy can exclude sessions and saved
-items (kestrel-sovereign#3849). Otherwise it is left out and counted as
-`reflection_unresolved` in the manifest. It is never admitted by default. On a
-core release without those exclusions, no reflection reaches training. A
-snapshot that includes an example its own policy excludes is refused outright.
-A policy restored from its mapping keeps its exclusion sets. A core that cannot
-apply a field refuses it rather than dropping it.
+items (kestrel-sovereign#3849, first released in core 0.57.0, this package's
+floor). Otherwise it is left out, never admitted by default. A snapshot that
+includes an example its own policy excludes is refused outright. A policy
+restored from its mapping keeps its exclusion sets. A core that cannot apply a
+field refuses it rather than dropping it.
+
+What was left out is reported as a count per reason. The policy's own reasons
+are core's (for example `explicitly_excluded` for an excluded session or item,
+or `consent_reference_disallowed`). A reflection that cannot be resolved to its
+sessions has its own reason, `unresolved_provenance`. The counts are in the
+candidate manifest (`counts.excluded`), the run outcome and the sleep hook
+(`corpus_excluded`), the run history and `parametric-self-history`. A run whose
+whole corpus was left out still reports them: its reason reads `empty corpus —
+no governed examples to train on (excluded: unresolved_provenance=N)`.
 
 **No reflection reaches training yet.** Nothing publishes `"agent_reflection"`
 assertions today. `kestrel-feature-reflection` stores insights only in its own
 `reflection_insights` table. That table's `session_id` names the reflection
 run, not the conversations the insight was drawn from, and nothing records
 those conversation sessions. Until a producer records them and publishes
-insights through core's governed write path, every reflection is unresolved and
-left out.
+insights through core's governed write path (kestrel-feature-reflection#17),
+every reflection is left out under `unresolved_provenance`.
 
 Each candidate retains an immutable, content-free manifest of its accepted
 assertion/revision lineage and semantic checkpoint. A tombstone, stale

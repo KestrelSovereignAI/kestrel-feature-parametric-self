@@ -44,6 +44,7 @@ def _snapshot():
         tenant_id="tenant:test",
         checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
         capability_versions={"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 
@@ -55,7 +56,7 @@ def _write_governed_manifest(candidate, assertion_id="assertion:test"):
         "capability_versions": {"semantic_maintenance": "1"},
         "counts": {
             "total": 1, "train": 1, "valid": 0, "reflection": 0, "governed_assertion": 1,
-            "reflection_unresolved": 0,
+            "excluded": {"unresolved_provenance": 0},
         },
         "examples": [{"example_id": "example:1", "source": "governed_assertion", "split": "train", "lineage": {
             "assertion_id": assertion_id, "revision_id": "revision:test", "content_hash": "sha256:test",

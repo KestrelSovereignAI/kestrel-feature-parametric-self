@@ -34,6 +34,7 @@ def _snapshot(
         policy=SimpleNamespace(digest=policy_digest),
         checkpoint=SimpleNamespace(tenant_id=tenant_id, generation=generation, latest_event_id=event_id),
         capability_versions=capability_versions or {"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 
@@ -419,23 +420,36 @@ def test_governed_core_dependency_floor_is_the_first_released_capability_version
     commit. That pin is gone because a direct reference cannot be uploaded to
     PyPI — it made the package unpublishable. The released floor buys the same
     guarantee and can ship.
+
+    Reflections reach the corpus only under a policy that can exclude saved
+    items and sessions named in source provenance (kestrel-sovereign#3849),
+    first released in core **0.57.0**, so the floor is that release.
     """
-    from kestrel_sovereign.knowledge import GovernedCorpusPolicy, GovernedCorpusSnapshot
+    from kestrel_sovereign.knowledge import (
+        GovernedCorpusPolicy,
+        GovernedCorpusSnapshot,
+        SourceOccurrence,
+        SourceReferenceKind,
+    )
     from kestrel_sovereign.storage.async_storage import AsyncStorage
 
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     requirements = pyproject.read_text()
 
-    assert "kestrel-sovereign>=0.50.0,<1" in requirements
+    assert "kestrel-sovereign>=0.57.0,<1" in requirements
     # A direct reference is unpublishable; never reintroduce one.
     assert "git+https" not in requirements
     # No floor below the first version that actually carries the capability.
-    for pre_capability in ("kestrel-sovereign>=0.48", "kestrel-sovereign>=0.49"):
+    for pre_capability in ("kestrel-sovereign>=0.48", "kestrel-sovereign>=0.49", "kestrel-sovereign>=0.50"):
         assert pre_capability not in requirements, pre_capability
 
     # ...and the core actually resolved here exposes the contract.
     assert GovernedCorpusPolicy is not None
     assert GovernedCorpusSnapshot is not None
+    assert callable(getattr(GovernedCorpusPolicy, "excludes", None))
+    assert callable(getattr(GovernedCorpusPolicy, "from_mapping", None))
+    assert isinstance(getattr(SourceOccurrence, "references", None), property)
+    assert SourceReferenceKind.SESSION is not None
     assert callable(getattr(AsyncStorage, "governed_assertion_corpus_snapshot", None))
     assert callable(getattr(AsyncStorage, "governed_assertion_corpus_changes_since", None))
 

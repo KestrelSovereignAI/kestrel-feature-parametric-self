@@ -21,6 +21,7 @@ import pytest
 from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 from kestrel_sovereign.knowledge import (
+    DirectLineage,
     EpistemicState,
     GovernedArtifactError,
     GovernedArtifactKind,
@@ -92,6 +93,7 @@ def _example(name, index):
         subject=SimpleNamespace(value="https://example.test/agent"),
         predicate=SimpleNamespace(value="https://example.test/lesson"),
         object=SimpleNamespace(lexical_form=f"governed lesson {index}"),
+        lineage=DirectLineage((f"source:{name}:{index}",)),
     )
     return SimpleNamespace(
         assertion=assertion, content_hash=f"sha256:revision:{name}:{index}", source_occurrences=(),
@@ -111,6 +113,7 @@ def _snapshot(name="one", generation=4, rows=ROWS):
             tenant_id="tenant:test", generation=generation, latest_event_id=f"event:{generation}",
         ),
         capability_versions={"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 

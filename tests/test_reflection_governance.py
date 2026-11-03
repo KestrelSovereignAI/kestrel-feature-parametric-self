@@ -41,23 +41,21 @@ from kestrel_sovereign.knowledge import (
     OntologyRef,
     SemanticMaintenanceTrainingReadiness,
     SourceOccurrence,
+    SourceReferenceKind,
     ValidationState,
     ValidationWriteAction,
     Visibility,
+    source_reference_segment,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
-from kestrel_feature_parametric_self import REFLECTION_SOURCE_KIND, ParametricSelfFeature, build_corpus
-from kestrel_feature_parametric_self.corpus import GovernedCorpusRequiredError
-
-# Session and saved-item exclusions ship in a core release after this
-# package's floor; until the floor reaches it, these tests run only against
-# such a core, and a reflection is never admitted on an older one.
-CORE_CAN_EXCLUDE = callable(getattr(GovernedCorpusPolicy, "excludes", None))
-needs_corpus_exclusions = pytest.mark.skipif(
-    not CORE_CAN_EXCLUDE,
-    reason="installed core predates GovernedCorpusPolicy exclusions (kestrel-sovereign#3849)",
+from kestrel_feature_parametric_self import (
+    REFLECTION_SOURCE_KIND,
+    ParametricSelfFeature,
+    ParametricSelfSleepHook,
+    build_corpus,
 )
+from kestrel_feature_parametric_self.corpus import UNRESOLVED_PROVENANCE, GovernedCorpusRequiredError
 
 TENANT = "did:example:meridian"
 ONTOLOGY = OntologyRef("https://example.test/ontology", "1.0.0", "sha256:test", "semantic-kb-v1")
@@ -66,12 +64,13 @@ CONSENT = "consent:approved-batch-1"
 FACT_SOURCE_KIND = "agent_tool_invocation"
 EXAM_SESSION = "dcd6f767-829d-4a7d-b8c7-d7a722e5de13"
 EVERYDAY_SESSION = "5b0c1e2a-3f4d-4e6a-8b7c-9d0e1f2a3b4c"
+SECOND_SESSION = "8e1f2a3b-4c5d-4e6f-9a0b-1c2d3e4f5a6b"
 EXAM_LESSON = "The held-out exam answer is forty-two"
 EVERYDAY_LESSON = "Shorter replies land better"
 FACT = "tea over coffee"
 # Facts that fill out the corpus so its validation split holds at least one
 # scoring batch; none of them is a reflection.
-FILLER_FACTS = 30
+FILLER_FACTS = 60
 CHECKPOINT = "0000100_adapters.safetensors"
 # What each set of weights scores on the run's validation set.
 SCORES = {"base": 9.0, CHECKPOINT: 1.2, "adapters.safetensors": 1.3}
@@ -118,10 +117,7 @@ def _source(assertion: Assertion, source_kind: str, locator: str) -> SourceOccur
 def _reflection_locator(insight_id: str, *session_ids: str) -> str:
     """A reflection source naming the sessions its insight was derived from."""
     segments = [f"reflection:{insight_id}"]
-    if session_ids:
-        from kestrel_sovereign.knowledge import SourceReferenceKind, source_reference_segment
-
-        segments += [source_reference_segment(SourceReferenceKind.SESSION, item) for item in session_ids]
+    segments += [source_reference_segment(SourceReferenceKind.SESSION, item) for item in session_ids]
     return "#".join(segments)
 
 
@@ -308,7 +304,7 @@ async def _train(feature: ParametricSelfFeature) -> tuple[str, dict]:
     session lineage must satisfy the same check that refuses a raw one.
     """
     outcome = await feature._run_training_cycle_locked(trigger="manual")
-    assert outcome["trained"] is True and outcome["promoted"] is True, outcome
+    assert outcome["trained"] is True and outcome["promoted"] is True, outcome["reason"]
     manifest_path = Path(feature._resolve_work_dir()) / "candidates"
     (candidate,) = manifest_path.iterdir()
     manifest = json.loads((candidate / "corpus_manifest.json").read_text())
@@ -345,7 +341,28 @@ async def test_raw_reflection_rows_never_reach_training(tmp_path):
     assert {item["source"] for item in manifest["examples"]} == {"governed_assertion"}
 
 
-@needs_corpus_exclusions
+async def test_reflection_with_provenance_from_eligible_sessions_is_admitted(tmp_path):
+    """The gate is not always-deny: a reflection whose provenance names only
+    sessions the policy allows is trained on, and its adapter is promoted."""
+    host = _Host(
+        _fact(), *_fillers(),
+        _reflection("everyday-reflection", EVERYDAY_LESSON, EVERYDAY_SESSION, SECOND_SESSION),
+    )
+    # Exclusions are in force; they name a session this reflection did not come from.
+    feature = await _feature(host, tmp_path, _policy(excluded_session_ids=(EXAM_SESSION,)))
+
+    corpus, manifest = await _train(feature)
+
+    assert EVERYDAY_LESSON in corpus and FACT in corpus
+    reflections = [item for item in manifest["examples"] if item["source"] == "reflection"]
+    assert [item["lineage"]["session_ids"] for item in reflections] == [
+        sorted([EVERYDAY_SESSION, SECOND_SESSION])
+    ]
+    assert manifest["counts"]["reflection"] == 1
+    assert manifest["counts"]["excluded"] == {UNRESOLVED_PROVENANCE: 0}
+    assert feature._active_adapter_path is not None
+
+
 async def test_reflection_from_excluded_session_never_reaches_training(tmp_path):
     host = _Host(
         _fact(),
@@ -368,10 +385,11 @@ async def test_reflection_from_excluded_session_never_reaches_training(tmp_path)
     reflections = [item for item in manifest["examples"] if item["source"] == "reflection"]
     assert [item["lineage"]["session_ids"] for item in reflections] == [[EVERYDAY_SESSION]]
     assert manifest["counts"]["reflection"] == 1
+    # Core's policy left the exam reflection out; it is counted under core's reason.
+    assert manifest["counts"]["excluded"] == {"explicitly_excluded": 1, UNRESOLVED_PROVENANCE: 0}
     assert manifest["policy_digest"] == _policy(excluded_session_ids=(EXAM_SESSION,)).digest
 
 
-@needs_corpus_exclusions
 async def test_reflection_that_names_no_session_is_left_out(tmp_path):
     host = _Host(_fact(), *_fillers(), _reflection("unsourced-reflection", EVERYDAY_LESSON))
     feature = await _feature(host, tmp_path, _policy())
@@ -381,21 +399,47 @@ async def test_reflection_that_names_no_session_is_left_out(tmp_path):
     assert EVERYDAY_LESSON not in corpus
     assert FACT in corpus
     assert manifest["counts"]["reflection"] == 0
-    assert manifest["counts"]["reflection_unresolved"] == 1
+    assert manifest["counts"]["excluded"] == {UNRESOLVED_PROVENANCE: 1}
 
 
-async def test_reflection_is_left_out_by_a_core_that_cannot_exclude_sessions(tmp_path):
-    # The reflection names its session wherever the installed core can say so.
-    sessions = (EVERYDAY_SESSION,) if CORE_CAN_EXCLUDE else ()
-    host = _Host(_fact(), _reflection("everyday-reflection", EVERYDAY_LESSON, *sessions))
+async def test_every_reflection_left_out_is_reported_by_reason(tmp_path):
+    """No reflection resolves to its sessions yet (reflection#17), so all of them
+    are left out. That shows as counts per reason, with unresolved provenance
+    kept apart from the policy's own exclusions, never as a silent empty corpus."""
+    host = _Host(
+        _reflection("exam-reflection", EXAM_LESSON, EXAM_SESSION),
+        _reflection("unsourced-reflection", EVERYDAY_LESSON),
+        _reflection("other-unsourced-reflection", "Ask before assuming"),
+    )
+    feature = await _feature(host, tmp_path, _policy(excluded_session_ids=(EXAM_SESSION,)))
+    feature._training_enabled = True
+    expected = {"explicitly_excluded": 1, UNRESOLVED_PROVENANCE: 2}
+
+    outcome = await ParametricSelfSleepHook(feature).on_post_consolidation(feature.agent, {})
+
+    assert outcome["trained"] is False and outcome["skipped"] is True
+    assert outcome["corpus_train"] == 0
+    assert outcome["corpus_excluded"] == expected
+    assert outcome["reason"] == (
+        "empty corpus — no governed examples to train on "
+        "(excluded: explicitly_excluded=1, unresolved_provenance=2)"
+    )
+    (entry,) = await feature._load_run_history()
+    assert entry["corpus_excluded"] == expected
+    history = await feature.parametric_self_history()
+    assert "excluded=explicitly_excluded:1,unresolved_provenance:2" in history.confirmation
+
+
+async def test_reflection_is_left_out_under_a_policy_that_cannot_exclude_sessions(tmp_path):
+    host = _Host(_fact(), _reflection("everyday-reflection", EVERYDAY_LESSON, EVERYDAY_SESSION))
     snapshot = await GovernedAssertionCorpusService(host).snapshot(
         policy=_policy(), inference_profile=None,
     )
-    # A policy from a core before exclusions: pinned by digest, unable to exclude.
-    pre_exclusion = replace(snapshot, policy=SimpleNamespace(digest=snapshot.policy.digest))
+    # A policy pinned by digest alone cannot show the reflection clear of an excluded session.
+    no_exclusions = replace(snapshot, policy=SimpleNamespace(digest=snapshot.policy.digest))
 
     stats = build_corpus(
-        str(tmp_path / "corpus"), governed_snapshot=pre_exclusion,
+        str(tmp_path / "corpus"), governed_snapshot=no_exclusions,
         manifest_dir=str(tmp_path / "candidate"),
     )
 
@@ -403,11 +447,11 @@ async def test_reflection_is_left_out_by_a_core_that_cannot_exclude_sessions(tmp
         (tmp_path / "corpus" / name).read_text() for name in ("train.jsonl", "valid.jsonl")
     )
     assert EVERYDAY_LESSON not in corpus and FACT in corpus
-    assert (stats.from_insights, stats.insights_unresolved, stats.from_facts) == (0, 1, 1)
+    assert (stats.from_insights, stats.from_facts) == (0, 1)
+    assert stats.excluded == {UNRESOLVED_PROVENANCE: 1}
     assert [revision for _, revision in stats.assertion_lineage] == ["fact"]
 
 
-@needs_corpus_exclusions
 async def test_snapshot_that_admits_an_excluded_reflection_is_refused(tmp_path):
     host = _Host(_reflection("exam-reflection", EXAM_LESSON, EXAM_SESSION))
     unexcluded = await GovernedAssertionCorpusService(host).snapshot(
@@ -424,7 +468,24 @@ async def test_snapshot_that_admits_an_excluded_reflection_is_refused(tmp_path):
     assert not (tmp_path / "corpus" / "train.jsonl").exists()
 
 
-@needs_corpus_exclusions
+async def test_snapshot_reporting_unresolved_provenance_as_a_policy_reason_is_refused(tmp_path):
+    host = _Host(_fact())
+    snapshot = await GovernedAssertionCorpusService(host).snapshot(
+        policy=_policy(), inference_profile=None,
+    )
+    # Counted as a policy reason, it would merge with the reflections left out here.
+    conflated = replace(
+        snapshot,
+        observability=replace(snapshot.observability, excluded={UNRESOLVED_PROVENANCE: 1}),
+    )
+
+    with pytest.raises(GovernedCorpusRequiredError, match="snapshot_metadata_invalid"):
+        build_corpus(
+            str(tmp_path / "corpus"), governed_snapshot=conflated,
+            manifest_dir=str(tmp_path / "candidate"),
+        )
+
+
 async def test_policy_exclusions_survive_a_restart(tmp_path):
     policy = _policy(excluded_session_ids=(EXAM_SESSION,))
     host = _Host(_fact())
@@ -442,12 +503,4 @@ def test_policy_mapping_with_an_unknown_field_is_refused():
     mapping = {**_policy().to_mapping(), "excluded_conversation_ids": ["x"]}
 
     with pytest.raises(ValueError, match="excluded_conversation_ids"):
-        ParametricSelfFeature._coerce_policy(mapping)
-
-
-@pytest.mark.skipif(CORE_CAN_EXCLUDE, reason="this core applies exclusions")
-def test_core_without_exclusions_refuses_rather_than_drops_them():
-    mapping = {**_policy().to_mapping(), "excluded_session_ids": [EXAM_SESSION]}
-
-    with pytest.raises(ValueError, match="excluded_session_ids"):
         ParametricSelfFeature._coerce_policy(mapping)
