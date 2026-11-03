@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,9 +31,9 @@ IMPROVING = {"base": 9.0, ITER_200: 1.5, ITER_400: 1.4}
 OVERFIT = {"base": 9.0, ITER_200: 1.5, ITER_400: 9.9}
 # Emma's June run (#11): base 8.977, iter 200 1.866, iter 400 2.688.
 JUNE = {"base": 8.977, ITER_200: 1.866, ITER_400: 2.688}
-# Seventy grounded insights plus the governed example give a four-row
-# validation split: one scoring batch at the default batch size.
-ROWS = [(str(i), "failure", f"Lesson {i}", f"Do thing {i}.", "") for i in range(70)]
+# Nineteen governed examples give a four-row validation split: one scoring
+# batch at the default batch size.
+ROWS = 19
 
 
 def _mlx_refusal(dataset: Path, batch_size: int):
@@ -45,21 +44,27 @@ def _mlx_refusal(dataset: Path, batch_size: int):
     return None
 
 
-def _snapshot():
+def _example(i):
     assertion = SimpleNamespace(
-        assertion_id="assertion:cycle", revision_id="revision:cycle",
+        assertion_id=f"assertion:cycle:{i}", revision_id=f"revision:cycle:{i}",
         subject=SimpleNamespace(value="https://example.test/agent"),
         predicate=SimpleNamespace(value="https://example.test/lesson"),
-        object=SimpleNamespace(lexical_form="governed lesson"),
+        object=SimpleNamespace(lexical_form=f"governed lesson {i}"),
     )
     return SimpleNamespace(
-        verified=True, examples=(SimpleNamespace(
-            assertion=assertion, content_hash="sha256:cycle", source_occurrences=(),
-            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
-        ),), snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
+        assertion=assertion, content_hash=f"sha256:cycle:{i}", source_occurrences=(),
+        decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+    )
+
+
+def _snapshot(rows=ROWS):
+    return SimpleNamespace(
+        verified=True, examples=tuple(_example(i) for i in range(rows)),
+        snapshot_hash="sha256:snapshot", policy=SimpleNamespace(digest="sha256:policy"),
         tenant_id="tenant:test",
         checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
         capability_versions={"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 
@@ -83,23 +88,6 @@ async def run_nightly_cycle(**kwargs):
     kwargs.setdefault("basis_now", lambda: basis)
     kwargs.setdefault("verify_served", _lineage_holds)
     return await _run_nightly_cycle(**kwargs)
-
-
-def _db_with(tmp_path, rows, fact=True) -> str:
-    """Build a fixture cognition DB with given (type, title, desc) insight rows."""
-    db = str(tmp_path / "cog.db")
-    con = sqlite3.connect(db)
-    con.execute(
-        "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT NOT NULL, "
-        "description TEXT, suggested_action TEXT)"
-    )
-    con.executemany(
-        "INSERT INTO reflection_insights (id,type,title,description,suggested_action) VALUES (?,?,?,?,?)",
-        rows,
-    )
-    con.commit()
-    con.close()
-    return db
 
 
 class _FakeAdapter:
@@ -192,9 +180,8 @@ def _served(tmp_path, checkpoint=ITER_200) -> ServedAdapter:
 
 
 async def test_cycle_promotes_when_gate_passes(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -209,10 +196,9 @@ async def test_cycle_promotes_when_gate_passes(tmp_path):
 
 async def test_every_saved_checkpoint_and_the_base_are_scored_on_the_runs_val_set(tmp_path):
     """One validation set and one scorer for every number the gate compares (R5)."""
-    db = _db_with(tmp_path, ROWS)
     adapter = _FakeAdapter()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         adapter_id="scored",
     )
@@ -238,10 +224,9 @@ async def test_logged_losses_never_stand_in_for_the_saved_weights(tmp_path):
     Here the log reads 1.0 at iter 400 while the saved file scores 10.0. Pairing
     the log line with the file would promote unevaluated weights.
     """
-    db = _db_with(tmp_path, ROWS)
     log = "Iter 1: Val loss 9.000, x\nIter 200: Val loss 1.500, x\nIter 400: Val loss 1.000, x\n"
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(log=log, scores={"base": 9.0, ITER_200: 1.5, ITER_400: 10.0}),
         gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
     )
@@ -253,10 +238,9 @@ async def test_logged_losses_never_stand_in_for_the_saved_weights(tmp_path):
 
 
 async def test_the_final_weights_are_scored_when_no_periodic_save_holds_them(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     adapter = _FakeAdapter(files=(ITER_200, FINAL), scores={"base": 9.0, ITER_200: 1.5, FINAL: 1.45})
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(iters=300), poll_interval=0,
     )
     assert adapter.scored == [ITER_200, FINAL, "base"]
@@ -265,9 +249,8 @@ async def test_the_final_weights_are_scored_when_no_periodic_save_holds_them(tmp
 
 
 async def test_cycle_trains_but_rejects_bad_adapter(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(scores=OVERFIT), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -279,9 +262,8 @@ async def test_cycle_trains_but_rejects_bad_adapter(tmp_path):
 
 
 async def test_june_run_through_the_cycle_never_promotes_its_final_checkpoint(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     rejected = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(scores=JUNE), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, adapter_id="june-default",
     )
@@ -290,7 +272,7 @@ async def test_june_run_through_the_cycle_never_promotes_its_final_checkpoint(tm
     assert rejected.promoted is False and rejected.promoted_checkpoint_id is None
 
     relaxed = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(scores=JUNE), gate=FidelityGate(overfit_ratio=1.50),
         config=TextLoRAConfig(), poll_interval=0, adapter_id="june-relaxed",
     )
@@ -301,11 +283,10 @@ async def test_june_run_through_the_cycle_never_promotes_its_final_checkpoint(tm
 
 async def test_served_adapter_is_the_baseline_scored_on_this_runs_val_set(tmp_path):
     """R5: one validation set, scored in this run, for candidate and baseline."""
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter(served_score=1.6)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         served=served, adapter_id="newrun",
     )
@@ -327,9 +308,8 @@ async def test_served_adapter_is_the_baseline_scored_on_this_runs_val_set(tmp_pa
 
 
 async def test_candidate_that_does_not_beat_the_served_adapter_is_rejected_on_margin(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(served_score=1.42), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, served=_served(tmp_path),
     )
@@ -348,10 +328,9 @@ SCORING_FAILURES = [
 @pytest.mark.parametrize("served", [True, False], ids=["served", "base"])
 @pytest.mark.parametrize("adapter_kwargs, detail", SCORING_FAILURES)
 async def test_baseline_scoring_failure_is_inconclusive(tmp_path, adapter_kwargs, detail, served):
-    db = _db_with(tmp_path, ROWS)
     failing = "served" if served else "base"
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(failing=failing, **adapter_kwargs), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, adapter_id="evalfail",
         served=_served(tmp_path) if served else None,
@@ -365,10 +344,9 @@ async def test_baseline_scoring_failure_is_inconclusive(tmp_path, adapter_kwargs
 
 @pytest.mark.parametrize("adapter_kwargs, detail", SCORING_FAILURES)
 async def test_checkpoint_scoring_failure_is_inconclusive_and_stops_scoring(tmp_path, adapter_kwargs, detail):
-    db = _db_with(tmp_path, ROWS)
     adapter = _FakeAdapter(failing=ITER_200, **adapter_kwargs)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
     )
     assert result.gate.outcome is GateOutcome.INCONCLUSIVE
@@ -381,10 +359,9 @@ async def test_checkpoint_scoring_failure_is_inconclusive_and_stops_scoring(tmp_
 
 
 async def test_a_run_that_saved_no_weights_is_inconclusive_and_scores_nothing(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     adapter = _FakeAdapter(files=())
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
     )
     assert result.gate.reason is GateReason.NO_CHECKPOINTS
@@ -392,12 +369,11 @@ async def test_a_run_that_saved_no_weights_is_inconclusive_and_scores_nothing(tm
 
 
 async def test_served_checkpoint_missing_on_disk_is_inconclusive(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     (Path(served.path) / ITER_200).unlink()
     adapter = _FakeAdapter()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         served=served,
     )
@@ -409,12 +385,11 @@ async def test_served_checkpoint_missing_on_disk_is_inconclusive(tmp_path):
 
 async def test_a_served_adapter_quarantined_during_training_is_never_loaded(tmp_path):
     """Quarantine clears the served pointer; the old baseline is refused, not scored."""
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter(served_score=50.0)
     config = TextLoRAConfig()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
         basis_now=lambda: GateBasis(config.base_model, served if adapter.trained_val_bytes is None else None),
     )
@@ -430,7 +405,6 @@ async def test_a_served_adapter_quarantined_during_training_is_never_loaded(tmp_
 
 async def test_a_served_adapter_that_fails_its_lineage_check_is_never_loaded(tmp_path):
     """No fallback to the base: the gate is inconclusive against the served adapter."""
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter(served_score=50.0)
     checked = []
@@ -440,7 +414,7 @@ async def test_a_served_adapter_that_fails_its_lineage_check_is_never_loaded(tmp
         return "it failed its governed-lineage check and was quarantined: lineage revoked"
 
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         served=served, verify_served=_revoked,
     )
@@ -457,7 +431,6 @@ async def test_a_served_adapter_that_fails_its_lineage_check_is_never_loaded(tmp
 
 async def test_a_served_adapter_is_checked_just_before_it_is_loaded(tmp_path):
     """After its candidate checkpoints are scored, and only while it is still the baseline."""
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter(served_score=50.0)
     scored_when_checked = []
@@ -467,7 +440,7 @@ async def test_a_served_adapter_is_checked_just_before_it_is_loaded(tmp_path):
         return None
 
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         served=served, verify_served=_holds,
     )
@@ -478,7 +451,6 @@ async def test_a_served_adapter_is_checked_just_before_it_is_loaded(tmp_path):
 
 async def test_a_served_adapter_that_already_changed_is_not_checked(tmp_path):
     """A quarantined adapter is never re-verified: its quarantine stands as it is."""
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter()
     config = TextLoRAConfig()
@@ -487,7 +459,7 @@ async def test_a_served_adapter_that_already_changed_is_not_checked(tmp_path):
         raise AssertionError("a baseline that changed is not verified")
 
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
         basis_now=lambda: GateBasis(config.base_model, None), verify_served=_must_not_run,
     )
@@ -496,7 +468,6 @@ async def test_a_served_adapter_that_already_changed_is_not_checked(tmp_path):
 
 
 async def test_a_baseline_changed_during_its_lineage_check_is_not_loaded(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter()
     config = TextLoRAConfig()
@@ -507,7 +478,7 @@ async def test_a_baseline_changed_during_its_lineage_check_is_not_loaded(tmp_pat
         return None
 
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
         basis_now=lambda: GateBasis(config.base_model, current["served"]),
         verify_served=_swapped_meanwhile,
@@ -518,12 +489,11 @@ async def test_a_baseline_changed_during_its_lineage_check_is_not_loaded(tmp_pat
 
 
 async def test_a_baseline_that_changes_while_it_is_scored_is_not_compared(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     served = _served(tmp_path)
     adapter = _FakeAdapter(served_score=50.0)
     config = TextLoRAConfig()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0, served=served,
         basis_now=lambda: GateBasis(config.base_model, None if "served" in adapter.scored else served),
     )
@@ -534,12 +504,11 @@ async def test_a_baseline_that_changes_while_it_is_scored_is_not_compared(tmp_pa
 
 
 async def test_a_base_model_reconfigured_during_the_run_is_inconclusive(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     adapter = _FakeAdapter()
     config = TextLoRAConfig()
     trained_on = config.base_model
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=adapter, gate=FidelityGate(), config=config, poll_interval=0,
         basis_now=lambda: GateBasis(trained_on if adapter.trained_val_bytes is None else "other/base", None),
     )
@@ -551,10 +520,9 @@ async def test_a_base_model_reconfigured_during_the_run_is_inconclusive(tmp_path
 
 
 async def test_empty_validation_split_is_inconclusive_and_trains_nothing(tmp_path):
-    db = _db_with(tmp_path, [("1", "failure", "Verbosity", "Be shorter.", "")])
     adapter = _FakeAdapter()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"), governed_snapshot=_snapshot(1),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
     )
     assert result.corpus_valid == 0
@@ -566,13 +534,12 @@ async def test_empty_validation_split_is_inconclusive_and_trains_nothing(tmp_pat
     assert result.reason.startswith("fidelity gate inconclusive")
 
 
-@pytest.mark.parametrize("rows", [5, 40], ids=["one-row", "three-rows"])
+@pytest.mark.parametrize("rows", [9, 15], ids=["one-row", "three-rows"])
 async def test_a_validation_split_smaller_than_one_batch_is_inconclusive_and_trains_nothing(tmp_path, rows):
     """mlx_lm cannot score fewer examples than one batch, so nothing is trained or scored."""
-    db = _db_with(tmp_path, ROWS[:rows])
     adapter = _FakeAdapter()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"), governed_snapshot=_snapshot(rows),
         adapter=adapter, gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
     )
     assert 0 < result.corpus_valid < TextLoRAConfig().batch_size
@@ -602,9 +569,8 @@ async def test_the_fake_trainer_refuses_a_set_smaller_than_one_batch_as_mlx_lm_d
 
 
 async def test_cycle_noop_when_trainer_unavailable(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(available=False), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -613,16 +579,15 @@ async def test_cycle_noop_when_trainer_unavailable(tmp_path):
 
 
 async def test_cycle_noop_on_empty_corpus(tmp_path):
-    # only a non-grounded 'anomaly' insight + no fact -> grounded corpus is empty
-    db = _db_with(tmp_path, [("1", "anomaly", "Musing", "A stray thought.", "")], fact=False)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         governed_snapshot=SimpleNamespace(
             verified=True, examples=(), snapshot_hash="sha256:empty",
             policy=SimpleNamespace(digest="sha256:policy"),
             tenant_id="tenant:test",
             checkpoint=SimpleNamespace(tenant_id="tenant:test", generation=1, latest_event_id="event:1"),
             capability_versions={"semantic_maintenance": "1"},
+            observability=SimpleNamespace(excluded={}),
         ),
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
@@ -648,9 +613,8 @@ async def test_cycle_retains_unknown_owner_legacy_shared_corpus_plaintext(tmp_pa
     (legacy / "some-prior-run").mkdir()
     (legacy / "some-prior-run" / "train.jsonl").write_text("{}\n")
 
-    db = _db_with(tmp_path, ROWS)
     await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(work),
+        agent_id="emma", work_dir=str(work),
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -670,9 +634,8 @@ async def test_legacy_corpus_retained_even_when_trainer_unavailable(tmp_path):
     (legacy / "train.jsonl").write_text('{"text": "old plaintext"}\n')
     (legacy / "valid.jsonl").write_text('{"text": "old plaintext"}\n')
 
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(work),
+        agent_id="emma", work_dir=str(work),
         adapter=_FakeAdapter(available=False), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -684,16 +647,15 @@ async def test_legacy_corpus_retained_even_when_trainer_unavailable(tmp_path):
 
 async def test_each_run_stages_in_a_unique_dir(tmp_path):
     """A later (rejected) run must not overwrite an earlier promoted adapter."""
-    db = _db_with(tmp_path, ROWS)
     work = str(tmp_path / "work")
 
     first = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=work,
+        agent_id="emma", work_dir=work,
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
     second = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=work,
+        agent_id="emma", work_dir=work,
         adapter=_FakeAdapter(scores=OVERFIT), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -706,10 +668,9 @@ async def test_each_run_stages_in_a_unique_dir(tmp_path):
 
 async def test_cycle_uses_supplied_adapter_id(tmp_path):
     """A caller-supplied adapter_id names the staging dir so it is introspectable."""
-    db = _db_with(tmp_path, ROWS)
     work = str(tmp_path / "work")
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=work,
+        agent_id="emma", work_dir=work,
         adapter=_FakeAdapter(), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, adapter_id="deadbeef0001",
     )
@@ -717,9 +678,8 @@ async def test_cycle_uses_supplied_adapter_id(tmp_path):
 
 
 async def test_cycle_reports_training_failure(tmp_path):
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(state=TrainingState.FAILED), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0,
     )
@@ -743,11 +703,10 @@ class _CorpusSpyAdapter(_FakeAdapter):
 
 async def test_cycle_deletes_corpus_after_training(tmp_path):
     from pathlib import Path
-    db = _db_with(tmp_path, ROWS)
     work = tmp_path / "work"
     adapter = _CorpusSpyAdapter()
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(work),
+        agent_id="emma", work_dir=str(work),
         adapter=adapter, gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, adapter_id="delrun",
     )
@@ -765,11 +724,10 @@ async def test_cycle_keeps_corpus_when_training_still_running(tmp_path):
     non-terminal, the corpus must NOT be deleted — the live subprocess still
     needs its input files (F377 deletion only after terminal)."""
     from pathlib import Path
-    db = _db_with(tmp_path, ROWS)
     work = tmp_path / "work"
     # Adapter stuck in TRAINING (never terminal); tiny poll budget → times out.
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(work),
+        agent_id="emma", work_dir=str(work),
         adapter=_FakeAdapter(state=TrainingState.TRAINING), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, max_polls=1, adapter_id="keeprun",
     )
@@ -783,7 +741,6 @@ async def test_cycle_keeps_corpus_when_training_still_running(tmp_path):
 
 async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_path, monkeypatch):
     """Arbitrary task cancellation cannot delete input under a live trainer."""
-    db = _db_with(tmp_path, ROWS)
     work = tmp_path / "work"
     events = []
 
@@ -823,7 +780,7 @@ async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_pa
 
     monkeypatch.setattr(cycle_module, "_delete_corpus", _ordered_delete)
     task = asyncio.create_task(run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(work), adapter=adapter,
+        agent_id="emma", work_dir=str(work), adapter=adapter,
         gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         max_polls=5, adapter_id="cancelrun",
     ))
@@ -838,7 +795,6 @@ async def test_cycle_cancellation_stops_live_child_before_deleting_corpus(tmp_pa
 
 async def test_cycle_cancellation_keeps_corpus_when_live_child_wont_confirm_stop(tmp_path):
     """A failed child-stop confirmation retains the live input."""
-    db = _db_with(tmp_path, ROWS)
     work = tmp_path / "work"
 
     class _UnstoppableChild(_FakeAdapter):
@@ -858,7 +814,7 @@ async def test_cycle_cancellation_keeps_corpus_when_live_child_wont_confirm_stop
 
     adapter = _UnstoppableChild()
     task = asyncio.create_task(run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(work), adapter=adapter,
+        agent_id="emma", work_dir=str(work), adapter=adapter,
         gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0,
         max_polls=5, adapter_id="retainrun",
     ))
@@ -874,7 +830,6 @@ async def test_cycle_cancellation_keeps_corpus_when_live_child_wont_confirm_stop
 @pytest.mark.parametrize("failing", [ITER_200, "served"])
 async def test_cancellation_during_scoring_stops_that_child_before_deleting_corpus(tmp_path, failing):
     """A scoring child reads this run's validation set, like the trainer did."""
-    db = _db_with(tmp_path, ROWS)
     corpus = tmp_path / "work" / "corpus" / "evalcancel"
     cancelled = []
 
@@ -902,7 +857,7 @@ async def test_cancellation_during_scoring_stops_that_child_before_deleting_corp
 
     adapter = _LiveEvaluation()
     task = asyncio.create_task(run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"), adapter=adapter,
+        agent_id="emma", work_dir=str(tmp_path / "work"), adapter=adapter,
         gate=FidelityGate(), config=TextLoRAConfig(), poll_interval=0, max_polls=5,
         served=_served(tmp_path), adapter_id="evalcancel",
     ))
@@ -918,9 +873,8 @@ async def test_cancellation_during_scoring_stops_that_child_before_deleting_corp
 
 @pytest.mark.parametrize("failing", [ITER_200, "served"])
 async def test_scoring_poll_timeout_retains_the_corpus(tmp_path, failing):
-    db = _db_with(tmp_path, ROWS)
     result = await run_nightly_cycle(
-        agent_id="emma", db_path=db, work_dir=str(tmp_path / "work"),
+        agent_id="emma", work_dir=str(tmp_path / "work"),
         adapter=_FakeAdapter(failing=failing, eval_state=TrainingState.TRAINING), gate=FidelityGate(),
         config=TextLoRAConfig(), poll_interval=0, max_polls=1,
         served=_served(tmp_path), adapter_id="evalslow",

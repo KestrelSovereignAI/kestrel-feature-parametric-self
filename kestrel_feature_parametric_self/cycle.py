@@ -6,7 +6,7 @@ without MLX or a real training run. The feature wires the real
 ``LocalMLXAdapter`` + ``FidelityGate``.
 
 This is the body of the sleep-cycle hook (§6 of the design doc): it runs after
-consolidation, trains a candidate adapter on the night's reflections, and
+consolidation, trains a candidate adapter on the night's governed corpus, and
 reports whether the gate (§5.2) promotes the run's best checkpoint. The feature
 records that decision before it applies any promotion.
 
@@ -33,7 +33,7 @@ import asyncio
 import hashlib
 import shutil
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence, Tuple
 
@@ -186,6 +186,8 @@ class CycleResult:
     gate: Optional[GateDecision] = None
     corpus_train: int = 0
     corpus_valid: int = 0
+    # Per-reason counts of what the corpus left out (see ``CorpusStats.excluded``).
+    corpus_excluded: dict[str, int] = field(default_factory=dict)
     corpus_manifest_path: Optional[str] = None
     corpus_manifest_hash: Optional[str] = None
     semantic_checkpoint_generation: Optional[int] = None
@@ -201,7 +203,6 @@ class CycleResult:
 async def run_nightly_cycle(
     *,
     agent_id: str,
-    db_path: str | None,
     work_dir: str,
     governed_snapshot: Any,
     adapter: _TrainerProtocol,
@@ -261,15 +262,17 @@ async def run_nightly_cycle(
     jobs = _ChildJobs(adapter, poll_interval, max_polls)
     try:
         stats = build_corpus(
-            db_path,
             corpus_dir,
             governed_snapshot=governed_snapshot,
             manifest_dir=adapter_dir,
         )
         if stats.train == 0:
+            left_out = ", ".join(f"{reason}={count}" for reason, count in stats.excluded.items() if count)
             return CycleResult(
-                False, reason="empty corpus — no grounded reflections to train on",
-                corpus_train=0, corpus_valid=stats.valid,
+                False,
+                reason="empty corpus — no governed examples to train on"
+                + (f" (excluded: {left_out})" if left_out else ""),
+                corpus_train=0, corpus_valid=stats.valid, corpus_excluded=dict(stats.excluded),
                 corpus_manifest_path=stats.manifest_path,
                 corpus_manifest_hash=stats.manifest_hash,
                 semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
@@ -286,7 +289,7 @@ async def run_nightly_cycle(
             decision = gate.evaluate(checkpoints=(), baseline=None, val_set=val_set, base_model=None)
             return CycleResult(
                 False, reason=decision.summary, gate=decision,
-                corpus_train=stats.train, corpus_valid=stats.valid,
+                corpus_train=stats.train, corpus_valid=stats.valid, corpus_excluded=dict(stats.excluded),
                 corpus_manifest_path=stats.manifest_path,
                 corpus_manifest_hash=stats.manifest_hash,
                 semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
@@ -317,7 +320,7 @@ async def run_nightly_cycle(
         if status.state != TrainingState.COMPLETED:
             return CycleResult(
                 False, reason=f"training did not complete (state={status.state.value}; {status.error or ''})".strip(),
-                corpus_train=stats.train, corpus_valid=stats.valid,
+                corpus_train=stats.train, corpus_valid=stats.valid, corpus_excluded=dict(stats.excluded),
                 legacy_corpus_retained=legacy_corpus_retained,
             )
 
@@ -346,6 +349,7 @@ async def run_nightly_cycle(
             gate=decision,
             corpus_train=stats.train,
             corpus_valid=stats.valid,
+            corpus_excluded=dict(stats.excluded),
             corpus_manifest_path=stats.manifest_path,
             corpus_manifest_hash=stats.manifest_hash,
             semantic_checkpoint_generation=stats.semantic_checkpoint_generation,
@@ -518,6 +522,7 @@ def _still_active(reason: str, stats: Any, corpus_dir: str, legacy_corpus_retain
         reason=reason,
         corpus_train=stats.train,
         corpus_valid=stats.valid,
+        corpus_excluded=dict(stats.excluded),
         training_active=True,
         retained_corpus_path=corpus_dir,
         legacy_corpus_retained=legacy_corpus_retained,

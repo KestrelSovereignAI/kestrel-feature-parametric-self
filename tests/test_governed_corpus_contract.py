@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -33,6 +34,7 @@ def _snapshot(
         policy=SimpleNamespace(digest=policy_digest),
         checkpoint=SimpleNamespace(tenant_id=tenant_id, generation=generation, latest_event_id=event_id),
         capability_versions=capability_versions or {"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 
@@ -152,7 +154,7 @@ async def test_tombstone_quarantines_served_adapter_and_clean_rebuild_is_eligibl
     snapshot = _snapshot()
     candidate = tmp_path / "candidate"
     build_corpus(
-        None, str(tmp_path / "corpus"), governed_snapshot=snapshot,
+        str(tmp_path / "corpus"), governed_snapshot=snapshot,
         manifest_dir=str(candidate),
     )
     tombstone = SimpleNamespace(
@@ -171,7 +173,7 @@ async def test_tombstone_quarantines_served_adapter_and_clean_rebuild_is_eligibl
 
     clean_candidate = tmp_path / "clean-candidate"
     build_corpus(
-        None, str(tmp_path / "clean-corpus"), governed_snapshot=_snapshot(revision="revision:two"),
+        str(tmp_path / "clean-corpus"), governed_snapshot=_snapshot(revision="revision:two"),
         manifest_dir=str(clean_candidate),
     )
     clean_host = _Host(_snapshot(revision="revision:two"))
@@ -198,7 +200,7 @@ async def test_untracked_candidate_with_valid_manifest_is_inspection_only_not_ad
     candidate = tmp_path / "work" / "candidates" / "untracked"
     candidate.mkdir(parents=True)
     (candidate / "train.log").write_text("Iter 1: Val loss 9.0, x\nIter 400: Val loss 1.2, x\n")
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=host.snapshot, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=host.snapshot, manifest_dir=str(candidate))
 
     outcome = await feature.parametric_self_adopt("untracked")
     assert outcome.status.value == "error"
@@ -209,7 +211,7 @@ async def test_untracked_candidate_with_valid_manifest_is_inspection_only_not_ad
 async def test_same_lineage_with_changed_policy_or_capability_pins_is_quarantined(tmp_path):
     baseline = _snapshot()
     candidate = tmp_path / "candidate"
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
 
     policy_host = _Host(baseline)
     policy_feature = await _feature(policy_host, tmp_path)
@@ -231,7 +233,7 @@ async def test_same_lineage_with_changed_policy_or_capability_pins_is_quarantine
 async def test_same_checkpoint_with_changed_snapshot_receipt_is_quarantined(tmp_path):
     baseline = _snapshot()
     candidate = tmp_path / "candidate"
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
 
     altered = _snapshot(snapshot_hash="sha256:other-receipt")
     feature = await _feature(_Host(altered), tmp_path)
@@ -245,7 +247,7 @@ async def test_rehashed_replacement_manifest_cannot_relabel_existing_adapter_wei
     """The durable receipt, not a self-consistent replacement manifest, binds weights."""
     trained_snapshot = _snapshot(revision="revision:one")
     candidate = tmp_path / "candidate"
-    build_corpus(None, str(tmp_path / "corpus-old"), governed_snapshot=trained_snapshot, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus-old"), governed_snapshot=trained_snapshot, manifest_dir=str(candidate))
     host = _Host(_snapshot(revision="revision:two", generation=5, event_id="event:5"))
     feature = await _feature(host, tmp_path)
     original_manifest, error = feature._manifest_lineage(str(candidate))
@@ -258,7 +260,7 @@ async def test_rehashed_replacement_manifest_cannot_relabel_existing_adapter_wei
 
     replacement = tmp_path / "replacement"
     build_corpus(
-        None, str(tmp_path / "corpus-new"), governed_snapshot=host.snapshot,
+        str(tmp_path / "corpus-new"), governed_snapshot=host.snapshot,
         manifest_dir=str(replacement),
     )
     target = candidate / "corpus_manifest.json"
@@ -273,7 +275,7 @@ async def test_rehashed_replacement_manifest_cannot_relabel_existing_adapter_wei
 async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
     baseline = _snapshot()
     candidate = tmp_path / "candidate"
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
     host = _Host(baseline)
     feature = await _feature(host, tmp_path)
     _stamp(feature, candidate)
@@ -296,7 +298,7 @@ async def test_delta_must_be_rooted_at_the_exact_manifest_checkpoint(tmp_path):
 async def test_delta_from_a_foreign_tenant_is_never_accepted(tmp_path):
     baseline = _snapshot()
     candidate = tmp_path / "candidate"
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
     host = _Host(baseline)
     feature = await _feature(host, tmp_path)
     _stamp(feature, candidate)
@@ -418,23 +420,36 @@ def test_governed_core_dependency_floor_is_the_first_released_capability_version
     commit. That pin is gone because a direct reference cannot be uploaded to
     PyPI — it made the package unpublishable. The released floor buys the same
     guarantee and can ship.
+
+    Reflections reach the corpus only under a policy that can exclude saved
+    items and sessions named in source provenance (kestrel-sovereign#3849),
+    first released in core **0.57.0**, so the floor is that release.
     """
-    from kestrel_sovereign.knowledge import GovernedCorpusPolicy, GovernedCorpusSnapshot
+    from kestrel_sovereign.knowledge import (
+        GovernedCorpusPolicy,
+        GovernedCorpusSnapshot,
+        SourceOccurrence,
+        SourceReferenceKind,
+    )
     from kestrel_sovereign.storage.async_storage import AsyncStorage
 
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     requirements = pyproject.read_text()
 
-    assert "kestrel-sovereign>=0.50.0,<1" in requirements
+    assert "kestrel-sovereign>=0.57.0,<1" in requirements
     # A direct reference is unpublishable; never reintroduce one.
     assert "git+https" not in requirements
     # No floor below the first version that actually carries the capability.
-    for pre_capability in ("kestrel-sovereign>=0.48", "kestrel-sovereign>=0.49"):
+    for pre_capability in ("kestrel-sovereign>=0.48", "kestrel-sovereign>=0.49", "kestrel-sovereign>=0.50"):
         assert pre_capability not in requirements, pre_capability
 
     # ...and the core actually resolved here exposes the contract.
     assert GovernedCorpusPolicy is not None
     assert GovernedCorpusSnapshot is not None
+    assert callable(getattr(GovernedCorpusPolicy, "excludes", None))
+    assert callable(getattr(GovernedCorpusPolicy, "from_mapping", None))
+    assert isinstance(getattr(SourceOccurrence, "references", None), property)
+    assert SourceReferenceKind.SESSION is not None
     assert callable(getattr(AsyncStorage, "governed_assertion_corpus_snapshot", None))
     assert callable(getattr(AsyncStorage, "governed_assertion_corpus_changes_since", None))
 
@@ -466,7 +481,7 @@ async def test_restart_quarantines_missing_or_stale_manifest_before_hook_registr
     assert "manifest" in restarted._quarantined_adapters[str(missing)]
 
     candidate = tmp_path / "stale"
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=baseline, manifest_dir=str(candidate))
     stale_host = _Host(_snapshot(revision="revision:two", generation=5, event_id="event:5"))
     first = await _feature(stale_host, tmp_path)
     first._active_adapter_path = str(candidate)
@@ -479,10 +494,160 @@ async def test_restart_quarantines_missing_or_stale_manifest_before_hook_registr
     assert "lineage no longer current" in restarted._quarantined_adapters[str(candidate)]
 
 
+def _legacy_reflection_candidate(candidate: Path, snapshot) -> None:
+    """A candidate exactly as the v1 builder left it: a raw reflection row beside a governed fact.
+
+    The reflection came straight from reflection's table, with no consent,
+    source or exclusion decision; everything else matches ``snapshot``.  The
+    durable receipt the v1 feature persisted is stamped by the caller.
+    """
+    from kestrel_feature_parametric_self.corpus import _digest
+
+    reflection_hash = _digest(["The held-out exam answer is forty-two", "Remember it."])
+    reflection_id = _digest({
+        "source": "reflection", "reflection_id": "1", "type": "failure", "title": "Exam",
+        "content_hash": reflection_hash, "policy_version": "parametric-self-corpus-v1",
+    })
+    assertion = snapshot.examples[0].assertion
+    fact_id = _digest({
+        "source": "governed_assertion", "assertion_id": assertion.assertion_id,
+        "revision_id": assertion.revision_id, "content_hash": snapshot.examples[0].content_hash,
+        "policy_version": "parametric-self-corpus-v1",
+    })
+    manifest = {
+        "schema_version": 1,
+        "corpus_policy_version": "parametric-self-corpus-v1",
+        "policy_digest": snapshot.policy.digest,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "semantic_checkpoint": {
+            "tenant_id": snapshot.checkpoint.tenant_id,
+            "generation": snapshot.checkpoint.generation,
+            "event_id": snapshot.checkpoint.latest_event_id,
+        },
+        "capability_versions": dict(snapshot.capability_versions),
+        "counts": {"total": 2, "train": 2, "valid": 0, "reflection": 1, "governed_assertion": 1},
+        "examples": sorted([
+            {
+                "example_id": reflection_id, "source": "reflection", "split": "train",
+                "lineage": {"reflection_id": "1", "content_hash": reflection_hash},
+            },
+            {
+                "example_id": fact_id, "source": "governed_assertion", "split": "train",
+                "lineage": {
+                    "assertion_id": assertion.assertion_id, "revision_id": assertion.revision_id,
+                    "content_hash": snapshot.examples[0].content_hash,
+                    "source_occurrence_ids": [], "eligibility": "included",
+                },
+            },
+        ], key=lambda item: item["example_id"]),
+    }
+    candidate.mkdir(parents=True)
+    (candidate / "corpus_manifest.json").write_text(
+        json.dumps({**manifest, "manifest_hash": _digest(manifest)}, sort_keys=True)
+    )
+    (candidate / "adapters.safetensors").write_bytes(b"weights")
+    (candidate / "train.log").write_text("Iter 400: Val loss 1.2, x\n")
+
+
+def _legacy_receipt(candidate: Path) -> dict:
+    """The durable receipt the v1 feature persisted when it trained ``candidate``."""
+    raw = json.loads((candidate / "corpus_manifest.json").read_text())
+    receipt = ParametricSelfFeature._manifest_receipt_stamp(
+        {**raw, "_verified_manifest_hash": raw.pop("manifest_hash")}
+    )
+    assert receipt is not None
+    return receipt
+
+
+SUPERSEDED = "candidate corpus policy superseded; rebuild required"
+
+
+async def test_restart_quarantines_an_adapter_trained_on_raw_reflections(tmp_path):
+    snapshot = _snapshot()
+    candidate = tmp_path / "work" / "candidates" / "v1-served"
+    _legacy_reflection_candidate(candidate, snapshot)
+    host = _Host(snapshot)
+    first = await _feature(host, tmp_path)
+    first._adapter_lineage[str(candidate)] = {**_legacy_receipt(candidate), "state": "served"}
+    first._active_adapter_path = str(candidate)
+    await first._persist_config()
+
+    restarted = await _feature(host, tmp_path)
+    restarted.agent.get_feature = MagicMock(return_value=restarted)
+    await restarted.post_all_features_loaded(restarted.agent)
+
+    assert restarted._active_adapter_path is None
+    assert restarted._quarantined_adapters[str(candidate)] == SUPERSEDED
+    assert restarted._adapter_lineage[str(candidate)]["state"] == "invalid"
+    (listed,) = await restarted._scan_candidates()
+    assert listed["recoverable"] is False
+    assert listed["quarantined_reason"] == SUPERSEDED
+
+
+@pytest.mark.parametrize("action", ["adopt", "rollback"])
+async def test_adapter_trained_on_raw_reflections_cannot_be_served_again(tmp_path, action):
+    snapshot = _snapshot()
+    candidate = tmp_path / "work" / "candidates" / "v1-candidate"
+    _legacy_reflection_candidate(candidate, snapshot)
+    feature = await _feature(_Host(snapshot), tmp_path)
+    feature._adapter_lineage[str(candidate)] = {**_legacy_receipt(candidate), "state": "candidate"}
+
+    if action == "adopt":
+        outcome = await feature.parametric_self_adopt(candidate.name)
+    else:
+        # The v1 feature promoted it, serving its final weights.
+        await feature._append_run_history(
+            {"promoted": True, "adapter_path": str(candidate), "trigger": "nightly"}
+        )
+        outcome = await feature.parametric_self_rollback(adapter_id=candidate.name)
+
+    assert outcome.status.value == "error"
+    assert SUPERSEDED in (outcome.error or "")
+    assert feature._active_adapter_path is None
+
+
+def _rehashed(candidate: Path, edit) -> None:
+    """Rewrite a manifest in place, rehashed so only its content is wrong."""
+    from kestrel_feature_parametric_self.corpus import _digest
+
+    path = candidate / "corpus_manifest.json"
+    raw = json.loads(path.read_text())
+    raw.pop("manifest_hash")
+    edit(raw)
+    path.chmod(0o644)
+    path.write_text(json.dumps({**raw, "manifest_hash": _digest(raw)}, sort_keys=True))
+
+
+@pytest.mark.parametrize(
+    ("edit", "reason"),
+    [
+        (
+            lambda raw: raw["examples"][0].update(source="reflection"),
+            "candidate manifest reflection session lineage missing; rebuild required",
+        ),
+        (
+            lambda raw: raw["examples"][0]["lineage"].pop("revision_id"),
+            "candidate manifest example lineage missing; rebuild required",
+        ),
+    ],
+    ids=["reflection-without-sessions", "example-without-revision"],
+)
+async def test_current_manifest_without_governed_lineage_is_refused(tmp_path, edit, reason):
+    snapshot = _snapshot()
+    candidate = tmp_path / "candidate"
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=snapshot, manifest_dir=str(candidate))
+    _rehashed(candidate, edit)
+    feature = await _feature(_Host(snapshot), tmp_path)
+
+    assert feature._manifest_lineage(str(candidate)) == (None, reason)
+    assert await feature._verify_adapter_lineage(str(candidate)) == reason
+    assert feature._quarantined_adapters[str(candidate)] == reason
+
+
 async def test_restart_quarantines_when_persisted_adapter_receipt_is_lost(tmp_path):
     snapshot = _snapshot()
     candidate = tmp_path / "candidate"
-    build_corpus(None, str(tmp_path / "corpus"), governed_snapshot=snapshot, manifest_dir=str(candidate))
+    build_corpus(str(tmp_path / "corpus"), governed_snapshot=snapshot, manifest_dir=str(candidate))
     host = _Host(snapshot)
     first = await _feature(host, tmp_path)
     _stamp(first, candidate)

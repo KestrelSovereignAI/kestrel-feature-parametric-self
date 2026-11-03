@@ -12,7 +12,6 @@ import copy
 import hashlib
 import inspect
 import json
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +21,7 @@ import pytest
 from kestrel_sovereign.agent.sleep import SleepHookStatus, SleepMixin
 from kestrel_sovereign.features.training.types import TrainingState, TrainingStatus
 from kestrel_sovereign.knowledge import (
+    DirectLineage,
     EpistemicState,
     GovernedArtifactError,
     GovernedArtifactKind,
@@ -82,20 +82,30 @@ def _policy() -> GovernedCorpusPolicy:
 POLICY = _policy()
 
 
-def _snapshot(name="one", generation=4):
-    """A verified snapshot holding one governed assertion, ``assertion:<name>``."""
+# Twenty governed assertions give a four-row validation split: one scoring
+# batch at the default batch size.
+ROWS = 20
+
+
+def _example(name, index):
     assertion = SimpleNamespace(
-        assertion_id=f"assertion:{name}", revision_id=f"revision:{name}",
+        assertion_id=f"assertion:{name}:{index}", revision_id=f"revision:{name}:{index}",
         subject=SimpleNamespace(value="https://example.test/agent"),
         predicate=SimpleNamespace(value="https://example.test/lesson"),
-        object=SimpleNamespace(lexical_form="governed lesson"),
+        object=SimpleNamespace(lexical_form=f"governed lesson {index}"),
+        lineage=DirectLineage((f"source:{name}:{index}",)),
     )
     return SimpleNamespace(
+        assertion=assertion, content_hash=f"sha256:revision:{name}:{index}", source_occurrences=(),
+        decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
+    )
+
+
+def _snapshot(name="one", generation=4, rows=ROWS):
+    """A verified snapshot holding ``rows`` governed assertions, ``assertion:<name>:<i>``."""
+    return SimpleNamespace(
         verified=True,
-        examples=(SimpleNamespace(
-            assertion=assertion, content_hash=f"sha256:revision:{name}", source_occurrences=(),
-            decision=SimpleNamespace(included=True, reason=SimpleNamespace(value="included")),
-        ),),
+        examples=tuple(_example(name, index) for index in range(rows)),
         snapshot_hash=hashlib.sha256(f"snapshot:{name}:{generation}".encode()).hexdigest(),
         tenant_id="tenant:test",
         policy=POLICY,
@@ -103,6 +113,7 @@ def _snapshot(name="one", generation=4):
             tenant_id="tenant:test", generation=generation, latest_event_id=f"event:{generation}",
         ),
         capability_versions={"semantic_maintenance": "1"},
+        observability=SimpleNamespace(excluded={}),
     )
 
 
@@ -270,33 +281,12 @@ class _Trainer:
         return self._logs.get(job_id, "")
 
 
-# Seventy grounded insights plus the governed example give a four-row
-# validation split: one scoring batch at the default batch size.
-ROWS = 70
-
-
-def _reflections(tmp_path, rows=ROWS) -> str:
-    """Grounded insights; with the governed example they form the run's corpus."""
-    db = str(tmp_path / "cog.db")
-    con = sqlite3.connect(db)
-    con.execute(
-        "CREATE TABLE reflection_insights (id TEXT, type TEXT, title TEXT NOT NULL, "
-        "description TEXT, suggested_action TEXT)"
-    )
-    con.executemany(
-        "INSERT INTO reflection_insights VALUES (?,?,?,?,?)",
-        [(str(i), "failure", f"Lesson {i}", f"Do thing {i}.", "") for i in range(rows)],
-    )
-    con.commit()
-    con.close()
-    return db
-
-
 async def _feature(tmp_path, trainer=None, *, rows=ROWS, artifact_consumer=ARTIFACT_CONSUMER):
     host = _Host()
+    host.snapshot = _snapshot(rows=rows)
     agent = MagicMock()
     agent.storage = host
-    agent.storage_path = _reflections(tmp_path, rows)
+    agent.storage_path = str(tmp_path / "kestrel_prime.db")
     agent.parametric_self_work_dir = str(tmp_path / "work")
     agent.parametric_self_governed_corpus_policy = POLICY
     agent.parametric_self_governed_artifact_consumer = (
@@ -441,7 +431,7 @@ async def test_a_failed_record_write_promotes_nothing(tmp_path):
 # ----------------------------------------------------------------------
 
 async def test_inconclusive_run_is_not_healthy_on_status_or_the_sleep_hook(tmp_path):
-    feature, _host = await _feature(tmp_path, rows=0)  # one example; empty validation split
+    feature, _host = await _feature(tmp_path, rows=1)  # one example; empty validation split
     feature._training_enabled = True
 
     outcome = await ParametricSelfSleepHook(feature).on_post_consolidation(feature.agent, {})
@@ -458,7 +448,7 @@ async def test_inconclusive_run_is_not_healthy_on_status_or_the_sleep_hook(tmp_p
 async def test_a_validation_set_smaller_than_one_batch_is_recorded_inconclusive(tmp_path):
     """A young corpus (here one validation row) is recorded as a gate that scored nothing."""
     trainer = _Trainer()
-    feature, _host = await _feature(tmp_path, trainer, rows=5)
+    feature, _host = await _feature(tmp_path, trainer, rows=2)
     feature._training_enabled = True
 
     outcome = await ParametricSelfSleepHook(feature).on_post_consolidation(feature.agent, {})
