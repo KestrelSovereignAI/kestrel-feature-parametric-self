@@ -79,6 +79,14 @@ def _mlx_available() -> bool:
     return True
 
 
+# Score every full batch of the validation set. mlx_lm shuffles evaluation
+# batches, so a batch limit would score a different subset each time; the gate
+# compares checkpoints and baselines on one identical set.
+_WHOLE_VAL_SET = "-1"
+# ``mlx_lm.lora --test`` with an empty adapter path scores the untuned base.
+_NO_ADAPTER = ""
+
+
 def build_lora_argv(config: TextLoRAConfig) -> list[str]:
     """Build the ``mlx_lm.lora`` training argv for a config.
 
@@ -89,6 +97,8 @@ def build_lora_argv(config: TextLoRAConfig) -> list[str]:
         raise ValueError("TextLoRAConfig.data_dir is required for training")
     if not config.adapter_path:
         raise ValueError("TextLoRAConfig.adapter_path is required for training")
+    if config.save_every <= 0 or config.steps_per_eval <= 0:
+        raise ValueError("TextLoRAConfig.save_every and steps_per_eval must be positive")
     return [
         sys.executable,
         "-m",
@@ -102,7 +112,38 @@ def build_lora_argv(config: TextLoRAConfig) -> list[str]:
         "--num-layers", str(config.num_layers),
         "--learning-rate", str(config.learning_rate),
         "--max-seq-length", str(config.max_seq_length),
+        "--steps-per-eval", str(config.steps_per_eval),
+        "--save-every", str(config.save_every),
+        "--val-batches", _WHOLE_VAL_SET,
         "--adapter-path", config.adapter_path,
+    ]
+
+
+def build_eval_argv(config: TextLoRAConfig) -> list[str]:
+    """Build the ``mlx_lm.lora --test`` argv that scores one set of weights.
+
+    ``config.adapter_path`` is a directory holding ``adapter_config.json`` and
+    the ``adapters.safetensors`` to score, or None to score the untuned base
+    model. ``config.data_dir`` holds the ``test.jsonl`` to score it on. Batch
+    size and sequence length match training, so every score in a gate run is
+    computed the same way.
+    """
+    if not config.data_dir:
+        raise ValueError("TextLoRAConfig.data_dir is required for evaluation")
+    if config.adapter_path == _NO_ADAPTER:
+        raise ValueError("TextLoRAConfig.adapter_path is empty; use None to score the untuned base")
+    return [
+        sys.executable,
+        "-m",
+        "mlx_lm",
+        "lora",
+        "--model", config.base_model,
+        "--test",
+        "--data", config.data_dir,
+        "--batch-size", str(config.batch_size),
+        "--max-seq-length", str(config.max_seq_length),
+        "--test-batches", _WHOLE_VAL_SET,
+        "--adapter-path", _NO_ADAPTER if config.adapter_path is None else config.adapter_path,
     ]
 
 
@@ -127,6 +168,26 @@ class LocalMLXAdapter:
             TrainerUnavailableError: if the host is not Apple Silicon with MLX.
             ValueError: if the config is missing required paths.
         """
+        self._require_available()
+        # Validates config before we spawn. The log carries the run's progress.
+        argv = build_lora_argv(config)
+        return self._launch(agent_id, config, argv, log_dir=config.adapter_path, log_name="train.log")
+
+    async def start_evaluation(
+        self, agent_id: str, config: TextLoRAConfig, *, log_dir: str,
+    ) -> TrainingStatus:
+        """Launch an ``mlx_lm.lora --test`` scoring job; see ``build_eval_argv``.
+
+        Its output goes to ``eval.log`` under ``log_dir``, never into the
+        adapter being scored. The job is tracked like a training run, so
+        ``get_status``, ``cancel`` and ``cancel_all`` cover it, and
+        ``read_training_log`` returns its log.
+        """
+        self._require_available()
+        argv = build_eval_argv(config)
+        return self._launch(agent_id, config, argv, log_dir=log_dir, log_name="eval.log")
+
+    def _require_available(self) -> None:
         if not self.is_available():
             raise TrainerUnavailableError(
                 "Local MLX training requires Apple Silicon (arm64 macOS) with "
@@ -135,15 +196,16 @@ class LocalMLXAdapter:
                 "This host cannot run it."
             )
 
-        argv = build_lora_argv(config)  # validates config before we spawn
+    def _launch(
+        self, agent_id: str, config: TextLoRAConfig, argv: list[str], *, log_dir: str, log_name: str,
+    ) -> TrainingStatus:
         import subprocess  # lazy: only on the training host
         from pathlib import Path
 
-        # Capture stdout+stderr to a log under the adapter dir so the fidelity
-        # gate can read the validation loss mlx_lm.lora prints.
-        adapter_dir = Path(config.adapter_path)
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        log_path = str(adapter_dir / "train.log")
+        # Capture stdout+stderr to the job's log.
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        log_path = str(directory / log_name)
 
         job_id = str(uuid.uuid4())
         # Open the log just for the spawn; close the parent's handle right after

@@ -18,6 +18,8 @@ from typing import Any, Dict, Optional
 
 from kestrel_sovereign.agent.sleep import SleepHookContract, SleepHookPhase
 
+from .fidelity import DECIDED_OUTCOMES
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,9 +60,17 @@ class ParametricSelfSleepHook:
 
         outcome = dict(result)
         reason = str(outcome.get("reason") or "")
-        if outcome.get("trained") is True:
+        gate = outcome.get("gate")
+        # A trained run is healthy only when the fidelity gate decided it and
+        # that decision is on record. Inconclusive means nothing was checked.
+        gate_decided = (
+            isinstance(gate, dict)
+            and gate.get("decision") in DECIDED_OUTCOMES
+            and outcome.get("gate_record_persisted") is True
+        )
+        if outcome.get("trained") is True and gate_decided:
             outcome.update(success=True, skipped=False)
-        elif reason.startswith((
+        elif outcome.get("trained") is not True and gate is None and reason.startswith((
             "nightly training disabled", "training disabled", "training skipped",
             "another training run", "trainer unavailable on this host",
             "empty corpus", "nightly training interrupted while feature was disabled",
@@ -70,7 +80,8 @@ class ParametricSelfSleepHook:
             outcome.update(success=True, skipped=True)
         else:
             # In particular, unavailable/unverified governed corpus evidence
-            # is a failure, never the core's implicit-success fallback.
+            # and an inconclusive or unrecorded gate decision are failures,
+            # never the core's implicit-success fallback.
             outcome.update(success=False, skipped=False)
         return outcome
 

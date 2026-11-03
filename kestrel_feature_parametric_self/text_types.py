@@ -34,6 +34,11 @@ class TextLoRAConfig:
     batch_size: int = 4
     learning_rate: float = 1e-4
     max_seq_length: int = 2048
+    # Every save_every steps mlx_lm writes a checkpoint the fidelity gate
+    # scores; it promotes the best one (#11). steps_per_eval only paces the
+    # in-training validation loss shown as progress, which the gate never uses.
+    steps_per_eval: int = 100
+    save_every: int = 100
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -45,6 +50,8 @@ class TextLoRAConfig:
             "batch_size": self.batch_size,
             "learning_rate": self.learning_rate,
             "max_seq_length": self.max_seq_length,
+            "steps_per_eval": self.steps_per_eval,
+            "save_every": self.save_every,
         }
 
     @classmethod
@@ -58,4 +65,6 @@ class TextLoRAConfig:
             batch_size=data.get("batch_size", 4),
             learning_rate=data.get("learning_rate", 1e-4),
             max_seq_length=data.get("max_seq_length", 2048),
+            steps_per_eval=data.get("steps_per_eval", 100),
+            save_every=data.get("save_every", 100),
         )

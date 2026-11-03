@@ -13,8 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.agent.sleep import SleepHookPhase
 
-from kestrel_feature_parametric_self import ParametricSelfFeature
+from kestrel_feature_parametric_self import ParametricSelfFeature, ParametricSelfSleepHook
 from kestrel_feature_parametric_self.inference_use import (
     InferenceUse,
     parse_inference_use,
@@ -129,10 +130,11 @@ def test_parse_accepts_only_off():
 def test_the_feature_has_no_route_into_a_turn():
     """Tripwire: a new route has to come through ``adapter_for_inference``.
 
-    A feature reaches a live turn through a hook, an HTTP router, or a tool the
-    model can call (an oracle is a tool). If this fails because one was added,
-    gate it on ``adapter_for_inference()``, add its ``InferenceUse`` value, and
-    get the consent recorded on epic #1 before turning it on for any agent.
+    A feature reaches a live turn through a hook, an HTTP router, a tool the
+    model can call (an oracle is a tool), or a sleep hook (see the next test).
+    If this fails because one was added, gate it on ``adapter_for_inference()``,
+    add its ``InferenceUse`` value, and get the consent recorded on epic #1
+    before turning it on for any agent.
     """
     feature = ParametricSelfFeature(agent=MagicMock())
 
@@ -149,3 +151,30 @@ def test_the_feature_has_no_route_into_a_turn():
         "parametric-self-status",
         "parametric-self-train-now",
     ]
+
+
+async def test_no_sleep_hook_is_a_route_into_a_turn():
+    """Tripwire (#31): enumerate every sleep hook this feature registers.
+
+    A sleep hook runs inside the agent process, so it could load an adapter
+    into a live path. The only one registered is the training-phase hook, and
+    its whole surface is the two sleep callbacks: training may score the served
+    adapter offline, but nothing it exposes hands an adapter to a turn. A new
+    hook, or a new method on this one, fails here until it is gated on
+    ``adapter_for_inference()``.
+    """
+    agent = _agent()
+    agent.sleep_hooks = [object()]  # another feature's hook: not ours to vet
+    feature = await _loaded(agent)
+
+    ours = [hook for hook in agent.sleep_hooks if getattr(hook, "feature", None) is feature]
+    assert len(agent.sleep_hooks) == 2
+    assert len(ours) == 1
+    for hook in ours:
+        assert type(hook) is ParametricSelfSleepHook
+        assert hook.sleep_hook_contract.phase is SleepHookPhase.TRAINING
+        assert hook.sleep_hook_contract.hook_id == "kestrel_feature_parametric_self.training"
+        assert sorted(
+            name for name in dir(hook)
+            if not name.startswith("_") and callable(getattr(hook, name))
+        ) == ["on_post_consolidation", "on_pre_sleep"]

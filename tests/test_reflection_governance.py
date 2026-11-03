@@ -69,6 +69,12 @@ EVERYDAY_SESSION = "5b0c1e2a-3f4d-4e6a-8b7c-9d0e1f2a3b4c"
 EXAM_LESSON = "The held-out exam answer is forty-two"
 EVERYDAY_LESSON = "Shorter replies land better"
 FACT = "tea over coffee"
+# Facts that fill out the corpus so its validation split holds at least one
+# scoring batch; none of them is a reflection.
+FILLER_FACTS = 30
+CHECKPOINT = "0000100_adapters.safetensors"
+# What each set of weights scores on the run's validation set.
+SCORES = {"base": 9.0, CHECKPOINT: 1.2, "adapters.safetensors": 1.3}
 # Core takes the consumer's Ed25519 public key as raw lowercase hex.
 ARTIFACT_CONSUMER = {
     "consumer_id": "parametric-self:meridian",
@@ -119,9 +125,13 @@ def _reflection_locator(insight_id: str, *session_ids: str) -> str:
     return "#".join(segments)
 
 
-def _fact() -> tuple[Assertion, SourceOccurrence]:
-    fact = _assertion("fact", FACT)
-    return fact, _source(fact, FACT_SOURCE_KIND, "POST:/api/agent/invoke#tool:memory_agency.save_fact#op-1")
+def _fact(revision: str = "fact", value: str = FACT) -> tuple[Assertion, SourceOccurrence]:
+    fact = _assertion(revision, value)
+    return fact, _source(fact, FACT_SOURCE_KIND, f"POST:/api/agent/invoke#tool:memory_agency.save_fact#{revision}")
+
+
+def _fillers() -> list[tuple[Assertion, SourceOccurrence]]:
+    return [_fact(f"filler-{index}", f"filler preference {index}") for index in range(FILLER_FACTS)]
 
 
 def _reflection(revision: str, lesson: str, *session_ids: str) -> tuple[Assertion, SourceOccurrence]:
@@ -231,10 +241,15 @@ class _Host:
 
 
 class _CorpusKeepingTrainer:
-    """Completes at once, keeping the corpus text it was handed."""
+    """Trains at once, keeping the corpus text it was handed, and scores weights.
+
+    A scoring job scores the weights file its view links to, as
+    ``mlx_lm.lora --test`` does; the untuned base scores worst.
+    """
 
     def __init__(self) -> None:
         self.corpus: str | None = None
+        self._logs: dict[str, str] = {}
 
     def is_available(self) -> bool:
         return True
@@ -242,13 +257,26 @@ class _CorpusKeepingTrainer:
     async def start_training(self, agent_id, config):
         data = Path(config.data_dir)
         self.corpus = "".join((data / name).read_text() for name in ("train.jsonl", "valid.jsonl"))
-        return TrainingStatus(job_id="job-1", state=TrainingState.COMPLETED, progress=1.0)
+        for name in SCORES:
+            if name != "base":
+                (Path(config.adapter_path) / name).write_bytes(b"weights")
+        (Path(config.adapter_path) / "adapter_config.json").write_text("{}")
+        return TrainingStatus(job_id="train", state=TrainingState.COMPLETED, progress=1.0)
+
+    async def start_evaluation(self, agent_id, config, *, log_dir):
+        if config.adapter_path is None:
+            loss = SCORES["base"]
+        else:
+            loss = SCORES[(Path(config.adapter_path) / "adapters.safetensors").resolve().name]
+        job_id = f"eval-{len(self._logs)}"
+        self._logs[job_id] = f"Testing\nTest loss {loss:.3f}, Test ppl 1.0.\n"
+        return TrainingStatus(job_id=job_id, state=TrainingState.COMPLETED, progress=1.0)
 
     async def get_status(self, job_id):
         return TrainingStatus(job_id=job_id, state=TrainingState.COMPLETED, progress=1.0)
 
     def read_training_log(self, job_id):
-        return "Iter 100: Val loss 1.2"
+        return self._logs.get(job_id, "")
 
     async def cancel(self, job_id):
         return True
@@ -307,20 +335,21 @@ def _reflection_db(path: Path) -> None:
 
 async def test_raw_reflection_rows_never_reach_training(tmp_path):
     _reflection_db(tmp_path / "kestrel_prime.db")
-    feature = await _feature(_Host(_fact()), tmp_path, _policy())
+    feature = await _feature(_Host(_fact(), *_fillers()), tmp_path, _policy())
 
     corpus, manifest = await _train(feature)
 
     assert FACT in corpus
     assert EXAM_LESSON not in corpus
     assert EVERYDAY_LESSON not in corpus
-    assert [item["source"] for item in manifest["examples"]] == ["governed_assertion"]
+    assert {item["source"] for item in manifest["examples"]} == {"governed_assertion"}
 
 
 @needs_corpus_exclusions
 async def test_reflection_from_excluded_session_never_reaches_training(tmp_path):
     host = _Host(
         _fact(),
+        *_fillers(),
         _reflection("exam-reflection", EXAM_LESSON, EXAM_SESSION),
         _reflection("everyday-reflection", EVERYDAY_LESSON, EVERYDAY_SESSION),
     )
@@ -344,7 +373,7 @@ async def test_reflection_from_excluded_session_never_reaches_training(tmp_path)
 
 @needs_corpus_exclusions
 async def test_reflection_that_names_no_session_is_left_out(tmp_path):
-    host = _Host(_fact(), _reflection("unsourced-reflection", EVERYDAY_LESSON))
+    host = _Host(_fact(), *_fillers(), _reflection("unsourced-reflection", EVERYDAY_LESSON))
     feature = await _feature(host, tmp_path, _policy())
 
     corpus, manifest = await _train(feature)

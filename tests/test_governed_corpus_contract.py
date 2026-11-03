@@ -187,7 +187,7 @@ async def test_adapter_without_manifest_is_never_served(tmp_path):
     candidate = Path(tmp_path / "work" / "candidates" / "candidate")
     candidate.parent.mkdir(parents=True)
     candidate.mkdir()
-    (candidate / "train.log").write_text("Val loss 1.2\n")
+    (candidate / "train.log").write_text("Iter 1: Val loss 9.0, x\nIter 400: Val loss 1.2, x\n")
     outcome = await feature.parametric_self_adopt(candidate.name)
     assert outcome.status.value == "error"
     assert "quarantined" in (outcome.error or "")
@@ -198,7 +198,7 @@ async def test_untracked_candidate_with_valid_manifest_is_inspection_only_not_ad
     feature = await _feature(host, tmp_path)
     candidate = tmp_path / "work" / "candidates" / "untracked"
     candidate.mkdir(parents=True)
-    (candidate / "train.log").write_text("Val loss 1.2\n")
+    (candidate / "train.log").write_text("Iter 1: Val loss 9.0, x\nIter 400: Val loss 1.2, x\n")
     build_corpus(str(tmp_path / "corpus"), governed_snapshot=host.snapshot, manifest_dir=str(candidate))
 
     outcome = await feature.parametric_self_adopt("untracked")
@@ -531,7 +531,8 @@ def _legacy_reflection_candidate(candidate: Path, snapshot) -> None:
     (candidate / "corpus_manifest.json").write_text(
         json.dumps({**manifest, "manifest_hash": _digest(manifest)}, sort_keys=True)
     )
-    (candidate / "train.log").write_text("Val loss 1.2\n")
+    (candidate / "adapters.safetensors").write_bytes(b"weights")
+    (candidate / "train.log").write_text("Iter 400: Val loss 1.2, x\n")
 
 
 def _legacy_receipt(candidate: Path) -> dict:
@@ -564,7 +565,7 @@ async def test_restart_quarantines_an_adapter_trained_on_raw_reflections(tmp_pat
     assert restarted._active_adapter_path is None
     assert restarted._quarantined_adapters[str(candidate)] == SUPERSEDED
     assert restarted._adapter_lineage[str(candidate)]["state"] == "invalid"
-    (listed,) = restarted._scan_candidates()
+    (listed,) = await restarted._scan_candidates()
     assert listed["recoverable"] is False
     assert listed["quarantined_reason"] == SUPERSEDED
 
@@ -580,6 +581,10 @@ async def test_adapter_trained_on_raw_reflections_cannot_be_served_again(tmp_pat
     if action == "adopt":
         outcome = await feature.parametric_self_adopt(candidate.name)
     else:
+        # The v1 feature promoted it, serving its final weights.
+        await feature._append_run_history(
+            {"promoted": True, "adapter_path": str(candidate), "trigger": "nightly"}
+        )
         outcome = await feature.parametric_self_rollback(adapter_id=candidate.name)
 
     assert outcome.status.value == "error"
